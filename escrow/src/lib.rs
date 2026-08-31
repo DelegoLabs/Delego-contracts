@@ -1009,6 +1009,9 @@ impl EscrowContract {
     /// Returns [`EscrowError::InvalidLimits`] if min_amount <= 0 or max_amount < min_amount.
     /// Returns [`EscrowError::InvalidAddress`] if treasury is a zero address.
     pub fn constructor(env: Env, config: EscrowConfig) -> Result<(), EscrowError> {
+        Self::__constructor(env, config)
+    }
+
     pub fn __constructor(env: Env, config: EscrowConfig) -> Result<(), EscrowError> {
         // Validate configuration
         if config.fee_bps > 1000 {
@@ -1984,11 +1987,19 @@ impl EscrowContract {
     }
 
     /// Read-only getter for a token's liquidity pool balance.
-    pub fn get_liquidity_pool(env: Env, token: Address) -> LiquidityPool {
+    ///
+    /// # Errors
+    /// Returns [`EscrowError::PoolNotFound`] when no pool has ever been funded
+    /// for the given token, so callers can distinguish an unfunded pool from a
+    /// funded one that is currently empty.
+    pub fn get_liquidity_pool(
+        env: Env,
+        token: Address,
+    ) -> Result<LiquidityPool, EscrowError> {
         env.storage()
             .instance()
-            .get(&DataKey::LiquidityPool(token.clone()))
-            .unwrap_or(LiquidityPool { token, balance: 0 })
+            .get(&DataKey::LiquidityPool(token))
+            .ok_or(EscrowError::PoolNotFound)
     }
 
     /// Create an escrow in unfunded `Created` status.
@@ -4337,6 +4348,7 @@ mod metadata_tests {
         let (client, _admin, _token) = setup(&env);
         let result = client.try_get_escrow_metadata(&999u64);
         assert_eq!(result, Err(Ok(EscrowError::NotFound)));
+    }
     fn get_escrow_metadata_existing_without_metadata_returns_metadata_not_set() {
         let (client, _admin, token) = setup(&env);
         let buyer = Address::generate(&env);
@@ -4353,8 +4365,10 @@ mod metadata_tests {
             &1000u32,
             &no_hash,
             &no_schema,
+        );
         let result = client.try_get_escrow_metadata(&escrow_id);
         assert_eq!(result, Err(Ok(EscrowError::MetadataNotSet)));
+    }
     fn get_escrow_metadata_existing_with_metadata_returns_metadata() {
         let order_hash = BytesN::from_array(&env, &[1u8; 32]);
         let schema = Symbol::new(&env, "order_v1");
@@ -4483,6 +4497,7 @@ mod error_code_allocation_tests {
         for pair in codes.windows(2) {
             assert_ne!(pair[0], pair[1], "duplicate EscrowError code: {}", pair[0]);
         }
+    }
     fn cross_contract_ranges_are_disjoint() {
         let mut ranges = ALLOCATED_RANGES;
         ranges.sort_unstable();
@@ -4495,6 +4510,8 @@ mod error_code_allocation_tests {
                 pair[1].0,
                 pair[1].1
             );
+        }
+    }
     fn escrow_error_codes_avoid_other_contract_ranges() {
         for &code in &escrow_error_codes() {
             if code >= 400 {
@@ -4503,11 +4520,17 @@ mod error_code_allocation_tests {
                     "EscrowError code {} is outside the escrow allocation",
                     code
                 );
-            for &(lo, hi) in &ALLOCATED_RANGES[1..] {
-                    !(lo..=hi).contains(&code),
-                    "EscrowError code {} collides with another contract's range {}..={}",
-                    code,
-                    lo,
-                    hi
+                for &(lo, hi) in &ALLOCATED_RANGES[1..] {
+                    assert!(
+                        !(lo..=hi).contains(&code),
+                        "EscrowError code {} collides with another contract's range {}..={}",
+                        code,
+                        lo,
+                        hi
+                    );
+                }
+            }
+        }
     }
+}
 }
