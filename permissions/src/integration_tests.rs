@@ -405,9 +405,7 @@ fn test_set_decrease_allowance_timelock_custom_value() {
         Err(Ok(PermissionError::TimeLockActive))
     );
 
-    t.env
-        .ledger()
-        .set_timestamp(t.env.ledger().timestamp() + 1);
+    t.env.ledger().set_timestamp(t.env.ledger().timestamp() + 1);
     client.execute_decrease_allowance(&t.buyer, &t.agent);
     assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 800);
 }

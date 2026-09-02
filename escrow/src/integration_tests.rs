@@ -11,18 +11,18 @@ use soroban_sdk::{
     Address, BytesN, Env, IntoVal, Symbol, TryIntoVal, Vec,
 };
 
-struct TestEnv {
-    env: Env,
-    admin: Address,
-    buyer: Address,
-    seller: Address,
-    agent: Address,
-    token_contract_id: Address,
-    escrow_contract_id: Address,
+pub(crate) struct TestEnv {
+    pub(crate) env: Env,
+    pub(crate) admin: Address,
+    pub(crate) buyer: Address,
+    pub(crate) seller: Address,
+    pub(crate) agent: Address,
+    pub(crate) token_contract_id: Address,
+    pub(crate) escrow_contract_id: Address,
 }
 
 impl TestEnv {
-    fn setup() -> Self {
+    pub(crate) fn setup() -> Self {
         Self::setup_with_fee_bps(0)
     }
 
@@ -49,21 +49,11 @@ impl TestEnv {
         let config = EscrowConfig {
             admin: admin.clone(),
             fee_bps,
-            treasury,
+            treasury: treasury.clone(),
             min_amount,
             max_amount,
         };
         let escrow_contract_id = env.register(EscrowContract, (config,));
-        let escrow_contract_id = env.register(
-            EscrowContract,
-            (EscrowConfig {
-                admin: admin.clone(),
-                fee_bps,
-                treasury: treasury.clone(),
-                min_amount: 100i128,
-                max_amount: 10000i128,
-            },),
-        );
         let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
         escrow_client.add_token(&admin, &token_contract_id);
 
@@ -83,7 +73,7 @@ impl TestEnv {
     }
 }
 
-fn deposit_escrow(t: &TestEnv, amount: i128, timeout_ledgers: u32) -> u64 {
+pub(crate) fn deposit_escrow(t: &TestEnv, amount: i128, timeout_ledgers: u32) -> u64 {
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
     escrow_client.deposit(
         &t.buyer,
@@ -151,21 +141,11 @@ fn test_add_token_by_non_admin_fails() {
     let config = EscrowConfig {
         admin: admin.clone(),
         fee_bps,
-        treasury,
+        treasury: treasury.clone(),
         min_amount,
         max_amount,
     };
     let escrow_contract_id = env.register(EscrowContract, (config,));
-    let escrow_contract_id = env.register(
-        EscrowContract,
-        (EscrowConfig {
-            admin: admin.clone(),
-            fee_bps: 0u32,
-            treasury: treasury.clone(),
-            min_amount: 100i128,
-            max_amount: 10000i128,
-        },),
-    );
     let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
 
     let new_token = Address::generate(&env);
@@ -1014,16 +994,6 @@ fn test_version_callable_without_auth() {
         max_amount: 10000i128,
     };
     let contract_id = env.register(EscrowContract, (config,));
-    let contract_id = env.register(
-        EscrowContract,
-        (EscrowConfig {
-            admin,
-            fee_bps: 0u32,
-            treasury,
-            min_amount: 100i128,
-            max_amount: 10000i128,
-        },),
-    );
     let client = EscrowContractClient::new(&env, &contract_id);
 
     let version = client.version();
@@ -1056,7 +1026,10 @@ fn test_set_fee_distribution_rejects_zero_address_treasury() {
     let t = TestEnv::setup();
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
 
-    let zero_address = soroban_sdk::Address::from_str(&t.env, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4");
+    let zero_address = soroban_sdk::Address::from_str(
+        &t.env,
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+    );
     let mut config = Vec::new(&t.env);
     config.push_back(TreasuryShare {
         treasury: zero_address,
@@ -2438,8 +2411,14 @@ fn test_split_release_multi_treasury() {
     let treasury1 = Address::generate(&t.env);
     let treasury2 = Address::generate(&t.env);
     let mut shares = soroban_sdk::Vec::new(&t.env);
-    shares.push_back(crate::TreasuryShare { treasury: treasury1.clone(), bps: 200 }); // 2%
-    shares.push_back(crate::TreasuryShare { treasury: treasury2.clone(), bps: 300 }); // 3%
+    shares.push_back(crate::TreasuryShare {
+        treasury: treasury1.clone(),
+        bps: 200,
+    }); // 2%
+    shares.push_back(crate::TreasuryShare {
+        treasury: treasury2.clone(),
+        bps: 300,
+    }); // 3%
     assert!(escrow_client.set_fee_distribution(&t.admin, &shares));
     let escrow_id = deposit_escrow(&t, 10000, 100);
     let recipient1 = Address::generate(&t.env);

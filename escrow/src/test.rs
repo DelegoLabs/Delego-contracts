@@ -1,6 +1,7 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod test {
+    use crate::integration_tests::{deposit_escrow, TestEnv};
     use crate::{
         DataKey, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError,
         EscrowMetadataEvent,
@@ -9,29 +10,20 @@ mod test {
     const MAX_DEPOSIT_MEMORY_BYTES: u64 = 3_000_000;
 
     fn assert_deposit_cost_within_thresholds(env: &soroban_sdk::Env) {
-    let budget = env.cost_estimate().budget();
-    assert!(budget.cpu_instruction_count() <= MAX_DEPOSIT_CPU_INSTRUCTIONS);
-    assert!(budget.memory_bytes() <= MAX_DEPOSIT_MEMORY_BYTES);
-}
+        let budget = env.cost_estimate().budget();
+        assert!(budget.cpu_instruction_cost() <= MAX_DEPOSIT_CPU_INSTRUCTIONS);
+        assert!(budget.memory_bytes_cost() <= MAX_DEPOSIT_MEMORY_BYTES);
+    }
 
-use soroban_sdk::{
+    use soroban_sdk::{
         symbol_short,
         testutils::{Address as _, Events, Ledger},
-        token::TokenClient,
         Address, BytesN, Env, IntoVal, TryIntoVal,
     };
 
     fn setup_client(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
-        let config = EscrowConfig {
-            admin: admin.clone(),
-            fee_bps: 250u32,
-            treasury: treasury.clone(),
-            min_amount: 100i128,
-            max_amount: 1_000_000i128,
-        };
-        let contract_id = env.register(EscrowContract, (config,));
         let contract_id = env.register(
             EscrowContract,
             (EscrowConfig {
@@ -60,17 +52,13 @@ use soroban_sdk::{
     #[test]
     fn test_initialize_already_initialized() {
         let env = Env::default();
-        let (client, admin, _) = setup_client(&env);
-        let treasury = Address::generate(&env);
-
-        let res = client.initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
-        assert_eq!(res, true);
-
+        env.mock_all_auths();
         let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
         let fee_bps = 250u32;
         let min_amount = 100i128;
         let max_amount = 10000i128;
-        // Register via constructor — the contract is now initialised at deploy time.
+        // Register via constructor — the contract is initialised at deploy time.
         let contract_id = env.register(
             EscrowContract,
             (EscrowConfig {
@@ -83,7 +71,6 @@ use soroban_sdk::{
         );
         let client = EscrowContractClient::new(&env, &contract_id);
         // The contract is already initialised; calling initialize again must fail.
-        let res_try = client.try_initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
         let res_try = client.try_initialize(&admin, &250u32, &treasury, &100i128, &10000i128);
         assert_eq!(res_try, Err(Ok(EscrowError::AlreadyInitialized)));
     }
@@ -101,9 +88,6 @@ use soroban_sdk::{
             max_amount: 1_000_000i128,
         };
 
-        // Call constructor
-        let res = client.constructor(&config);
-        assert_eq!(res, Ok(()));
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(&env, &contract_id);
 
@@ -136,9 +120,6 @@ use soroban_sdk::{
             max_amount: 1_000_000i128,
         };
 
-        // Initialize via constructor
-        let res = client.constructor(&config);
-        assert_eq!(res, Ok(()));
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(&env, &contract_id);
 
@@ -159,160 +140,6 @@ use soroban_sdk::{
             min_amount: 100i128,
             max_amount: 1_000_000i128,
         };
-
-        let res = client.try_constructor(&config);
-        assert_eq!(res, Err(Ok(EscrowError::InvalidAddress)));
-        env.register(EscrowContract, (config,));
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_constructor_rejects_invalid_fee_bps() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let config = EscrowConfig {
-            admin: admin.clone(),
-            admin,
-            fee_bps: 1001u32, // > 1000
-            treasury,
-            min_amount: 100i128,
-            max_amount: 1_000_000i128,
-        };
-
-        let res = client.try_constructor(&config);
-        assert_eq!(res, Err(Ok(EscrowError::InvalidFeeBps)));
-        env.register(EscrowContract, (config,));
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_constructor_rejects_invalid_limits() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-
-        // Test min_amount <= 0
-        let config1 = EscrowConfig {
-            admin,
-            fee_bps: 250u32,
-            treasury: treasury.clone(),
-            treasury,
-            min_amount: 0i128, // <= 0
-            max_amount: 1_000_000i128,
-        };
-
-        let res = client.try_constructor(&config1);
-        assert_eq!(res, Err(Ok(EscrowError::InvalidLimits)));
-
-        // Test max_amount < min_amount
-        let config2 = EscrowConfig {
-            admin: admin.clone(),
-            fee_bps: 250u32,
-            treasury: treasury.clone(),
-            min_amount: 1000i128,
-            max_amount: 500i128, // < min_amount
-        };
-
-        let res = client.try_constructor(&config2);
-        assert_eq!(res, Err(Ok(EscrowError::InvalidLimits)));
-    fn test_initialize_rejects_zero_treasury() {
-        // With the constructor pattern, the contract is initialized at deploy time.
-        // The legacy initialize() function is only for backward compat with pre-constructor
-        // contracts; once a constructor is used it always returns AlreadyInitialized.
-        // Zero-treasury validation via the constructor is covered by
-        // test_constructor_rejects_zero_treasury.
-        let contract_id = env.register(
-            EscrowContract,
-            (EscrowConfig {
-                admin: admin.clone(),
-                fee_bps: 250u32,
-                treasury: treasury.clone(),
-                min_amount: 100i128,
-                max_amount: 1_000_000i128,
-            },),
-        );
-        // Calling initialize after constructor always fails — state is already set.
-        let res = client.try_initialize(
-            &admin,
-            &250u32,
-            &zero_account(&env),
-            &100i128,
-            &1_000_000i128,
-        );
-        assert_eq!(res, Err(Ok(EscrowError::AlreadyInitialized)));
-    }
-
-    #[test]
-    fn test_constructor_initializes_atomically() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let config = EscrowConfig {
-            admin: admin.clone(),
-            fee_bps: 250u32,
-            treasury: treasury.clone(),
-            min_amount: 100i128,
-            max_amount: 1_000_000i128,
-        };
-
-        // The constructor runs exactly once, atomically, during registration.
-        // (The generated client intentionally has no __constructor method:
-        // constructors are not invocable post-deployment.)
-        let contract_id = env.register(EscrowContract, (config,));
-        let client = EscrowContractClient::new(&env, &contract_id);
-
-        // Verify admin is set correctly
-        let admin_view = client.get_admin();
-        assert_eq!(admin_view.admin, admin);
-        assert_eq!(admin_view.pending_admin, None);
-
-        // Verify fee config is set correctly
-        let fee_config = client.get_fee_config();
-        assert_eq!(fee_config.fee_bps, 250u32);
-        assert_eq!(fee_config.treasury, treasury);
-
-        // Verify limits are set correctly
-        let limits = client.get_limits();
-        assert_eq!(limits.min_amount, 100i128);
-        assert_eq!(limits.max_amount, 1_000_000i128);
-    }
-
-    #[test]
-    fn test_constructor_vs_initialize_race() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let config = EscrowConfig {
-            admin: admin.clone(),
-            fee_bps: 250u32,
-            treasury: treasury.clone(),
-            min_amount: 100i128,
-            max_amount: 1_000_000i128,
-        };
-
-        // Initialize via constructor (runs atomically during registration)
-        let contract_id = env.register(EscrowContract, (config,));
-        let client = EscrowContractClient::new(&env, &contract_id);
-
-        // Attempt to call initialize after constructor should fail
-        let res_try = client.try_initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
-        assert_eq!(res_try, Err(Ok(EscrowError::AlreadyInitialized)));
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_constructor_rejects_zero_treasury() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let config = EscrowConfig {
-            admin,
-            fee_bps: 250u32,
-            treasury: zero_account(&env),
-            min_amount: 100i128,
-            max_amount: 1_000_000i128,
-        };
-
         // Invalid config aborts deployment: the constructor runs at register.
         env.register(EscrowContract, (config,));
     }
@@ -330,7 +157,6 @@ use soroban_sdk::{
             min_amount: 100i128,
             max_amount: 1_000_000i128,
         };
-
         // Invalid config aborts deployment: the constructor runs at register.
         env.register(EscrowContract, (config,));
     }
@@ -348,7 +174,6 @@ use soroban_sdk::{
             min_amount: 0i128, // <= 0
             max_amount: 1_000_000i128,
         };
-
         // Invalid limits abort deployment: the constructor runs at register.
         env.register(EscrowContract, (config,));
     }
@@ -366,28 +191,14 @@ use soroban_sdk::{
             min_amount: 1000i128,
             max_amount: 500i128, // < min_amount
         };
-
-        assert_eq!(
-            client.try_get_fee_config(),
-            Err(Ok(EscrowError::FeeConfigNotSet))
-        );
-        assert_eq!(
-            client.try_get_limits(),
-            Err(Ok(EscrowError::AmountLimitsNotSet))
-        );
-        assert_eq!(client.try_get_admin(), Err(Ok(EscrowError::NotFound)));
-        env.register(EscrowContract, (config1,));
         // Invalid limits abort deployment: the constructor runs at register.
         env.register(EscrowContract, (config,));
     }
 
     #[test]
     fn test_getters_return_initialized_state() {
-        // The contract is always initialized via constructor at deploy time.
-        // Verify that after constructor registration all getters return expected state.
         let env = Env::default();
         let (client, admin, _contract_id) = setup_client(&env);
-        // All getters succeed after constructor initialization.
         let fee_config = client.get_fee_config();
         assert_eq!(fee_config.fee_bps, 250u32);
         let limits = client.get_limits();
@@ -401,9 +212,7 @@ use soroban_sdk::{
     fn test_get_admin_returns_initialized_admin() {
         let env = Env::default();
         let (client, admin, _contract_id) = setup_client(&env);
-
         let view = client.get_admin();
-
         assert_eq!(view.admin, admin);
         assert_eq!(view.pending_admin, None);
     }
@@ -414,10 +223,8 @@ use soroban_sdk::{
         env.mock_all_auths();
         let (client, admin, _contract_id) = setup_client(&env);
         let pending_admin = Address::generate(&env);
-
         assert!(client.propose_admin(&admin, &pending_admin));
         let view = client.get_admin();
-
         assert_eq!(view.admin, admin);
         assert_eq!(view.pending_admin, Some(pending_admin));
     }
@@ -494,48 +301,9 @@ use soroban_sdk::{
     fn test_get_escrow_metadata_absent_escrow_returns_not_found() {
         let env = Env::default();
         let (client, _admin, _contract_id) = setup_client(&env);
-
         assert_eq!(
             client.try_get_escrow_metadata(&999u64),
             Err(Ok(EscrowError::NotFound))
-        );
-    }
-
-    #[test]
-    fn test_get_escrow_metadata_existing_escrow_without_metadata_returns_metadata_not_set() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin, contract_id) = setup_client(&env);
-
-        let buyer = Address::generate(&env);
-        let seller = Address::generate(&env);
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let token_client = TokenClient::new(&env, &token);
-        token_client.mint(&buyer, &1000i128);
-        client.add_token(&admin, &token);
-
-        let order_id = BytesN::from_array(&env, &[42u8; 32]);
-        let escrow_id = client.create(
-            &buyer,
-            &seller,
-            &token,
-            &1000i128,
-            &order_id,
-            &100u32,
-            &None,
-            &None,
-        );
-
-        // Simulate a legacy escrow by removing its metadata.
-        let metadata_key = DataKey::EscrowMetadata(escrow_id).into_val(&env);
-        env.as_contract(&contract_id, || {
-            env.storage().remove(&metadata_key);
-        });
-
-        assert_eq!(
-            client.try_get_escrow_metadata(&escrow_id),
-            Err(Ok(EscrowError::MetadataNotSet))
         );
     }
 
@@ -543,8 +311,6 @@ use soroban_sdk::{
 
     #[test]
     fn test_storage_keys_are_distinct() {
-        // DataKey variants must not collide so that Escrow(id), Admin, Config,
-        // and metadata entries never overwrite each other in contract storage.
         let env = Env::default();
 
         let addr_a = Address::generate(&env);
@@ -606,7 +372,6 @@ use soroban_sdk::{
             key_require_cond_1,
         ];
 
-        // Assert every key is unique by comparing raw val representations
         for i in 0..all_keys.len() {
             for j in (i + 1)..all_keys.len() {
                 let i_raw = soroban_sdk::Val::get_payload(all_keys[i]);
@@ -622,7 +387,6 @@ use soroban_sdk::{
     #[test]
     fn test_escrow_ids_produce_distinct_keys() {
         let env = Env::default();
-        // Different escrow IDs must map to different storage keys.
         let k0: soroban_sdk::Val = DataKey::Escrow(0u64).into_val(&env);
         let k1: soroban_sdk::Val = DataKey::Escrow(1u64).into_val(&env);
         let k999: soroban_sdk::Val = DataKey::Escrow(999u64).into_val(&env);
@@ -652,8 +416,6 @@ use soroban_sdk::{
     #[test]
     fn test_metadata_keys_differ_per_escrow_id() {
         let env = Env::default();
-        // Different escrow IDs must map to different metadata storage keys,
-        // for both the hash and schema halves.
         let kh0: soroban_sdk::Val = DataKey::EscrowMetadataHash(0u64).into_val(&env);
         let kh1: soroban_sdk::Val = DataKey::EscrowMetadataHash(1u64).into_val(&env);
         let kh999: soroban_sdk::Val = DataKey::EscrowMetadataHash(999u64).into_val(&env);
@@ -676,7 +438,6 @@ use soroban_sdk::{
             soroban_sdk::Val::get_payload(ks1),
             soroban_sdk::Val::get_payload(ks999)
         );
-        // The hash half and the schema half must never collide for the same id.
         assert_ne!(
             soroban_sdk::Val::get_payload(kh0),
             soroban_sdk::Val::get_payload(ks0)
@@ -692,11 +453,9 @@ use soroban_sdk::{
         let (client, admin, _contract_id) = setup_client(&env);
 
         assert!(!client.get_create_paused());
-
         let res = client.set_create_paused(&admin, &true);
         assert!(res);
         assert!(client.get_create_paused());
-
         let res = client.set_create_paused(&admin, &false);
         assert!(res);
         assert!(!client.get_create_paused());
@@ -708,7 +467,6 @@ use soroban_sdk::{
         env.mock_all_auths();
         let (client, _admin, _contract_id) = setup_client(&env);
         let non_admin = Address::generate(&env);
-
         let res = client.try_set_create_paused(&non_admin, &true);
         assert_eq!(res, Err(Ok(EscrowError::Unauthorized)));
     }
@@ -720,25 +478,18 @@ use soroban_sdk::{
         let env = Env::default();
         env.mock_all_auths();
         let (client, _admin, _contract_id) = setup_client(&env);
-
         let res = client.try_get_token(&999u64);
         assert_eq!(res, Err(Ok(EscrowError::NotFound)));
     }
 
     // ─── TTL Bumping on Escrow Reads ──────────────────────────────────────────
 
-    // A long-lived, open escrow must not be evicted while it is still being read.
-    // The read paths (e.g. `get_escrow`) are expected to `extend_ttl` on the
-    // `Escrow(id)` persistent key. This test creates an escrow, advances the
-    // ledger toward the TTL boundary, reads it (which should bump the TTL), then
-    // advances further and asserts the record is still live and readable.
     #[test]
     fn test_get_escrow_bumps_ttl_across_expiry_boundary() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin, _contract_id) = setup_client(&env);
 
-        // Register and whitelist a token, then fund the buyer.
         let token_admin = Address::generate(&env);
         let token = env
             .register_stellar_asset_contract_v2(token_admin)
@@ -751,27 +502,21 @@ use soroban_sdk::{
         token_admin_client.mint(&buyer, &1_000_000i128);
 
         let order_id = BytesN::from_array(&env, &[7u8; 32]);
-        // Amount stays within the [100, 1_000_000] limits configured in setup.
         let escrow_id = client.create(
             &buyer, &seller, &token, &1000i128, &order_id, &1000u32, &None, &None,
         );
 
-        // Advance the ledger close to the persistent TTL boundary, then read the
-        // escrow so the read path refreshes (bumps) its TTL.
         env.ledger().with_mut(|li| {
             li.sequence_number += 100_000;
         });
         let before = client.get_escrow(&escrow_id);
 
-        // Advance again past what would have been the original expiry. Because the
-        // read above bumped the TTL, the record must still be live and readable.
         env.ledger().with_mut(|li| {
             li.sequence_number += 100_000;
         });
         let after = client.get_escrow(&escrow_id);
 
         assert_eq!(before, after);
-    }
     }
 
     // ─── Issue #172: Escrow Creation Metadata Hash Tests ─────────────────────
@@ -1725,9 +1470,7 @@ use soroban_sdk::{
             &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
         );
 
-        // Generate a dummy oracle address.
-        let oracle_id = Address::generate(env);
-        // Register a dummy oracle contract so the address is valid.
+        // Generate a dummy oracle contract address for testing release conditions.
         let dummy_admin = Address::generate(env);
         let dummy_treasury = Address::generate(env);
         let oracle_id = env.register(
@@ -2823,52 +2566,66 @@ use soroban_sdk::{
         let res_auth = client.try_prune_dispute_votes(&stranger, &valid);
         assert_eq!(res_auth, Err(Ok(EscrowError::Unauthorized)));
     }
- 
-     #[test]
-     fn test_batch_deposit_missing_escrow_returns_not_found() {
-         let env = Env::default();
-         env.mock_all_auths();
-         let (client, admin, contract_id) = setup_client(&env);
-         let buyer = Address::generate(&env);
-         let seller = Address::generate(&env);
-         let token_admin = Address::generate(&env);
-         let token = env
-             .register_stellar_asset_contract_v2(token_admin)
-             .address();
-         let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
-         token_admin_client.mint(&buyer, &100_000i128);
-         client.add_token(&admin, &token);
-         let missing_order_id = BytesN::from_array(&env, &[90u8; 32]);
-         let valid_order_id = BytesN::from_array(&env, &[91u8; 32]);
-         // Create both escrows up front, then remove one stored record to simulate
-         // a corrupted/absent entry that deposit_internal must surface as NotFound.
-         let missing_escrow_id = client.create(
-             &buyer, &seller, &token, &1_000i128, &missing_order_id, &1_000u32, &None, &None,
-         );
-         let valid_escrow_id = client.create(
-             &buyer, &seller, &token, &1_000i128, &valid_order_id, &1_000u32, &None, &None,
-         );
-         env.as_contract(&contract_id, || {
-             env.storage()
-                 .persistent()
-                 .remove(&DataKey::Escrow(missing_escrow_id));
-         });
-         let mut orders = soroban_sdk::Vec::new(&env);
-         orders.push_back(crate::BatchDepositParams {
-             seller: seller.clone(),
-             token: token.clone(),
-             amount: 1_000i128,
-             order_id: missing_order_id,
-             timeout_ledgers: 1_000u32,
-             order_hash: None,
-             schema: None,
-         });
-         let res = client.try_batch_deposit(&buyer, &orders);
-         assert_eq!(res, Err(Ok(EscrowError::NotFound)));
-         // The valid order is untouched when the batch call returns a typed error.
-         let valid_record = client.get_escrow(&valid_escrow_id);
-         assert_eq!(valid_record.status, crate::EscrowStatus::Created);
-     }
+
+    #[test]
+    fn test_batch_deposit_missing_escrow_returns_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, contract_id) = setup_client(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &100_000i128);
+        client.add_token(&admin, &token);
+        let missing_order_id = BytesN::from_array(&env, &[90u8; 32]);
+        let valid_order_id = BytesN::from_array(&env, &[91u8; 32]);
+        // Create both escrows up front, then remove one stored record to simulate
+        // a corrupted/absent entry that deposit_internal must surface as NotFound.
+        let missing_escrow_id = client.create(
+            &buyer,
+            &seller,
+            &token,
+            &1_000i128,
+            &missing_order_id,
+            &1_000u32,
+            &None,
+            &None,
+        );
+        let valid_escrow_id = client.create(
+            &buyer,
+            &seller,
+            &token,
+            &1_000i128,
+            &valid_order_id,
+            &1_000u32,
+            &None,
+            &None,
+        );
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Escrow(missing_escrow_id));
+        });
+        let mut orders = soroban_sdk::Vec::new(&env);
+        orders.push_back(crate::BatchDepositParams {
+            seller: seller.clone(),
+            token: token.clone(),
+            amount: 1_000i128,
+            order_id: missing_order_id,
+            timeout_ledgers: 1_000u32,
+            order_hash: None,
+            schema: None,
+        });
+        let res = client.try_batch_deposit(&buyer, &orders);
+        assert_eq!(res, Err(Ok(EscrowError::NotFound)));
+        // The valid order is untouched when the batch call returns a typed error.
+        let valid_record = client.get_escrow(&valid_escrow_id);
+        assert_eq!(valid_record.status, crate::EscrowStatus::Created);
+    }
     // ─── Issue #142: entity id carried in event topics ───────────────────────
     /// The `released` event carries the escrow id as its third topic so
     /// indexers can subscribe by escrow without deserializing the event body.

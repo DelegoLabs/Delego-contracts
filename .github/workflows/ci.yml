@@ -127,16 +127,21 @@ jobs:
         run: cargo audit --deny warnings --file audit.toml
 
   wasm-proof:
-    name: WASM build proof (every crate)
+    name: WASM build proof (every contract crate)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Run independently of the host-target build job so that WASM
+    # build failures are reported as a distinct, clearly-labelled CI failure.
 
     steps:
       - uses: actions/checkout@v4
 
+      # rust-toolchain.toml already lists wasm32-unknown-unknown as a target,
+      # so the toolchain action installs both the compiler and the WASM target
+      # from the pinned channel in a single step.
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          toolchain-file: rust-toolchain.toml
 
       - uses: actions/cache@v4
         with:
@@ -148,22 +153,43 @@ jobs:
           restore-keys: |
             cargo-wasm-${{ runner.os }}-
 
-      - name: Build every workspace crate for wasm32-unknown-unknown (release)
-        run: |
-          cargo build --release --workspace --target wasm32-unknown-unknown
-
-      - name: Verify WASM artifacts were produced
+      # Build every workspace crate that can target wasm32-unknown-unknown.
+      # The `tests` crate is host-only (it uses std test-harness features and
+      # has no [lib] section), so it is explicitly excluded.  All five contract
+      # crates — delegation_registry, escrow, permissions, reputation, and
+      # marketplace — are covered by this single command.
+      - name: Build all contract crates for wasm32-unknown-unknown (release)
         run: |
           set -euo pipefail
-          echo "WASM artifacts produced:"
-          find target/wasm32-unknown-unknown/release -maxdepth 1 -name '*.wasm' -print
-          count=$(find target/wasm32-unknown-unknown/release -maxdepth 1 -name '*.wasm' | wc -l)
-          if [ "$count" -lt 5 ]; then
-            echo "::error::Expected at least 5 .wasm artifacts (one per contract crate), found $count"
+          cargo build --release --target wasm32-unknown-unknown \
+            --package delego-delegation-registry \
+            --package delego-escrow \
+            --package delego-permissions \
+            --package delego-reputation \
+            --package delego-marketplace
+
+      # Confirm that a .wasm artifact was produced for every contract crate.
+      # This step fails CI if the build silently skipped any package.
+      - name: Verify WASM artifacts were produced for all five contract crates
+        run: |
+          set -euo pipefail
+          RELEASE_DIR="target/wasm32-unknown-unknown/release"
+          EXPECTED=(
+            delego_delegation_registry.wasm
+            delego_escrow.wasm
+            delego_permissions.wasm
+            delego_reputation.wasm
+            delego_marketplace.wasm
+          )
+          missing=()
+          for artifact in "${EXPECTED[@]}"; do
+            if [ ! -f "${RELEASE_DIR}/${artifact}" ]; then
+              missing+=("${artifact}")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing WASM artifacts: ${missing[*]}"
             exit 1
           fi
-      - name: Build every workspace member for WASM
-          for package in $(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print("\\n".join(package["name"] for package in json.load(sys.stdin)["packages"]))'); do
-            echo "Building ${package}"
-            cargo build --package "${package}" --target wasm32-unknown-unknown --release
-          done
+          echo "All contract WASM artifacts present:"
+          ls -lh "${RELEASE_DIR}"/*.wasm

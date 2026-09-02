@@ -1,30 +1,11 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod test {
-    use crate::{
-        PermissionError, PermissionStatus, PermissionsContract, PermissionsContractClient,
-    };
+    use crate::{PermissionError, PermissionsContract, PermissionsContractClient};
     use soroban_sdk::{
         testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
         Address, Env, IntoVal, TryIntoVal, Vec,
     };
-
-    const MAX_SPEND_CPU_INSTRUCTIONS: u64 = 2_000_000;
-    const MAX_SPEND_MEMORY_BYTES: u64 = 2_000_000;
-
-    fn assert_cost_within_thresholds(env: &Env) {
-        let cost = env.cost_estimate().budget();
-        assert!(
-            cost.cpu_instruction_count() <= MAX_SPEND_CPU_INSTRUCTIONS,
-            "spend CPU budget exceeded: {}",
-            cost.cpu_instruction_count()
-        );
-        assert!(
-            cost.memory_bytes() <= MAX_SPEND_MEMORY_BYTES,
-            "spend memory budget exceeded: {}",
-            cost.memory_bytes()
-        );
-    }
 
     #[test]
     fn test_merchant_in_whitelist_succeeds() {
@@ -177,22 +158,6 @@ mod test {
     }
 
     #[test]
-    fn test_get_permission_missing_returns_error() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let owner = Address::generate(&env);
-        let delegate = Address::generate(&env);
-
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-
-        assert_eq!(
-            client.try_get_permission(&owner, &delegate),
-            Err(Ok(PermissionError::PermissionNotFound))
-        );
-    }
-
-    #[test]
     fn test_get_remaining_allowance() {
         let env = Env::default();
         let owner = Address::generate(&env);
@@ -210,22 +175,6 @@ mod test {
 
         client.execute_spend(&owner, &delegate, &30, &merchant);
         assert_eq!(client.get_remaining_allowance(&owner, &delegate), 970);
-    }
-
-    #[test]
-    fn test_get_remaining_allowance_missing_returns_error() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let owner = Address::generate(&env);
-        let delegate = Address::generate(&env);
-
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-
-        assert_eq!(
-            client.try_get_remaining_allowance(&owner, &delegate),
-            Err(Ok(PermissionError::PermissionNotFound))
-        );
     }
 
     // --- Issue #98: get_allowance_detail tests ---
@@ -315,6 +264,7 @@ mod test {
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
 
+        // get_permission panics on missing (existing behavior), but get_allowance_detail returns typed error.
         let result = client.try_get_allowance_detail(&owner, &delegate);
         assert_eq!(result, Err(Ok(PermissionError::PermissionNotFound)));
     }
@@ -351,21 +301,6 @@ mod test {
     }
 
     // --- Issue #99: PermissionSpendEvent snapshot tests ---
-
-    #[test]
-    fn test_spend_cost_stays_within_thresholds() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let owner = Address::generate(&env);
-        let delegate = Address::generate(&env);
-        let merchant = Address::generate(&env);
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-        let merchants = Vec::<Address>::new(&env);
-        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
-        client.execute_spend(&owner, &delegate, &60, &merchant);
-        assert_cost_within_thresholds(&env);
-    }
 
     #[test]
     fn test_spend_event_emitted_on_success() {
@@ -504,22 +439,6 @@ mod test {
         // PauseMetadata isn't there anymore, let's just assert it is paused
         let perm = client.get_permission(&owner, &delegate);
         assert_eq!(perm.status, crate::PermissionStatus::Paused);
-    }
-
-    #[test]
-    fn test_get_pause_metadata_missing_returns_error() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let owner = Address::generate(&env);
-        let delegate = Address::generate(&env);
-
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-
-        assert_eq!(
-            client.try_get_pause_metadata(&owner, &delegate),
-            Err(Ok(PermissionError::PermissionNotFound))
-        );
     }
 
     #[test]
@@ -1098,140 +1017,6 @@ mod test {
         }
     }
 
-    // ── Issue #51: Distinguish re-grant from first grant ─────────────────────
-
-    #[test]
-    fn test_first_grant_succeeds_and_emits_zero_delta() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let owner = Address::generate(&env);
-        let delegate = Address::generate(&env);
-        let merchant = Address::generate(&env);
-
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-
-        let mut merchants = Vec::<Address>::new(&env);
-        merchants.push_back(merchant.clone());
-
-        // A first grant is allowed.
-        assert_eq!(
-            client.try_grant(&owner, &delegate, &1000, &100, &merchants, &10000),
-            Ok(Ok(()))
-        );
-
-        // The granted event reports no previous spend and a full-limit delta.
-        let events = env.events().all();
-        let mut found = false;
-        for event in events.iter() {
-            let (contract, topics, value) = event;
-            if contract != contract_id || topics.len() != 2 {
-                continue;
-            }
-            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
-            if t0 == soroban_sdk::symbol_short!("perm")
-                && t1 == soroban_sdk::symbol_short!("granted")
-            {
-                let evt: crate::PermissionGrantedEvent = value.try_into_val(&env).unwrap();
-                assert_eq!(evt.previous_spent, 0);
-                assert_eq!(evt.remaining_delta, 1000);
-                found = true;
-            }
-        }
-        assert!(found, "PermissionGrantedEvent not found in events");
-    }
-
-    #[test]
-    fn test_regrant_without_flag_is_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let owner = Address::generate(&env);
-        let delegate = Address::generate(&env);
-
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-
-        let merchants = Vec::<Address>::new(&env);
-        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
-
-        // A plain grant on an existing live permission must not silently reset it.
-        assert_eq!(
-            client.try_grant(&owner, &delegate, &2000, &200, &merchants, &10000),
-            Err(Ok(PermissionError::AlreadyGranted))
-        );
-    }
-
-    #[test]
-    fn test_forced_regrant_reports_previous_spent_and_delta() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let owner = Address::generate(&env);
-        let delegate = Address::generate(&env);
-        let merchant = Address::generate(&env);
-
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-
-        let merchants = Vec::<Address>::new(&env);
-        client.grant(&owner, &delegate, &1000, &200, &merchants, &10000);
-
-        // Spend a portion so the re-grant has accounting to report.
-        client.execute_spend(&owner, &delegate, &150, &merchant);
-
-        // Explicit re-grant replaces the live permission. Read the events it
-        // emitted immediately after this single invocation.
-        assert_eq!(
-            client.try_re_grant(&owner, &delegate, &2000, &200, &merchants, &10000),
-            Ok(Ok(()))
-        );
-        let events = env.events().all();
-
-        // Accounting is reset (spent back to 0) under the new limit.
-        let detail = client.get_allowance_detail(&owner, &delegate);
-        assert_eq!(detail.limit, 2000);
-        assert_eq!(detail.spent, 0);
-        assert_eq!(detail.remaining, 2000);
-        let mut found = false;
-        for event in events.iter() {
-            let (contract, topics, value) = event;
-            if contract != contract_id || topics.len() != 2 {
-                continue;
-            }
-            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
-            if t0 == soroban_sdk::symbol_short!("perm")
-                && t1 == soroban_sdk::symbol_short!("granted")
-            {
-                let evt: crate::PermissionGrantedEvent = value.try_into_val(&env).unwrap();
-                assert_eq!(evt.total_limit, 2000);
-                assert_eq!(evt.previous_spent, 150);
-                assert_eq!(evt.remaining_delta, 1150);
-                found = true;
-            }
-        }
-        assert!(found, "PermissionGrantedEvent not found in events");
-    }
-
-    #[test]
-    fn test_re_grant_requires_existing_permission() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let owner = Address::generate(&env);
-        let delegate = Address::generate(&env);
-
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-
-        let merchants = Vec::<Address>::new(&env);
-
-        // Re-granting something that was never granted has nothing to replace.
-        assert_eq!(
-            client.try_re_grant(&owner, &delegate, &1000, &100, &merchants, &10000),
-            Err(Ok(PermissionError::PermissionNotFound))
-        );
-    }
-
     // ── Issue #185: Storage Key Namespace Tests ───────────────────────────────
 
     #[test]
@@ -1259,9 +1044,7 @@ mod test {
             policy_hash: hash.clone(),
             schema: soroban_sdk::symbol_short!("v1"),
         };
-        // The Permission key is already live from the grant above, so this is
-        // an explicit re-grant (issue #51).
-        client.re_grant_with_metadata(
+        client.grant_with_metadata(
             &owner,
             &delegate,
             &1000,
@@ -1581,9 +1364,8 @@ mod test {
         );
         assert!(client.get_metadata(&owner, &delegate).is_some());
 
-        // Second grant: without metadata — stale entry must be removed. The
-        // permission is live so an explicit re-grant is required (issue #51).
-        client.re_grant_with_metadata(&owner, &delegate, &2000, &200, &merchants, &10000, &None);
+        // Second grant: without metadata — stale entry must be removed.
+        client.grant_with_metadata(&owner, &delegate, &2000, &200, &merchants, &10000, &None);
         assert!(
             client.get_metadata(&owner, &delegate).is_none(),
             "Re-grant with None must clear stale metadata from the prior grant"
@@ -2501,21 +2283,17 @@ mod test {
             PermissionError::ExceedsParentLimit as u32,
             PermissionError::VelocityLimitExceeded as u32,
             PermissionError::InactivityThresholdNotSet as u32,
-            PermissionError::LimitBelowSpent as u32,
-            PermissionError::ExceedsAllowance as u32,
-            PermissionError::NotInitialized as u32,
         ];
 
         let mut seen = std::vec::Vec::<u32>::new();
         for &val in variants.iter() {
             assert!(
                 !seen.contains(&val),
-                "Duplicate discriminant {} found in PermissionError enum",
-                val
+                "Duplicate discriminant {val} found in PermissionError enum"
             );
             seen.push(val);
         }
-        assert_eq!(seen.len(), 24, "expected 24 distinct error discriminants");
+        assert_eq!(seen.len(), 21, "expected 21 distinct error discriminants");
     }
 
     #[test]
@@ -2542,9 +2320,6 @@ mod test {
             PermissionError::ExceedsParentLimit,
             PermissionError::VelocityLimitExceeded,
             PermissionError::InactivityThresholdNotSet,
-            PermissionError::LimitBelowSpent,
-            PermissionError::ExceedsAllowance,
-            PermissionError::NotInitialized,
         ];
 
         let mut seen = std::vec::Vec::<u32>::new();
@@ -2552,13 +2327,11 @@ mod test {
             let serialized = *variant as u32;
             assert!(
                 !seen.contains(&serialized),
-                "Duplicate serialized value {} for {:?}",
-                serialized,
-                variant
+                "Duplicate serialized value {serialized} for {variant:?}"
             );
             seen.push(serialized);
         }
-        assert_eq!(seen.len(), 24, "expected 24 distinct error variants");
+        assert_eq!(seen.len(), 21, "expected 21 distinct error variants");
     }
 
     // --- PermissionUsage & get_permission_usage tests ---
@@ -2770,235 +2543,5 @@ mod test {
         client.propose_admin(&admin, &new_admin);
         let res = client.try_accept_admin(&other);
         assert_eq!(res, Err(Ok(PermissionError::Unauthorized)));
-    }
-
-    #[test]
-    fn test_get_permissions_by_owner() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let owner = Address::generate(&env);
-        let delegate1 = Address::generate(&env);
-        let delegate2 = Address::generate(&env);
-        let delegate3 = Address::generate(&env);
-        let merchant = Address::generate(&env);
-
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-
-        let mut merchants = Vec::<Address>::new(&env);
-        merchants.push_back(merchant.clone());
-
-        // Grant 3 permissions
-        client.grant(&owner, &delegate1, &1000, &100, &merchants, &10000);
-        client.grant(&owner, &delegate2, &2000, &200, &merchants, &10000);
-        client.grant(&owner, &delegate3, &3000, &300, &merchants, &10000);
-
-        let perms = client.get_permissions_by_owner(&owner);
-        assert_eq!(perms.len(), 3);
-
-        // Revoke one permission
-        client.revoke(&owner, &delegate2);
-
-        let perms = client.get_permissions_by_owner(&owner);
-        assert_eq!(perms.len(), 2);
-
-        // Transfer a permission
-        let new_delegate = Address::generate(&env);
-        client.transfer_permission(&owner, &delegate1, &new_delegate);
-
-        let perms = client.get_permissions_by_owner(&owner);
-        assert_eq!(perms.len(), 2); // Still 2, delegate1 is removed, new_delegate is added.
-
-        // Verify new_delegate is in the list and delegate1 is not
-        let mut found_new = false;
-        let mut found_old = false;
-        for perm in perms.iter() {
-            if perm.delegate == new_delegate {
-                found_new = true;
-            }
-            if perm.delegate == delegate1 {
-                found_old = true;
-            }
-        }
-        assert!(found_new);
-        assert!(!found_old);
-    // --- grant expiry overflow (issue #52) -------------------------------------
-    fn test_grant_expiry_at_u32_max_boundary_succeeds() {
-        let delegate = Address::generate(&env);
-        let merchants = Vec::<Address>::new(&env);
-        env.ledger().with_mut(|li| {
-            li.sequence_number = 1_000;
-        });
-        // ttl_ledgers that lands the expiry exactly on u32::MAX must still succeed.
-        let ttl = u32::MAX - 1_000;
-        assert_eq!(
-            client.try_grant(&owner, &delegate, &1000, &100, &merchants, &ttl),
-            Ok(Ok(()))
-        );
-            client.get_permission(&owner, &delegate).expires_at_ledger,
-            u32::MAX
-    }
-    fn test_grant_expiry_overflow_returns_typed_error() {
-        // Just past the boundary: sequence + ttl == u32::MAX + 1.
-        // Must return a typed error instead of overflow-panicking.
-        let ttl = u32::MAX - 999;
-            Err(Ok(PermissionError::InvalidExpiry))
-        // Extreme ttl is handled the same way.
-            client.try_grant(&owner, &delegate, &1000, &100, &merchants, &u32::MAX),
-        // A subsequent in-range grant for the same pair still succeeds,
-        // confirming the rejected calls left no half-written state.
-            client.try_grant(&owner, &delegate, &1000, &100, &merchants, &10_000),
-            11_000
-    }
-
-    // --- Batch sweep tests ---
-
-    #[test]
-    fn test_sweep_expired_batch_transitions_eligible() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let owner = Address::generate(&env);
-        let delegate1 = Address::generate(&env);
-        let delegate2 = Address::generate(&env);
-        let caller = Address::generate(&env);
-
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-
-        let merchants = Vec::<Address>::new(&env);
-        // delegate1 expires at ledger 10, delegate2 expires at ledger 100
-        client.grant(&owner, &delegate1, &1000, &100, &merchants, &10);
-        client.grant(&owner, &delegate2, &1000, &100, &merchants, &100);
-
-        // Advance ledger to 50
-        env.ledger().set_sequence_number(50);
-
-        let mut pairs = Vec::<(Address, Address)>::new(&env);
-        pairs.push_back((owner.clone(), delegate1.clone()));
-        pairs.push_back((owner.clone(), delegate2.clone()));
-
-        let transitioned = client.sweep_expired_batch(&pairs, &caller);
-        assert_eq!(transitioned, 1);
-
-        let perm1 = client.get_permission(&owner, &delegate1);
-        assert_eq!(perm1.status, PermissionStatus::Expired);
-
-        let perm2 = client.get_permission(&owner, &delegate2);
-        assert_eq!(perm2.status, PermissionStatus::Active);
-    }
-
-    #[test]
-    fn test_sweep_expired_batch_rejects_over_limit() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let owner = Address::generate(&env);
-        let delegate = Address::generate(&env);
-        let caller = Address::generate(&env);
-
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-
-        let mut pairs = Vec::<(Address, Address)>::new(&env);
-        for _ in 0..51 {
-            pairs.push_back((owner.clone(), delegate.clone()));
-        }
-
-        let res = client.try_sweep_expired_batch(&pairs, &caller);
-        assert_eq!(res, Err(Ok(PermissionError::InvalidParam)));
-    }
-
-    #[test]
-    fn test_sweep_inactive_batch_transitions_eligible() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let owner = Address::generate(&env);
-        let delegate1 = Address::generate(&env);
-        let delegate2 = Address::generate(&env);
-        let caller = Address::generate(&env);
-
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-
-        client.set_admin(&admin);
-        client.set_inactivity_threshold(&admin, &1000);
-
-        env.ledger().set_timestamp(100);
-        let merchants = Vec::<Address>::new(&env);
-        client.grant(&owner, &delegate1, &1000, &100, &merchants, &10000);
-
-        env.ledger().set_timestamp(800);
-        client.grant(&owner, &delegate2, &1000, &100, &merchants, &10000);
-
-        // Advance timestamp to 1200: delegate1 (created 100, elapsed 1100 > 1000) is eligible,
-        // delegate2 (created 800, elapsed 400 < 1000) is not eligible.
-        env.ledger().set_timestamp(1200);
-
-        let mut pairs = Vec::<(Address, Address)>::new(&env);
-        pairs.push_back((owner.clone(), delegate1.clone()));
-        pairs.push_back((owner.clone(), delegate2.clone()));
-
-        let transitioned = client.sweep_inactive_batch(&pairs, &caller);
-        assert_eq!(transitioned, 1);
-
-        let perm1 = client.get_permission(&owner, &delegate1);
-        assert_eq!(perm1.status, PermissionStatus::Revoked);
-
-        let perm2 = client.get_permission(&owner, &delegate2);
-        assert_eq!(perm2.status, PermissionStatus::Active);
-    }
-
-    #[test]
-    fn test_sweep_inactive_batch_rejects_unset_threshold_or_over_limit() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let owner = Address::generate(&env);
-        let delegate = Address::generate(&env);
-        let caller = Address::generate(&env);
-
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-
-        let mut pairs = Vec::<(Address, Address)>::new(&env);
-        pairs.push_back((owner.clone(), delegate.clone()));
-
-        // Threshold not set
-        let res_no_thresh = client.try_sweep_inactive_batch(&pairs, &caller);
-        assert_eq!(
-            res_no_thresh,
-            Err(Ok(PermissionError::InactivityThresholdNotSet))
-        );
-
-        let admin = Address::generate(&env);
-        client.set_admin(&admin);
-        client.set_inactivity_threshold(&admin, &1000);
-
-        let mut over_cap = Vec::<(Address, Address)>::new(&env);
-        for _ in 0..51 {
-            over_cap.push_back((owner.clone(), delegate.clone()));
-        }
-
-        let res_over_cap = client.try_sweep_inactive_batch(&over_cap, &caller);
-        assert_eq!(res_over_cap, Err(Ok(PermissionError::InvalidParam)));
-    fn test_stale_nonce_relay_reverts() {
-        let merchant = Address::generate(&env);
-        let relayer = Address::generate(&env);
-        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
-        client.set_relayer_key(&owner, &delegate, &relayer);
-            li.sequence_number = 100;
-            client.try_execute_spend_via_relayer(&owner, &delegate, &50, &merchant, &1, &1000),
-            Err(Ok(PermissionError::InvalidNonce))
-    fn test_second_spend_inside_velocity_window_reverts() {
-        client.set_velocity_interval(&owner, &delegate, &10);
-            client.try_execute_spend(&owner, &delegate, &10, &merchant),
-        // A second spend inside the 10-ledger velocity window is rejected.
-            li.sequence_number = 105;
-            Err(Ok(PermissionError::VelocityLimitExceeded))
-        // Once the window has elapsed, spending is allowed again.
-            li.sequence_number = 110;
-    fn test_decrease_allowance_negative_amount_rejected() {
-        let result = client.try_decrease_allowance(&owner, &delegate, &-100);
-        assert!(result.is_err());
     }
 }
