@@ -5,11 +5,10 @@ mod test {
         DataKey, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError,
         EscrowMetadataEvent,
     };
-    use crate::{DataKey, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError, EscrowMetadataEvent};
     const MAX_DEPOSIT_CPU_INSTRUCTIONS: u64 = 3_000_000;
-const MAX_DEPOSIT_MEMORY_BYTES: u64 = 3_000_000;
+    const MAX_DEPOSIT_MEMORY_BYTES: u64 = 3_000_000;
 
-fn assert_deposit_cost_within_thresholds(env: &soroban_sdk::Env) {
+    fn assert_deposit_cost_within_thresholds(env: &soroban_sdk::Env) {
     let budget = env.cost_estimate().budget();
     assert!(budget.cpu_instruction_count() <= MAX_DEPOSIT_CPU_INSTRUCTIONS);
     assert!(budget.memory_bytes() <= MAX_DEPOSIT_MEMORY_BYTES);
@@ -240,6 +239,7 @@ use soroban_sdk::{
             &zero_account(&env),
             &100i128,
             &1_000_000i128,
+        );
         assert_eq!(res, Err(Ok(EscrowError::AlreadyInitialized)));
     }
 
@@ -734,7 +734,6 @@ use soroban_sdk::{
     // advances further and asserts the record is still live and readable.
     #[test]
     fn test_get_escrow_bumps_ttl_across_expiry_boundary() {
-    fn test_dispute_votes_removed_after_quorum_resolution() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin, _contract_id) = setup_client(&env);
@@ -772,30 +771,7 @@ use soroban_sdk::{
         let after = client.get_escrow(&escrow_id);
 
         assert_eq!(before, after);
-            &buyer,
-            &seller,
-            &token,
-            &1000i128,
-            &order_id,
-            &100u32,
-            &None,
-        client.deposit(&escrow_id, &1000i128);
-        let arbiter1 = Address::generate(&env);
-        let arbiter2 = Address::generate(&env);
-        client.set_quorum_config(
-            &admin,
-            &crate::QuorumConfig {
-                arbiters: soroban_sdk::vec![arbiter1.clone(), arbiter2.clone()],
-                threshold: 2,
-            },
-        client.dispute(&escrow_id);
-        client.vote(&escrow_id, &arbiter1, &true);
-        client.vote(&escrow_id, &arbiter2, &true);
-        client.resolve_dispute_quorum(&escrow_id);
-        assert!(
-            !env.storage()
-                .persistent()
-                .has(&DataKey::DisputeVotes(escrow_id))
+    }
     }
 
     // ─── Issue #172: Escrow Creation Metadata Hash Tests ─────────────────────
@@ -2871,6 +2847,7 @@ use soroban_sdk::{
          );
          let valid_escrow_id = client.create(
              &buyer, &seller, &token, &1_000i128, &valid_order_id, &1_000u32, &None, &None,
+         );
          env.as_contract(&contract_id, || {
              env.storage()
                  .persistent()
@@ -2885,7 +2862,7 @@ use soroban_sdk::{
              timeout_ledgers: 1_000u32,
              order_hash: None,
              schema: None,
-             order_id: valid_order_id,
+         });
          let res = client.try_batch_deposit(&buyer, &orders);
          assert_eq!(res, Err(Ok(EscrowError::NotFound)));
          // The valid order is untouched when the batch call returns a typed error.
@@ -2895,7 +2872,10 @@ use soroban_sdk::{
     // ─── Issue #142: entity id carried in event topics ───────────────────────
     /// The `released` event carries the escrow id as its third topic so
     /// indexers can subscribe by escrow without deserializing the event body.
+    #[test]
     fn test_released_event_carries_escrow_id_topic() {
+        let env = Env::default();
+        env.mock_all_auths();
         let (client, admin, contract_id) = setup_client(&env);
         let buyer = Address::generate(&env);
         let seller = Address::generate(&env);
@@ -2923,11 +2903,45 @@ use soroban_sdk::{
                 let t2: u64 = topics.get(2).unwrap().try_into_val(&env).unwrap();
                 assert_eq!(t2, escrow_id, "released topic must carry the escrow id");
                 found = true;
+            }
+        }
         assert!(found, "released event with escrow_id topic not found");
-    /// The `created` event (emitted by `deposit`) carries the escrow id topic.
+    }
+
+    /// The `created` event (emitted by `deposit`) carries the escrow id topic so
+    /// indexers can subscribe by escrow without deserializing the event body.
+    #[test]
     fn test_created_event_carries_escrow_id_topic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, contract_id) = setup_client(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
         let order_id = BytesN::from_array(&env, &[7u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+        let mut found = false;
+        for event in env.events().all().iter() {
+            let (c_id, topics, _value) = event;
+            if c_id != contract_id || topics.len() != 3 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
             if t0 == symbol_short!("escrow") && t1 == symbol_short!("created") {
+                let t2: u64 = topics.get(2).unwrap().try_into_val(&env).unwrap();
                 assert_eq!(t2, escrow_id, "created topic must carry the escrow id");
+                found = true;
+            }
+        }
         assert!(found, "created event with escrow_id topic not found");
+    }
 }

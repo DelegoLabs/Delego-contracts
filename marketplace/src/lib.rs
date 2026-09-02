@@ -64,6 +64,10 @@ pub enum ReputationResolution {
     NotConfigured,
     Available(u32, u64),
     CallFailed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
 pub struct MerchantStats {
     pub total: u64,
     pub active: u64,
@@ -78,16 +82,16 @@ pub struct DiscoveryPage {
     pub total: u32,
     pub next_offset: Option<u32>,
     pub next_cursor: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
 pub struct MerchantOperationalView {
     pub id: u64,
     pub name: String,
     pub status: MerchantStatus,
     pub verified: bool,
-    pub effective: bool,   // verified && status == Verified
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
+    pub effective: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,6 +100,10 @@ pub struct MerchantCursor {
     pub after_id: u64,
     pub status: MerchantStatus,
     pub limit: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
 pub struct NameRelease {
     pub name: String,
     pub released_at: u64,
@@ -107,16 +115,16 @@ pub struct NameRelease {
 pub struct MerchantViewDetailed {
     pub view: MerchantView,
     pub reputation: ReputationResolution,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
 pub struct CategoryEntry {
     pub key: Symbol,
     pub normalized: Symbol,
     pub display: String,
     pub added_at: u64,
 }
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub struct NameRelease { pub name: String, pub released_at: u64, pub previous_merchant: u64 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -184,23 +192,6 @@ impl From<MerchantValidationError> for MarketplaceError {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum MarketplaceError {
-    AlreadyInitialized = 1,
-    NotInitialized = 2,
-    Unauthorized = 3,
-    MerchantNotFound = 4,
-    AlreadyVerified = 5,
-    InvalidCommissionBps = 6,
-    DuplicateMerchantName = 7,
-    MerchantFrozen = 8,
-    MerchantClosed = 9,
-    VerifierAlreadyExists = 10,
-    VerifierNotFound = 11,
-    InsufficientVerifications = 12,
-    MetadataLockActive = 13,
-    InvalidCategory = 14,
-    InvalidParam = 15,
-    NoPendingAdmin = 16,
-    VerificationCountOverflow = 16,
     AlreadyInitialized = 4001,
     NotInitialized = 4002,
     Unauthorized = 4003,
@@ -217,6 +208,7 @@ pub enum MarketplaceError {
     InvalidCategory = 4014,
     InvalidParam = 4015,
     NoPendingAdmin = 4016,
+    VerificationCountOverflow = 4017,
 }
 
 // --- Events ---
@@ -379,6 +371,8 @@ pub struct CategoryAddedEvent {
 pub struct CategoryRemovedEvent {
     pub key: Symbol,
     pub removed_by: Address,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MerchantPrunedEvent {
     pub pruned_count: u32,

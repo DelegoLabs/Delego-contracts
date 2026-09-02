@@ -465,6 +465,30 @@ struct ContractInfo {
 }
 ```
 
+### Deployment Runbook per Contract
+
+The table below is the normative deployment manifest for the five Delego contracts. Replace `<...>` placeholders with the values returned by `soroban contract deploy` and use `--network testnet` for staging or `--network public` for mainnet.
+
+| Contract | Deploy wasm | Init call | Treasury/admin setup | Upgrade procedure |
+|---|---|---|---|---|
+| **Escrow** | `delego_escrow.wasm` | `initialize(admin, treasury, token)` | `add_token`, `set_limits`, `update_fee`; then `propose_admin`/`accept_admin` | `soroban contract upgrade --id <ESCROW_ID> --wasm <ESCROW_WASM> --source <ADMIN_ADDRESS> --network <NETWORK>` |
+| **Permissions** | `delego_permissions.wasm` | `initialize(admin)` or `set_admin(admin)` | `set_admin(admin)`; then `propose_admin`/`accept_admin` after deploy | `soroban contract upgrade --id <PERMISSIONS_ID> --wasm <PERMISSIONS_WASM> --source <ADMIN_ADDRESS> --network <NETWORK>` |
+| **Delegation Registry** | `delego_delegation_registry.wasm` | `initialize(admin)` | `propose_admin`/`accept_admin` | `soroban contract upgrade --id <DELEGATION_REGISTRY_ID> --wasm <DELEGATION_REGISTRY_WASM> --source <ADMIN_ADDRESS> --network <NETWORK>` |
+| **Reputation** | `delego_reputation.wasm` | `initialize(admin)` | `propose_admin`/`accept_admin`; pair registry with `set_reputation_contract` | `soroban contract upgrade --id <REPUTATION_ID> --wasm <REPUTATION_WASM> --source <ADMIN_ADDRESS> --network <NETWORK>` |
+| **Marketplace** | `delego_marketplace.wasm` | `initialize(admin, verifiers, required_verifications)` | `add_verifier`, `set_reputation_contract`, `set_metadata_cooldown`; then `propose_admin`/`accept_admin` | `soroban contract upgrade --id <MARKETPLACE_ID> --wasm <MARKETPLACE_WASM> --source <ADMIN_ADDRESS> --network <NETWORK>` |
+
+### DataKey Migration
+
+A release that changes the on-chain `DataKey` layout must ship a `migrate_data_keys(admin, version)` entrypoint or admin-only migration tool. Invoke it immediately after `soroban contract upgrade`, before any user operations. The migration must:
+
+1. Read each legacy `DataKey` with the old SDK types.
+2. Validate the record against the new schema (admin, status, amounts, expiry).
+3. Write the migrated record under the new `DataKey`.
+4. Publish `(contract, "migrated", entity_id)` for each migrated record.
+5. Re-run the contract test suite against the migrated shadow ledger before mainnet.
+
+For every contract, record the deployed contract id, deployer address, final admin address, wasm hash, and migration version in the project deployment manifest.
+
 ## Security Considerations
 
 ### Error Code Allocation

@@ -93,10 +93,8 @@ pub enum PermissionError {
     /// Relayer-submitted nonce does not match the delegate's expected next nonce
     InvalidNonce = 2013,
     /// Relayer-submitted signature has expired
-    SignatureExpired = 14,
-    /// A live permission already exists; use `re_grant` to replace it explicitly (issue #51)
-    AlreadyGranted = 15,
     SignatureExpired = 2014,
+    /// A live permission already exists; use `re_grant` to replace it explicitly (issue #51)
     AlreadyGranted = 2015,
     /// Owner and delegate cannot be the same address
     SelfDelegationNotAllowed = 2401,
@@ -115,20 +113,16 @@ pub enum PermissionError {
     /// A pending allowance decrease already exists for this delegation
     PendingDecreaseExists = 2408,
     /// Time-lock on pending allowance decrease has not elapsed yet
-    TimeLockActive = 409,
+    TimeLockActive = 2409,
     /// Decrease would drop the allowance limit below what has already been spent
-    LimitBelowSpent = 410,
+    LimitBelowSpent = 2410,
     /// A multi-owner spend accumulation would overflow or exceed the
     /// permission's total allowance
-    ExceedsAllowance = 411,
-    ExceedsAllowance = 410,
+    ExceedsAllowance = 2411,
     /// A grant's `expires_at_ledger = ledger_sequence + ttl_ledgers`
     /// computation would overflow `u32`, so no valid expiry ledger can be
     /// represented. Returned instead of an arithmetic overflow panic.
-    InvalidExpiry = 411,
-    TimeLockActive = 2409,
-    LimitBelowSpent = 2410,
-    ExceedsAllowance = 2411,
+    InvalidExpiry = 2412,
     /// Admin-gated call made before `set_admin` has ever been called
     NotInitialized = 2500,
 }

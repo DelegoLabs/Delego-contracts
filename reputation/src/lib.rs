@@ -151,20 +151,13 @@ pub enum ReputationError {
     InvalidRating = 0x0003_0006,
     EntityFrozen = 0x0003_0007,
     /// Same reporter already flagged.
-    AlreadyFlagged = 8,
-    NoActiveFlag = 10,
-    NotFlagReporter = 11,
-    InvalidParam = 9,
-    /// No active (unresolved) flag from reporter.
-    NoActiveFlag = 10,
-    /// Reporter did not flag the entity.
-    /// No flags exist for this entity.
-    /// The caller is not the reporter who flagged this entity.
-    /// Entity has no flags on file.
-    /// Reporter is not the creator of an active flag.
-    NotFlagReporter = 11,
     AlreadyFlagged = 0x0003_0008,
+    /// Invalid input parameter.
     InvalidParam = 0x0003_0009,
+    /// No active (unresolved) flag from reporter.
+    NoActiveFlag = 0x0003_000A,
+    /// Reporter did not flag the entity.
+    NotFlagReporter = 0x0003_000B,
 }
 
 #[cfg(test)]
@@ -185,6 +178,7 @@ mod error_code_allocation {
             }
         }
     }
+    #[test]
     fn reputation_error_codes_are_unique_and_in_allocated_space() {
         let mut codes = [
             ReputationError::AlreadyInitialized as u32,
@@ -196,26 +190,19 @@ mod error_code_allocation {
             ReputationError::EntityFrozen as u32,
             ReputationError::AlreadyFlagged as u32,
             ReputationError::InvalidParam as u32,
+            ReputationError::NoActiveFlag as u32,
+            ReputationError::NotFlagReporter as u32,
         ];
         for code in codes {
             assert!(
                 (0x0003_0001..=0x0003_ffff).contains(&code),
                 "ReputationError code {code:#x} escaped its allocated contract space"
             );
+        }
         codes.sort_unstable();
         codes.dedup();
-        assert_eq!(codes.len(), 9, "ReputationError codes must be unique");
-    /// resolve_flag called for a reporter whose flag is already resolved
-    /// (or never existed) — distinguishes the "no active flag" case from
-    /// the generic entity-not-found case.
-    /// resolve_flag called with a reporter that has no flag on this entity
-    /// (someone else's flag cannot be resolved through this reporter).
-    /// `resolve_flag` was asked to clear a flag for an entity that has no
-    /// active (unresolved) flags at all — the reporter may never have
-    /// flagged, or all of its flags were already resolved.
-    /// `resolve_flag` was asked to clear a flag for a reporter that is not
-    /// the source of the entity's (still active) flag — there is an active
-    /// flag, but it belongs to a different reporter.
+        assert_eq!(codes.len(), 11, "ReputationError codes must be unique");
+    }
 }
 
 #[contracttype]

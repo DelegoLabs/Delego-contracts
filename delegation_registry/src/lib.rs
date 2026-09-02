@@ -193,32 +193,25 @@ pub enum DataKey {
 #[repr(u32)]
 pub enum DelegationError {
     /// The delegation was not found.
-    NotFound = 1,
-    /// The delegation is not active.
-    NotActive = 2,
-    /// The delegation is not paused.
-    NotPaused = 3,
-    /// The delegation has expired.
-    Expired = 4,
-    /// The registry has already been initialized.
-    AlreadyInitialized = 5,
-    /// The provided version is invalid.
-    InvalidVersion = 6,
-    /// The target version is not lower than the current version.
-    VersionNotLower = 7,
-    /// The requested snapshot was not found.
-    SnapshotNotFound = 8,
-    InvalidAgentId = 9,
-    IdExhausted = 9,
     NotFound = 301,
+    /// The delegation is not active.
     NotActive = 302,
+    /// The delegation is not paused.
     NotPaused = 303,
+    /// The delegation has expired.
     Expired = 304,
+    /// The registry has already been initialized.
     AlreadyInitialized = 305,
+    /// The provided version is invalid.
     InvalidVersion = 306,
+    /// The target version is not lower than the current version.
     VersionNotLower = 307,
+    /// The requested snapshot was not found.
     SnapshotNotFound = 308,
+    /// The provided agent id is invalid.
     InvalidAgentId = 309,
+    /// No more delegation ids are available.
+    IdExhausted = 310,
 }
 
 /// The delegation registry contract.

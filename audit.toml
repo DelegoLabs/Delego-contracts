@@ -1,0 +1,36 @@
+# cargo-audit configuration for Delego-contracts
+# https://docs.rs/cargo-audit/latest/cargo_audit/config/struct.AuditConfig.html
+#
+# SECURITY POLICY
+# ---------------
+# The CI job runs `cargo audit --deny warnings` so any NEW advisory (including
+# informational/unmaintained) causes a build failure.  An advisory is only
+# added to the ignore list below after the team has:
+#   1. Confirmed the advisory does not affect the contract execution path.
+#   2. Documented *why* it is safe to ignore (see inline comments).
+#   3. Set a `--expires` date no longer than 90 days in the future so the
+#      exception is periodically re-evaluated.
+#
+# Format: https://docs.rs/cargo-audit/latest/cargo_audit/config/
+#
+# Example entry (do NOT add without team review):
+#
+# [advisories.ignore]
+# id = "RUSTSEC-YYYY-NNNN"
+# reason = "Only affects the X feature which is not compiled in this workspace"
+# expires = "YYYY-MM-DD"
+
+[advisories]
+# Deny all vulnerability categories.
+ignore = []
+
+[output]
+# Show the full advisory text for every finding so developers have context.
+deny = ["warnings"]
+
+[database]
+# Always fetch the latest RustSec advisory database on each run.
+fetch = true
+# Fail the build if the advisory database cannot be updated (stale data is
+# worse than no data for a security check).
+stale = "error"

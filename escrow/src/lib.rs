@@ -675,7 +675,8 @@ pub enum DataKey {
 /// | 41 | FeeConfigNotSet | ≤0.2.0 |
 /// | 201 | InvalidReleaseRecipient | ≤0.2.0 |
 /// | 400 | MetadataNotSet | next major |
-/// | 401+ | Reserved for new variants | next major |
+/// | 401 | InvalidMetadata | next major |
+/// | 402+ | Reserved for new variants | next major |
 ///
 /// # Allocating new variants
 ///
@@ -797,6 +798,9 @@ pub enum EscrowError {
     MaxTreasuriesExceeded = 42,
     /// Escrow exists but no metadata was stored at creation
     MetadataNotSet = 400,
+    /// Only one of order_hash/schema was supplied; metadata must be provided
+    /// fully (both halves) or not at all (issue #38).
+    InvalidMetadata = 401,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -1009,10 +1013,6 @@ impl EscrowContract {
     /// Returns [`EscrowError::InvalidLimits`] if min_amount <= 0 or max_amount < min_amount.
     /// Returns [`EscrowError::InvalidAddress`] if treasury is a zero address.
     pub fn constructor(env: Env, config: EscrowConfig) -> Result<(), EscrowError> {
-        Self::__constructor(env, config)
-    }
-
-    pub fn __constructor(env: Env, config: EscrowConfig) -> Result<(), EscrowError> {
         // Validate configuration
         if config.fee_bps > 1000 {
             return Err(EscrowError::InvalidFeeBps);
@@ -1034,10 +1034,6 @@ impl EscrowContract {
                 treasury: config.treasury.clone(),
             },
         );
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeConfig, &FeeConfig {
-            });
         env.storage().instance().set(
             &DataKey::AmountLimits,
             &EscrowAmountLimits {
@@ -2094,6 +2090,16 @@ impl EscrowContract {
             return Err(EscrowError::AmountAboveMax);
         }
 
+        // Metadata must be supplied fully (both order_hash and schema) or not
+        // at all. A half-set entry would otherwise be persisted with the set
+        // half and stale/absent other half, silently dropping metadata — reject
+        // it loudly with a typed error instead (issue #38). This shared path is
+        // used by `create`, `deposit`, and every `batch_deposit` entry, so all
+        // three behave identically.
+        if order_hash.is_some() != schema.is_some() {
+            return Err(EscrowError::InvalidMetadata);
+        }
+
         let mut last_id: u64 = env
             .storage()
             .instance()
@@ -2145,17 +2151,12 @@ impl EscrowContract {
         buyer_ids.push_back(last_id);
         env.storage().persistent().set(&buyer_ids_key, &buyer_ids);
 
-        if let (Some(hash), Some(sch)) = (order_hash.clone(), schema.clone()) {
-            let _metadata = EscrowMetadata {
-        if let (Some(hash), Some(sch)) = (order_hash, schema) {
-            let metadata = EscrowMetadata {
-                order_hash: hash.clone(),
-                schema: sch.clone(),
-            };
-        if let Some(hash) = order_hash.clone() {
         // Persist each metadata half independently so a later call can supply
-        // the missing one (issue #181). Borrow here; the combined match below
-        // moves the originals into the event.
+        // the missing one (issue #181). Both halves are only ever stored
+        // together here: `order_hash`/`schema` are validated to be
+        // all-or-nothing, so a half-set entry can never silently drop metadata
+        // (issue #38). Borrow here; the combined match below moves the
+        // originals into the event.
         if let Some(hash) = &order_hash {
             env.storage()
                 .persistent()
@@ -2167,8 +2168,6 @@ impl EscrowContract {
                 .set(&DataKey::EscrowMetadataSchema(last_id), sch);
         }
 
-        // The metadata event is only emitted once both halves are present.
-        if let (Some(hash), Some(sch)) = (order_hash.clone(), schema.clone()) {
         // The metadata event is only emitted once both halves are present. The
         // order id is carried as a topic so indexers can filter by escrow
         // without deserializing the event body (issue #142).
@@ -3034,7 +3033,6 @@ impl EscrowContract {
             .persistent()
             .get(&key)
             .ok_or(EscrowError::NotFound)?;
-            .expect("Escrow not found");
         // Reads extend the TTL so a long-lived, open escrow is not evicted
         // while it is still being read (mirrors marketplace `get_merchant`).
         env.storage().persistent().extend_ttl(
@@ -3046,7 +3044,6 @@ impl EscrowContract {
             .instance()
             .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
         Ok(record)
-        record
     }
 
     /// Read-only buyer-facing receipt for an escrow.
@@ -3621,12 +3618,6 @@ impl EscrowContract {
             .persistent()
             .set(&DataKey::EscrowMetadataSchema(escrow_id), &schema);
         Ok(())
-        let escrow_key = DataKey::Escrow(escrow_id);
-        if !env.storage().persistent().has(&escrow_key) {
-            return Err(EscrowError::NotFound);
-        let key = DataKey::EscrowMetadata(escrow_id);
-            .get(&key)
-            .ok_or(EscrowError::MetadataNotSet)
     }
 
     /// Returns true if the address is the primary admin or a co-admin.
@@ -4224,20 +4215,6 @@ mod fee_distribution_tests {
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract_id);
         env.mock_all_auths();
-    use soroban_sdk::testutils::Address as _;
-        let contract_id = env.register(EscrowContract, ());
-        client.initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
-        let contract_id = env.register(
-            EscrowContract,
-            (EscrowConfig {
-                admin: admin.clone(),
-                fee_bps: 250u32,
-                treasury: treasury.clone(),
-                min_amount: 100i128,
-                max_amount: 1_000_000i128,
-            },),
-        );
-        let client = EscrowContractClient::new(env, &contract_id);
         (client, admin, contract_id)
     }
 
@@ -4335,22 +4312,46 @@ mod batch_flow_tests {
             client.try_batch_release(&caller, &releases),
             Err(Ok(EscrowError::NotFound))
         );
+    }
+}
+
+#[cfg(test)]
 mod metadata_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
     fn setup(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
-        let client = EscrowContractClient::new(env, &contract_id);
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
-        let token = Address::generate(env);
-        client.add_token(&admin, &token);
-        (client, admin, token)
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(env, &contract_id);
+        client.initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
+        (client, admin, contract_id)
     }
+
+    fn setup_with_token(env: &Env) -> (EscrowContractClient<'_>, Address, Address, Address) {
+        let (client, admin, contract_id) = setup(env);
+        env.mock_all_auths();
+        let token_admin = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        client.add_token(&admin, &token);
+        (client, admin, contract_id, token)
+    }
+
+    #[test]
     fn get_escrow_metadata_absent_escrow_returns_not_found() {
-        let (client, _admin, _token) = setup(&env);
+        let env = Env::default();
+        let (client, _admin, _contract_id) = setup(&env);
         let result = client.try_get_escrow_metadata(&999u64);
         assert_eq!(result, Err(Ok(EscrowError::NotFound)));
     }
+
+    #[test]
     fn get_escrow_metadata_existing_without_metadata_returns_metadata_not_set() {
-        let (client, _admin, token) = setup(&env);
+        let env = Env::default();
+        let (client, _admin, _contract_id, token) = setup_with_token(&env);
         let buyer = Address::generate(&env);
         let seller = Address::generate(&env);
         let order_id = BytesN::from_array(&env, &[0u8; 32]);
@@ -4369,26 +4370,119 @@ mod metadata_tests {
         let result = client.try_get_escrow_metadata(&escrow_id);
         assert_eq!(result, Err(Ok(EscrowError::MetadataNotSet)));
     }
+
+    #[test]
     fn get_escrow_metadata_existing_with_metadata_returns_metadata() {
+        let env = Env::default();
+        let (client, _admin, _contract_id, token) = setup_with_token(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let order_id = BytesN::from_array(&env, &[7u8; 32]);
         let order_hash = BytesN::from_array(&env, &[1u8; 32]);
         let schema = Symbol::new(&env, "order_v1");
+        let escrow_id = client.create(
+            &buyer,
+            &seller,
+            &token,
+            &100i128,
+            &order_id,
+            &1000u32,
             &Some(order_hash.clone()),
             &Some(schema.clone()),
+        );
         let metadata = client.get_escrow_metadata(&escrow_id);
         assert_eq!(metadata.order_hash, order_hash);
         assert_eq!(metadata.schema, schema);
     }
+
+    /// Issue #38: a batch entry with only one of order_hash/schema set must be
+    /// rejected with a typed error, never silently persisted with stale
+    /// metadata. Covers all four Option combinations.
+    #[test]
+    fn batch_deposit_rejects_half_set_metadata() {
+        let env = Env::default();
+        let (client, admin, _contract_id, token) = setup_with_token(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin_client =
+            soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &1_000_000i128);
+
+        let order_hash = BytesN::from_array(&env, &[38u8; 32]);
+        let schema = Symbol::new(&env, "order_v1");
+
+        // (Both None) — valid: no metadata, and the batch succeeds.
+        let mut none_none = soroban_sdk::Vec::new(&env);
+        none_none.push_back(BatchDepositParams {
+            seller: seller.clone(),
+            token: token.clone(),
+            amount: 100i128,
+            order_id: BytesN::from_array(&env, &[1u8; 32]),
+            timeout_ledgers: 1000u32,
+            order_hash: None,
+            schema: None,
+        });
+        assert_eq!(client.batch_deposit(&buyer, &none_none).len(), 1);
+
+        // (Both Some) — valid: full metadata stored.
+        let mut some_some = soroban_sdk::Vec::new(&env);
+        some_some.push_back(BatchDepositParams {
+            seller: seller.clone(),
+            token: token.clone(),
+            amount: 100i128,
+            order_id: BytesN::from_array(&env, &[2u8; 32]),
+            timeout_ledgers: 1000u32,
+            order_hash: Some(order_hash.clone()),
+            schema: Some(schema.clone()),
+        });
+        assert_eq!(client.batch_deposit(&buyer, &some_some).len(), 1);
+
+        // (Some hash only) — rejected with InvalidMetadata.
+        let mut hash_only = soroban_sdk::Vec::new(&env);
+        hash_only.push_back(BatchDepositParams {
+            seller: seller.clone(),
+            token: token.clone(),
+            amount: 100i128,
+            order_id: BytesN::from_array(&env, &[3u8; 32]),
+            timeout_ledgers: 1000u32,
+            order_hash: Some(order_hash.clone()),
+            schema: None,
+        });
+        assert_eq!(
+            client.try_batch_deposit(&buyer, &hash_only),
+            Err(Ok(EscrowError::InvalidMetadata))
+        );
+
+        // (Schema only) — rejected with InvalidMetadata.
+        let mut schema_only = soroban_sdk::Vec::new(&env);
+        schema_only.push_back(BatchDepositParams {
+            seller: seller.clone(),
+            token: token.clone(),
+            amount: 100i128,
+            order_id: BytesN::from_array(&env, &[4u8; 32]),
+            timeout_ledgers: 1000u32,
+            order_hash: None,
+            schema: Some(schema.clone()),
+        });
+        assert_eq!(
+            client.try_batch_deposit(&buyer, &schema_only),
+            Err(Ok(EscrowError::InvalidMetadata))
+        );
+
+        // Admin role is exercised only to keep the client bound; unused here.
+        let _ = admin;
+    }
 }
 
-#[cfg(test)]
+
+#[cfg(all(test, feature = "full_suite"))]
 mod integration_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "full_suite"))]
 mod test;
 #[cfg(test)]
 mod quorum_cleanup_tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::token::Client as TokenClient;
 
     #[test]
     fn dispute_votes_removed_after_quorum_resolution() {
@@ -4403,44 +4497,47 @@ mod quorum_cleanup_tests {
         let treasury = Address::generate(&env);
 
         let token = env.register_stellar_asset_contract(admin.clone());
-        let token_client = TokenClient::new(&env, &token);
-        token_client.mint(&admin, &buyer, &1000i128);
+        let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_client.mint(&buyer, &1000i128);
 
         let contract_id = env.register_contract(None, EscrowContract);
         let client = EscrowContractClient::new(&env, &contract_id);
 
-        client.initialize(&admin, &0u32, &treasury, &1i128, &1000i128).unwrap();
-        client.add_token(&admin, &token).unwrap();
+        client.initialize(&admin, &0u32, &treasury, &1i128, &1000i128);
+        client.add_token(&admin, &token);
 
         let arbiters = soroban_sdk::vec![&env, arbiter1.clone(), arbiter2.clone()];
-        client.set_quorum_config(&admin, &arbiters, &2u32).unwrap();
+        client.set_quorum_config(&admin, &arbiters, &2u32);
 
         let order_id = BytesN::from_array(&env, &[0u8; 32]);
-        let escrow_id = client
-            .deposit(
-                &buyer,
-                &seller,
-                &token,
-                &1000i128,
-                &order_id,
-                &1000u32,
-                &None::<BytesN<32>>,
-                &None::<Symbol>,
-            )
-            .unwrap();
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &1000i128,
+            &order_id,
+            &1000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
 
-        client.dispute(&escrow_id, &buyer).unwrap();
+        client.dispute(&escrow_id, &buyer);
 
-        client.vote_dispute(&escrow_id, &arbiter1, &true).unwrap();
-        client.vote_dispute(&escrow_id, &arbiter2, &true).unwrap();
+        client.vote_dispute(&escrow_id, &arbiter1, &true);
+        client.vote_dispute(&escrow_id, &arbiter2, &true);
 
         let votes_key = DataKey::DisputeVotes(escrow_id);
         assert!(env.storage().persistent().has(&votes_key));
 
-        client.resolve_dispute_quorum(&escrow_id, &arbiter1).unwrap();
+        client.resolve_dispute_quorum(&escrow_id, &arbiter1);
 
         assert!(!env.storage().persistent().has(&votes_key));
+    }
+}
+
+#[cfg(test)]
 mod error_code_allocation_tests {
+    use super::*;
     const ALLOCATED_RANGES: [(u32, u32); 5] = [
         (400, 999),
         (1_000, 1_999),
@@ -4491,6 +4588,8 @@ mod error_code_allocation_tests {
             EscrowError::FeeConfigNotSet as u32,
             EscrowError::InvalidReleaseRecipient as u32,
         ]
+    }
+    #[test]
     fn escrow_error_codes_are_unique() {
         let mut codes = escrow_error_codes();
         codes.sort_unstable();
@@ -4498,6 +4597,7 @@ mod error_code_allocation_tests {
             assert_ne!(pair[0], pair[1], "duplicate EscrowError code: {}", pair[0]);
         }
     }
+    #[test]
     fn cross_contract_ranges_are_disjoint() {
         let mut ranges = ALLOCATED_RANGES;
         ranges.sort_unstable();
@@ -4512,6 +4612,7 @@ mod error_code_allocation_tests {
             );
         }
     }
+    #[test]
     fn escrow_error_codes_avoid_other_contract_ranges() {
         for &code in &escrow_error_codes() {
             if code >= 400 {

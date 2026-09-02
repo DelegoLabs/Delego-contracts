@@ -105,6 +105,27 @@ jobs:
       - name: Build contracts
         run: cargo build --target wasm32-unknown-unknown --release
 
+  audit:
+    name: Supply-chain audit (cargo-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # cargo-audit reads Cargo.lock directly; no compilation needed, so we
+      # skip the Rust toolchain / build cache setup to keep this job fast.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # --deny warnings promotes every advisory (including informational /
+      # unmaintained) to a hard failure.  Exceptions require a documented entry
+      # in audit.toml (see that file for the approval process).
+      - name: Run cargo audit
+        run: cargo audit --deny warnings --file audit.toml
+
   wasm-proof:
     name: WASM build proof (every crate)
     runs-on: ubuntu-latest

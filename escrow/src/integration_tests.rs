@@ -2475,7 +2475,12 @@ fn test_upgrade_with_admin_handover_preserves_state_and_emits_event() {
         record_before, record_after,
         "escrow record must survive the upgrade"
     );
+}
+
+#[test]
 fn test_split_release_multi_treasury() {
+    let t = TestEnv::setup_with_fee_bps(500);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
     let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
     // Setup multi-treasury
     let treasury1 = Address::generate(&t.env);
@@ -2492,7 +2497,7 @@ fn test_split_release_multi_treasury() {
     release_shares.push_back((recipient2.clone(), 6000));
     // Release shares
     assert!(escrow_client.split_release(&escrow_id, &t.buyer, &release_shares));
-    // Fees: 
+    // Fees:
     // total base amount = 10000
     // share1 amount = 4000
     // fee1 = 4000 * 500 / 10000 = 200. Net = 3800.
