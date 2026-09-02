@@ -136,7 +136,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          toolchain-file: rust-toolchain.toml
 
       - uses: actions/cache@v4
         with:
@@ -148,9 +148,17 @@ jobs:
           restore-keys: |
             cargo-wasm-${{ runner.os }}-
 
-      - name: Build every workspace crate for wasm32-unknown-unknown (release)
+      - name: Build all contract crates individually for wasm32-unknown-unknown
         run: |
-          cargo build --release --workspace --target wasm32-unknown-unknown
+          set -euo pipefail
+          # Enumerate every workspace member that has a lib target (i.e. a
+          # deployable contract crate).  The "tests" crate has no lib and
+          # is not a deployable contract, so it is intentionally excluded.
+          for package in $(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.targets[] | .kind[] == "cdylib") | .name'); do
+            echo "Building ${package} for wasm32-unknown-unknown..."
+            cargo build --package "${package}" --target wasm32-unknown-unknown --release
+          done
 
       - name: Verify WASM artifacts were produced
         run: |
@@ -162,8 +170,3 @@ jobs:
             echo "::error::Expected at least 5 .wasm artifacts (one per contract crate), found $count"
             exit 1
           fi
-      - name: Build every workspace member for WASM
-          for package in $(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print("\\n".join(package["name"] for package in json.load(sys.stdin)["packages"]))'); do
-            echo "Building ${package}"
-            cargo build --package "${package}" --target wasm32-unknown-unknown --release
-          done
