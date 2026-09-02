@@ -1983,11 +1983,19 @@ impl EscrowContract {
     }
 
     /// Read-only getter for a token's liquidity pool balance.
-    pub fn get_liquidity_pool(env: Env, token: Address) -> LiquidityPool {
+    ///
+    /// # Errors
+    /// Returns [`EscrowError::PoolNotFound`] when no pool has ever been funded
+    /// for the given token, so callers can distinguish an unfunded pool from a
+    /// funded one that is currently empty.
+    pub fn get_liquidity_pool(
+        env: Env,
+        token: Address,
+    ) -> Result<LiquidityPool, EscrowError> {
         env.storage()
             .instance()
-            .get(&DataKey::LiquidityPool(token.clone()))
-            .unwrap_or(LiquidityPool { token, balance: 0 })
+            .get(&DataKey::LiquidityPool(token))
+            .ok_or(EscrowError::PoolNotFound)
     }
 
     /// Create an escrow in unfunded `Created` status.
@@ -4625,4 +4633,5 @@ mod error_code_allocation_tests {
             }
         }
     }
+}
 }

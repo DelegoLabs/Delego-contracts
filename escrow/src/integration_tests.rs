@@ -1937,7 +1937,9 @@ fn test_fund_pool_increases_balance() {
     let new_balance = escrow_client.fund_pool(&funder, &t.token_contract_id, &2000);
     assert_eq!(new_balance, 2000);
 
-    let pool = escrow_client.get_liquidity_pool(&t.token_contract_id);
+    let pool = escrow_client
+        .get_liquidity_pool(&t.token_contract_id)
+        .unwrap();
     assert_eq!(pool.balance, 2000);
     assert_eq!(pool.token, t.token_contract_id);
     assert_eq!(token_client.balance(&t.escrow_contract_id), 2000);
@@ -1947,6 +1949,7 @@ fn test_fund_pool_increases_balance() {
     assert_eq!(
         escrow_client
             .get_liquidity_pool(&t.token_contract_id)
+            .unwrap()
             .balance,
         2500
     );
@@ -1994,7 +1997,9 @@ fn test_settle_from_pool_transfers_to_seller() {
 
     // Pool balance is debited by the settled amount, mirroring the real
     // token movement out of the reserve.
-    let pool = escrow_client.get_liquidity_pool(&t.token_contract_id);
+    let pool = escrow_client
+        .get_liquidity_pool(&t.token_contract_id)
+        .unwrap();
     assert_eq!(pool.balance, 4000);
 }
 
@@ -2016,6 +2021,7 @@ fn test_settle_from_pool_decrements_balance_and_blocks_overcommit() {
     assert_eq!(
         escrow_client
             .get_liquidity_pool(&t.token_contract_id)
+            .unwrap()
             .balance,
         4000
     );
@@ -2093,6 +2099,7 @@ fn test_withdraw_from_pool_respects_available_balance() {
     assert_eq!(
         escrow_client
             .get_liquidity_pool(&t.token_contract_id)
+            .unwrap()
             .balance,
         600
     );
@@ -2123,13 +2130,54 @@ fn test_withdraw_from_pool_rejects_non_admin() {
 }
 
 #[test]
-fn test_get_liquidity_pool_defaults_to_zero_for_unfunded_token() {
+fn test_get_liquidity_pool_returns_not_found_for_unfunded_token() {
     let t = TestEnv::setup();
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
 
-    let pool = escrow_client.get_liquidity_pool(&t.token_contract_id);
-    assert_eq!(pool.balance, 0);
+    // No pool has ever been funded for the (whitelisted) token, so the getter
+    // reports PoolNotFound rather than fabricating a zero-balance pool.
+    assert_eq!(
+        escrow_client.try_get_liquidity_pool(&t.token_contract_id),
+        Err(Ok(EscrowError::PoolNotFound))
+    );
+}
+
+#[test]
+fn test_get_liquidity_pool_distinguishes_funded_empty_from_funded_nonzero() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let funder = Address::generate(&t.env);
+    let token_admin_client =
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token_contract_id);
+    token_admin_client.mint(&funder, &3000);
+    escrow_client.fund_pool(&funder, &t.token_contract_id, &1000);
+
+    // Funded and non-zero: the pool returns its real balance.
+    let pool = escrow_client
+        .get_liquidity_pool(&t.token_contract_id)
+        .unwrap();
+    assert_eq!(pool.balance, 1000);
     assert_eq!(pool.token, t.token_contract_id);
+
+    // Withdraw everything: a funded-but-empty pool is distinct from a
+    // never-funded one — it returns a zero-balance pool, not PoolNotFound.
+    escrow_client.withdraw_from_pool(&t.admin, &t.token_contract_id, &1000);
+    let empty_pool = escrow_client
+        .get_liquidity_pool(&t.token_contract_id)
+        .unwrap();
+    assert_eq!(empty_pool.balance, 0);
+
+    // A different token that was never funded still reports PoolNotFound.
+    let other_admin = Address::generate(&t.env);
+    let other_token = t
+        .env
+        .register_stellar_asset_contract_v2(other_admin.clone())
+        .address();
+    assert_eq!(
+        escrow_client.try_get_liquidity_pool(&other_token),
+        Err(Ok(EscrowError::PoolNotFound))
+    );
 }
 
 // --- batch_deposit / batch_release / batch_refund (issue #317) ---
