@@ -152,6 +152,16 @@ pub struct Verifier {
     pub registered_at: u64,
 }
 
+pub const MAX_VERIFIERS: u32 = 50;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct VerifierPage {
+    pub items: Vec<Verifier>,
+    pub total: u32,
+    pub next_offset: Option<u32>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractVersion {
@@ -198,6 +208,7 @@ pub enum MarketplaceError {
     MerchantNotFound = 4004,
     AlreadyVerified = 4005,
     InvalidCommissionBps = 4006,
+    VerifierLimitReached = 4090,
     DuplicateMerchantName = 4007,
     MerchantFrozen = 4008,
     MerchantClosed = 4009,
@@ -1027,14 +1038,19 @@ impl MarketplaceContract {
             return Err(MarketplaceError::Unauthorized);
         }
 
-        let mut verifiers = Self::get_verifiers(env.clone());
+               let mut verifiers = Self::get_verifiers(env.clone());
         for v in verifiers.iter() {
             if v.address == verifier.address {
                 return Err(MarketplaceError::VerifierAlreadyExists);
             }
         }
 
+        if verifiers.len() as u32 >= MAX_VERIFIERS {
+            return Err(MarketplaceError::VerifierLimitReached);
+        }
+
         verifiers.push_back(verifier.clone());
+
         env.storage()
             .instance()
             .set(&DataKey::Verifiers, &verifiers);
@@ -2200,6 +2216,28 @@ impl MarketplaceContract {
             .instance()
             .get(&DataKey::Verifiers)
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Paginated verifier read. Prefer this over `get_verifiers` for large sets.
+    pub fn get_verifiers_page(env: Env, offset: u32, limit: u32) -> VerifierPage {
+        let verifiers: Vec<Verifier> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Verifiers)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = verifiers.len() as u32;
+        let start = offset.min(total);
+        let end = start.saturating_add(limit).min(total);
+
+        let mut items = Vec::new(&env);
+        for i in start..end {
+            items.push_back(verifiers.get(i).unwrap());
+        }
+
+        let next_offset = if end < total { Some(end) } else { None };
+
+        VerifierPage { items, total, next_offset }
     }
 
     pub fn version(_env: Env) -> ContractVersion {
