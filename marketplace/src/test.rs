@@ -2853,3 +2853,57 @@ fn test_register_merchant_event_carries_merchant_id_topic() {
     assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::InvalidParam);
     let unchanged = f.client.get_merchant(&id);
     assert_eq!(unchanged.name, String::from_str(&f.env, "Store A Updated"));
+
+
+    #[test]
+fn add_verifier_rejects_when_at_capacity() {
+    let (env, admin, contract_id) = setup();
+    let client = MarketplaceContractClient::new(&env, &contract_id);
+
+    for _ in 0..MAX_VERIFIERS {
+        let addr = Address::generate(&env);
+        let v = Verifier { address: addr, label: Symbol::new(&env, "v"), registered_at: 0 };
+        client.add_verifier(&admin, &v);
+    }
+
+    let one_more = Verifier {
+        address: Address::generate(&env),
+        label: Symbol::new(&env, "over"),
+        registered_at: 0,
+    };
+    let result = client.try_add_verifier(&admin, &one_more);
+    assert_eq!(result, Err(Ok(MarketplaceError::VerifierLimitReached)));
+}
+
+#[test]
+fn get_verifiers_page_returns_correct_slice() {
+    let (env, admin, contract_id) = setup();
+    let client = MarketplaceContractClient::new(&env, &contract_id);
+
+    for _ in 0..5 {
+        let v = Verifier {
+            address: Address::generate(&env),
+            label: Symbol::new(&env, "v"),
+            registered_at: 0,
+        };
+        client.add_verifier(&admin, &v);
+    }
+
+    let page = client.get_verifiers_page(&2, &2);
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.total, 5);
+    assert_eq!(page.next_offset, Some(4));
+
+    let last_page = client.get_verifiers_page(&4, &2);
+    assert_eq!(last_page.items.len(), 1);
+    assert_eq!(last_page.next_offset, None);
+}
+
+#[test]
+fn get_verifiers_page_offset_beyond_total_returns_empty() {
+    let (env, admin, contract_id) = setup();
+    let client = MarketplaceContractClient::new(&env, &contract_id);
+    let page = client.get_verifiers_page(&100, &10);
+    assert_eq!(page.items.len(), 0);
+    assert_eq!(page.next_offset, None);
+}
