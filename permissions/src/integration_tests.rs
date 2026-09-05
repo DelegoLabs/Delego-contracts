@@ -357,6 +357,62 @@ fn test_permission_events() {
 }
 
 #[test]
+fn test_decrease_allowance_timelock_defaults_to_one_day() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    assert_eq!(client.get_decrease_timelock_secs(), 86400);
+
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &36000);
+    client.decrease_allowance(&t.buyer, &t.agent, &200);
+
+    t.env
+        .ledger()
+        .set_timestamp(t.env.ledger().timestamp() + 86399);
+    assert_eq!(
+        client.try_execute_decrease_allowance(&t.buyer, &t.agent),
+        Err(Ok(PermissionError::TimeLockActive))
+    );
+}
+
+#[test]
+fn test_set_decrease_allowance_timelock_custom_value() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    assert_eq!(
+        client.try_set_decrease_timelock_secs(&t.admin, &0),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+    assert_eq!(
+        client.try_set_decrease_timelock_secs(&t.admin, &2592001),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+
+    client.set_decrease_timelock_secs(&t.admin, &3600);
+    assert_eq!(client.get_decrease_timelock_secs(), 3600);
+
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &36000);
+    client.decrease_allowance(&t.buyer, &t.agent, &200);
+
+    t.env
+        .ledger()
+        .set_timestamp(t.env.ledger().timestamp() + 3599);
+    assert_eq!(
+        client.try_execute_decrease_allowance(&t.buyer, &t.agent),
+        Err(Ok(PermissionError::TimeLockActive))
+    );
+
+    t.env
+        .ledger()
+        .set_timestamp(t.env.ledger().timestamp() + 1);
+    client.execute_decrease_allowance(&t.buyer, &t.agent);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 800);
+}
+
+#[test]
 fn test_decrease_allowance_timelock() {
     let t = TestEnv::setup();
     let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);

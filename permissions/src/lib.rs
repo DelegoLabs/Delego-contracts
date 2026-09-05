@@ -1,7 +1,31 @@
 //! Delego Permissions Contract
 //! Spending limits, delegated authority, and time-locked allowance decrements
+//!
+//! # Error code allocation
+//!
+//! Numeric error codes are `u32` values surfaced over the bridge, so every
+//! contract must own a disjoint numeric block. The current allocation is:
+//!
+//! | Contract          | Range      |
+//! |-------------------|------------|
+//! | `EscrowError`     | 1000-1999  |
+//! | `PermissionError` | 2000-2999  |
+//! | `ReputationError` | 3000-3999  |
+//! | `DelegationError` | 4000-4999  |
+//! | `MarketplaceError` | 5000-5999 |
+//!
+//! `PermissionError` keeps its historical status-code style by adding the
+//! allocation base (`2000`) to each legacy value (e.g. `ParentNotFound`
+//! moves from `404` to `2404`). The unit tests below enforce that every
+//! `PermissionError` discriminant is inside the contract's range and that
+//! the documented ranges are pairwise disjoint.
 
+// Contract crates compile as no_std for release and wasm builds, but keep std
+// enabled during testing so dev-dependencies and test assertions operate normally.
+// This exact conditional form must be consistent across all workspace contract crates.
 #![cfg_attr(not(test), no_std)]
+#![allow(clippy::too_many_arguments)]
+#![warn(missing_docs)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, xdr::ToXdr, Address, BytesN,
     Env, Symbol, Vec,
@@ -29,71 +53,170 @@ pub const MAX_AUDIT_ENTRIES: u32 = 200;
 /// effectively disable spending forever with no clear signal, so it is
 /// rejected outright.
 pub const MAX_VELOCITY_INTERVAL: u32 = 6_307_200;
+/// Default allowance-decrease timelock in seconds (24 hours).
+pub const DEFAULT_DECREASE_TIMELOCK_SECS: u64 = 86_400;
+/// Maximum configurable allowance-decrease timelock (30 days).
+pub const MAX_DECREASE_TIMELOCK_SECS: u64 = 2_592_000;
+pub const MAX_SWEEP_BATCH: u32 = 50;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
+/// Errors returned by permission operations.
+#[allow(missing_docs)]
 pub enum PermissionError {
     /// No permission record found for this owner/delegate pair
-    PermissionNotFound = 302,
-    NotFound = 1,
+    PermissionNotFound = 2302,
+    NotFound = 2001,
     /// Permission has expired
-    Expired = 2,
+    Expired = 2002,
     /// Amount exceeds per-transaction limit
-    ExceedsPerTxLimit = 3,
+    ExceedsPerTxLimit = 2003,
     /// Amount exceeds remaining total allowance
-    ExceedsTotalLimit = 4,
+    ExceedsTotalLimit = 2004,
     /// Merchant is not in the allowed merchants list
-    MerchantNotAllowed = 5,
+    MerchantNotAllowed = 2005,
     /// Caller is not authorized (not the owner)
-    Unauthorized = 6,
+    Unauthorized = 2006,
     /// Invalid parameter (zero limit, etc.)
-    InvalidParam = 7,
+    InvalidParam = 2007,
     /// Permission is currently paused
-    PermissionPaused = 8,
+    PermissionPaused = 2008,
     /// Permission is already paused
-    AlreadyPaused = 9,
+    AlreadyPaused = 2009,
     /// Permission is already active
-    AlreadyActive = 10,
+    AlreadyActive = 2010,
     /// New grants are globally paused by admin
-    GrantsPaused = 11,
+    GrantsPaused = 2011,
     /// No relayer signing key registered for this delegate
-    RelayerKeyNotSet = 12,
+    RelayerKeyNotSet = 2012,
     /// Relayer-submitted nonce does not match the delegate's expected next nonce
-    InvalidNonce = 13,
+    InvalidNonce = 2013,
     /// Relayer-submitted signature has expired
-    SignatureExpired = 14,
+    SignatureExpired = 2014,
     /// A live permission already exists; use `re_grant` to replace it explicitly (issue #51)
-    AlreadyGranted = 15,
+    AlreadyGranted = 2015,
     /// Owner and delegate cannot be the same address
-    SelfDelegationNotAllowed = 401,
+    SelfDelegationNotAllowed = 2401,
     /// Fewer valid owner signatures were provided than the configured threshold
-    InsufficientSignatures = 402,
+    InsufficientSignatures = 2402,
     /// Metadata schema is not in the approved schema registry
-    UnknownSchema = 403,
+    UnknownSchema = 2403,
     /// Referenced parent permission was not found
-    ParentNotFound = 404,
+    ParentNotFound = 2404,
     /// Child limits exceed what the parent permission can back
-    ExceedsParentLimit = 405,
+    ExceedsParentLimit = 2405,
     /// Spend rejected because the velocity (min interval) limit has not elapsed
-    VelocityLimitExceeded = 406,
+    VelocityLimitExceeded = 2406,
     /// sweep_inactive called before admin has configured an inactivity threshold
-    InactivityThresholdNotSet = 407,
+    InactivityThresholdNotSet = 2407,
     /// A pending allowance decrease already exists for this delegation
-    PendingDecreaseExists = 408,
+    PendingDecreaseExists = 2408,
     /// Time-lock on pending allowance decrease has not elapsed yet
-    TimeLockActive = 409,
+    TimeLockActive = 2409,
     /// Decrease would drop the allowance limit below what has already been spent
-    LimitBelowSpent = 410,
+    LimitBelowSpent = 2410,
     /// A multi-owner spend accumulation would overflow or exceed the
     /// permission's total allowance
-    ExceedsAllowance = 411,
+    ExceedsAllowance = 2411,
+    /// A grant's `expires_at_ledger = ledger_sequence + ttl_ledgers`
+    /// computation would overflow `u32`, so no valid expiry ledger can be
+    /// represented. Returned instead of an arithmetic overflow panic.
+    InvalidExpiry = 2412,
     /// Admin-gated call made before `set_admin` has ever been called
-    NotInitialized = 500,
+    NotInitialized = 2500,
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::PermissionError;
+
+    const ERROR_CODE_RANGES: &[(&str, u32, u32)] = &[
+        ("EscrowError", 1000, 1999),
+        ("PermissionError", 2000, 2999),
+        ("ReputationError", 3000, 3999),
+        ("DelegationError", 4000, 4999),
+        ("MarketplaceError", 5000, 5999),
+    ];
+
+    const PERMISSION_ERROR_CODES: &[u32] = &[
+        PermissionError::PermissionNotFound as u32,
+        PermissionError::NotFound as u32,
+        PermissionError::Expired as u32,
+        PermissionError::ExceedsPerTxLimit as u32,
+        PermissionError::ExceedsTotalLimit as u32,
+        PermissionError::MerchantNotAllowed as u32,
+        PermissionError::Unauthorized as u32,
+        PermissionError::InvalidParam as u32,
+        PermissionError::PermissionPaused as u32,
+        PermissionError::AlreadyPaused as u32,
+        PermissionError::AlreadyActive as u32,
+        PermissionError::GrantsPaused as u32,
+        PermissionError::RelayerKeyNotSet as u32,
+        PermissionError::InvalidNonce as u32,
+        PermissionError::SignatureExpired as u32,
+        PermissionError::AlreadyGranted as u32,
+        PermissionError::SelfDelegationNotAllowed as u32,
+        PermissionError::InsufficientSignatures as u32,
+        PermissionError::UnknownSchema as u32,
+        PermissionError::ParentNotFound as u32,
+        PermissionError::ExceedsParentLimit as u32,
+        PermissionError::VelocityLimitExceeded as u32,
+        PermissionError::InactivityThresholdNotSet as u32,
+        PermissionError::PendingDecreaseExists as u32,
+        PermissionError::TimeLockActive as u32,
+        PermissionError::LimitBelowSpent as u32,
+        PermissionError::ExceedsAllowance as u32,
+        PermissionError::NotInitialized as u32,
+    ];
+
+    #[test]
+    fn permission_error_codes_are_unique_and_in_reserved_range() {
+        let permission_range = ERROR_CODE_RANGES
+            .iter()
+            .find(|entry| entry.0 == "PermissionError")
+            .expect("PermissionError range must be declared");
+        let (start, end) = (permission_range.1, permission_range.2);
+
+        for (i, code) in PERMISSION_ERROR_CODES.iter().enumerate() {
+            assert!(
+                (start..=end).contains(code),
+                "PermissionError code {} is outside the allocated range {}-{}",
+                code,
+                start,
+                end
+            );
+            assert!(
+                !PERMISSION_ERROR_CODES[..i].contains(code),
+                "duplicate PermissionError code {}",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn error_code_ranges_are_disjoint() {
+        for (i, &(name_i, start_i, end_i)) in ERROR_CODE_RANGES.iter().enumerate() {
+            for &(name_j, start_j, end_j) in ERROR_CODE_RANGES.iter().skip(i + 1) {
+                assert!(
+                    end_i < start_j || end_j < start_i,
+                    "error code ranges overlap: {} ({}-{}) and {} ({}-{})",
+                    name_i,
+                    start_i,
+                    end_i,
+                    name_j,
+                    start_j,
+                    end_j
+                );
+            }
+        }
+    }
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// The current state of a permission.
+#[allow(missing_docs)]
 pub enum PermissionStatus {
     Active,
     Paused,
@@ -103,6 +226,8 @@ pub enum PermissionStatus {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// A record describing a delegated permission from an owner to a delegate.
+#[allow(missing_docs)]
 pub struct PermissionRecord {
     pub owner: Address,
     pub delegate: Address,
@@ -129,6 +254,7 @@ pub struct PermissionRecord {
 /// storage by `(owners[0], delegate)` — see `DataKey::MultiPermission`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
 pub struct MultiOwnerPermission {
     pub owners: Vec<Address>,
     pub threshold: u32,
@@ -144,6 +270,8 @@ pub struct MultiOwnerPermission {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+/// Emitted when a multi-owner permission is granted.
+#[allow(missing_docs)]
 pub struct MultiOwnerGrantedEvent {
     pub primary_owner: Address,
     pub delegate: Address,
@@ -155,6 +283,7 @@ pub struct MultiOwnerGrantedEvent {
 /// Emitted after a multi-owner delegated spend is successfully recorded (issue #326).
 #[contracttype]
 #[derive(Clone, Debug)]
+#[allow(missing_docs)]
 pub struct MultiOwnerSpendEvent {
     pub primary_owner: Address,
     pub delegate: Address,
@@ -167,6 +296,7 @@ pub struct MultiOwnerSpendEvent {
 /// Emitted when an admin registers a new approved metadata schema (issue #328).
 #[contracttype]
 #[derive(Clone, Debug)]
+#[allow(missing_docs)]
 pub struct SchemaRegisteredEvent {
     pub admin: Address,
     pub schema: Symbol,
@@ -175,6 +305,7 @@ pub struct SchemaRegisteredEvent {
 /// Lightweight config for multi-merchant whitelisting and allowance tracking.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
 pub struct PermissionConfig {
     pub merchants: Vec<Address>,
     pub allowance: i128,
@@ -182,6 +313,8 @@ pub struct PermissionConfig {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+/// Emitted when a permission is granted.
+#[allow(missing_docs)]
 pub struct PermissionGrantedEvent {
     pub owner: Address,
     pub delegate: Address,
@@ -201,6 +334,8 @@ pub struct PermissionGrantedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+/// Emitted when a permission is revoked.
+#[allow(missing_docs)]
 pub struct PermissionRevokedEvent {
     pub owner: Address,
     pub delegate: Address,
@@ -208,6 +343,8 @@ pub struct PermissionRevokedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+/// Emitted when a permission is transferred to a new delegate.
+#[allow(missing_docs)]
 pub struct PermissionTransferredEvent {
     pub owner: Address,
     pub old_delegate: Address,
@@ -218,6 +355,7 @@ pub struct PermissionTransferredEvent {
 /// Emitted after a delegated spend is successfully recorded (issue #99).
 #[contracttype]
 #[derive(Clone, Debug)]
+#[allow(missing_docs)]
 pub struct PermissionSpendEvent {
     pub owner: Address,
     pub delegate: Address,
@@ -232,6 +370,7 @@ pub struct PermissionSpendEvent {
 /// and later re-derived and verified inside `execute_spend_via_relayer`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
 pub struct RelayedSpendMessage {
     pub owner: Address,
     pub delegate: Address,
@@ -243,6 +382,8 @@ pub struct RelayedSpendMessage {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+/// Emitted when a permission's merchant whitelist changes.
+#[allow(missing_docs)]
 pub struct MerchantWhitelistChangedEvent {
     pub owner: Address,
     pub delegate: Address,
@@ -251,6 +392,8 @@ pub struct MerchantWhitelistChangedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// A pending allowance decrease waiting for its time-lock to expire.
+#[allow(missing_docs)]
 pub struct PendingAllowanceDecrement {
     pub amount: i128,
     pub execution_time: u64,
@@ -259,6 +402,7 @@ pub struct PendingAllowanceDecrement {
 /// Typed allowance breakdown returned by `get_allowance_detail` (issue #98).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
 pub struct RemainingAllowance {
     pub limit: i128,
     pub spent: i128,
@@ -269,6 +413,7 @@ pub struct RemainingAllowance {
 /// Contract identity returned by `version` (issue #103).
 #[contracttype]
 #[derive(Clone, Debug)]
+#[allow(missing_docs)]
 pub struct ContractVersion {
     pub name: Symbol,
     pub semver: Symbol,
@@ -277,6 +422,7 @@ pub struct ContractVersion {
 /// Stored when a permission is paused; cleared on resume (issue #105).
 #[contracttype]
 #[derive(Clone, Debug)]
+#[allow(missing_docs)]
 pub struct PauseMetadata {
     pub paused_by: Address,
     pub reason_code: Symbol,
@@ -285,6 +431,8 @@ pub struct PauseMetadata {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+/// Emitted when a permission is paused.
+#[allow(missing_docs)]
 pub struct PermissionPausedEvent {
     pub owner: Address,
     pub delegate: Address,
@@ -571,6 +719,8 @@ pub enum DataKey {
     InactivityThreshold,
     /// Instance-level minimum number of ledgers between successive spends (velocity limit).
     MinSpendInterval,
+    /// Instance-level delay in seconds before a scheduled allowance decrease can execute.
+    DecreaseTimelockSecs,
     /// Last ledger on which a spend was executed for a (owner, delegate) pair.
     LastSpendLedger(Address, Address),
     /// Append-only audit log for a (owner, delegate) pair.
@@ -722,6 +872,29 @@ impl PermissionsContract {
         }
 
         let expires_at_ledger = env.ledger().sequence() + ttl_ledgers;
+        let expires_at_ledger = Self::grant_expiry_ledger(&env, ttl_ledgers)?;
+
+        let user_perms_key = DataKey::UserPermissions(owner.clone());
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&user_perms_key)
+            .unwrap_or(Vec::new(&env));
+        if !delegates.contains(&delegate) {
+            delegates.push_back(delegate.clone());
+            env.storage().persistent().set(&user_perms_key, &delegates);
+        }
+
+        let user_perms_key = DataKey::UserPermissions(owner.clone());
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&user_perms_key)
+            .unwrap_or(Vec::new(&env));
+        if !delegates.contains(&delegate) {
+            delegates.push_back(delegate.clone());
+            env.storage().persistent().set(&user_perms_key, &delegates);
+        }
 
         let user_perms_key = DataKey::UserPermissions(owner.clone());
         let mut delegates: Vec<Address> = env
@@ -864,7 +1037,7 @@ impl PermissionsContract {
             return Err(PermissionError::ExceedsParentLimit);
         }
 
-        let requested_expiry = env.ledger().sequence() + ttl_ledgers;
+        let requested_expiry = Self::grant_expiry_ledger(&env, ttl_ledgers)?;
         let expires_at_ledger = requested_expiry.min(parent_record.expires_at_ledger);
 
         let record = PermissionRecord {
@@ -1233,6 +1406,15 @@ impl PermissionsContract {
         Ok(stored_admin)
     }
 
+    /// Computes an absolute expiry ledger as `current_sequence + ttl_ledgers`,
+    /// returning [`PermissionError::InvalidExpiry`] instead of overflow-panicking
+    /// when `ttl_ledgers` is large enough to push the sum past `u32::MAX`.
+    fn grant_expiry_ledger(env: &Env, ttl_ledgers: u32) -> Result<u32, PermissionError> {
+        ttl_ledgers
+            .checked_add(env.ledger().sequence())
+            .ok_or(PermissionError::InvalidExpiry)
+    }
+
     /// Validates the merchant whitelist:
     /// - Must not exceed `MAX_MERCHANTS_PER_PERMISSION` entries.
     /// - Must not contain duplicate addresses.
@@ -1406,8 +1588,9 @@ impl PermissionsContract {
         // since the last recorded spend ledger for this (owner, delegate) pair.
         Self::check_velocity(&env, &owner, &delegate)?;
 
-        let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
+        let _velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
 
+        let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
         let remaining = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
         // Emit after successful spend only (issue #99).
@@ -1646,6 +1829,13 @@ impl PermissionsContract {
             merchant.clone(),
         )?;
 
+        // #54: Velocity check — reject if min_spend_interval has not yet elapsed
+        // since the last recorded spend ledger for this (owner, delegate) pair.
+        // Shared with execute_spend so direct and relayed spends share the
+        // same throttle (issue #179).
+        // Velocity check for relayed spend path
+        Self::check_velocity(&env, &owner, &delegate)?;
+
         // Advance the nonce before mutating spend state so a replay attempt
         // within the same ledger is rejected even if apply_spend panics.
         env.storage().persistent().set(&nonce_key, &(nonce + 1));
@@ -1724,7 +1914,7 @@ impl PermissionsContract {
         }
 
         let primary_owner = unique_owners.get(0).unwrap();
-        let expires_at_ledger = env.ledger().sequence() + ttl_ledgers;
+        let expires_at_ledger = Self::grant_expiry_ledger(&env, ttl_ledgers)?;
 
         let record = MultiOwnerPermission {
             owners: unique_owners.clone(),
@@ -1982,10 +2172,15 @@ impl PermissionsContract {
         env.storage().persistent().get(&key).unwrap()
     }
 
-    pub fn get_remaining_allowance(env: Env, owner: Address, delegate: Address) -> i128 {
+    pub fn get_permission(env: Env, owner: Address, delegate: Address) -> PermissionRecord {
         let key = DataKey::Permission(owner, delegate);
-        let record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
-        record.limit_total - record.spent
+        env.storage().persistent().get(&key).ok_or(PermissionError::PermissionNotFound)
+    }
+
+    pub fn get_remaining_allowance(env: Env, owner: Address, delegate: Address) -> Result<i128, PermissionError> {
+        let key = DataKey::Permission(owner, delegate);
+        let record: PermissionRecord = env.storage().persistent().get(&key).ok_or(PermissionError::PermissionNotFound)?;
+        Ok(record.limit_total - record.spent)
     }
 
     /// Typed allowance getter: returns limit, spent, remaining (clamped ≥ 0),
@@ -2086,6 +2281,7 @@ impl PermissionsContract {
         }
 
         let execution_time = env.ledger().timestamp() + 86400;
+        let execution_time = env.ledger().timestamp() + Self::get_decrease_timelock_secs(env.clone());
 
         let pending = PendingAllowanceDecrement {
             amount,
@@ -2227,18 +2423,20 @@ impl PermissionsContract {
         Ok(())
     }
 
-    /// Returns the stored pause metadata for `(owner, delegate)`, or `Ok(None)`
-    /// when the permission is not currently paused (never panics on a missing
-    /// entry).
+    /// Returns the stored pause metadata for `(owner, delegate)`.
+    ///
+    /// # Errors
+    /// [`PermissionError::PermissionNotFound`] if no pause metadata is stored
+    /// for the pair.
     pub fn get_pause_metadata(
         env: Env,
         owner: Address,
         delegate: Address,
-    ) -> Result<Option<PauseMetadata>, PermissionError> {
-        Ok(env
-            .storage()
+    ) -> Result<PauseMetadata, PermissionError> {
+        env.storage()
             .persistent()
-            .get(&DataKey::PauseMetadata(owner, delegate)))
+            .get(&DataKey::PauseMetadata(owner, delegate))
+            .ok_or(PermissionError::PermissionNotFound)
     }
 
     pub fn set_admin(env: Env, admin: Address) {
@@ -2498,10 +2696,138 @@ impl PermissionsContract {
         Ok(true)
     }
 
+    /// Bounded batch version of [`Self::sweep_expired`].
+    ///
+    /// Callable by anyone. Up to `MAX_SWEEP_BATCH` (50) `(owner, delegate)` pairs can be provided.
+    /// Iterates through the pairs, updating eligible records to `PermissionStatus::Expired`.
+    /// Returns the number of transitioned records.
+    pub fn sweep_expired_batch(
+        env: Env,
+        pairs: Vec<(Address, Address)>,
+        caller: Address,
+    ) -> Result<u32, PermissionError> {
+        caller.require_auth();
+
+        if pairs.len() > MAX_SWEEP_BATCH {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        let mut transitioned: u32 = 0;
+        for (owner, delegate) in pairs.iter() {
+            let key = DataKey::Permission(owner.clone(), delegate.clone());
+            if let Some(mut record) = env.storage().persistent().get::<_, PermissionRecord>(&key) {
+                if record.status == PermissionStatus::Active
+                    && env.ledger().sequence() >= record.expires_at_ledger
+                {
+                    record.status = PermissionStatus::Expired;
+                    env.storage().persistent().set(&key, &record);
+                    Self::append_audit_log(
+                        &env,
+                        &owner,
+                        &delegate,
+                        caller.clone(),
+                        symbol_short!("expired"),
+                    );
+                    transitioned += 1;
+                }
+            }
+        }
+
+        Ok(transitioned)
+    }
+
+    /// Bounded batch version of [`Self::sweep_inactive`].
+    ///
+    /// Callable by anyone. Up to `MAX_SWEEP_BATCH` (50) `(owner, delegate)` pairs can be provided.
+    /// Iterates through the pairs, revoking inactive permissions that have sat idle past the inactivity threshold.
+    /// Returns the number of transitioned records.
+    pub fn sweep_inactive_batch(
+        env: Env,
+        pairs: Vec<(Address, Address)>,
+        caller: Address,
+    ) -> Result<u32, PermissionError> {
+        caller.require_auth();
+
+        if pairs.len() > MAX_SWEEP_BATCH {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        let threshold = Self::get_inactivity_threshold(env.clone());
+        if threshold == 0 {
+            return Err(PermissionError::InactivityThresholdNotSet);
+        }
+
+        let current_time = env.ledger().timestamp();
+        let mut transitioned: u32 = 0;
+
+        for (owner, delegate) in pairs.iter() {
+            let key = DataKey::Permission(owner.clone(), delegate.clone());
+            if let Some(mut record) = env.storage().persistent().get::<_, PermissionRecord>(&key) {
+                if record.status == PermissionStatus::Active
+                    && record.spent == 0
+                    && current_time >= record.created_at + threshold
+                {
+                    record.status = PermissionStatus::Revoked;
+                    env.storage().persistent().set(&key, &record);
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::PendingDecrement(owner.clone(), delegate.clone()));
+
+                    env.events().publish(
+                        (symbol_short!("perm"), symbol_short!("autorevk")),
+                        PermissionRevokedEvent {
+                            owner: owner.clone(),
+                            delegate: delegate.clone(),
+                        },
+                    );
+
+                    Self::append_audit_log(
+                        &env,
+                        &owner,
+                        &delegate,
+                        caller.clone(),
+                        symbol_short!("autorevk"),
+                    );
+
+                    transitioned += 1;
+                }
+            }
+        }
+
+        Ok(transitioned)
+    }
+
     /// Configure the minimum number of ledgers that must elapse between successive
     /// spends for any delegation pair (#324). Admin-only.
     ///
     /// Set `interval` to `0` to disable velocity limiting.
+    /// Configure the delay before a scheduled allowance decrease can execute.
+    /// Admin-only; values are bounded to prevent disabling the security delay.
+    pub fn set_decrease_timelock_secs(
+        env: Env,
+        admin: Address,
+        secs: u64,
+    ) -> Result<(), PermissionError> {
+        Self::require_admin(&env, &admin)?;
+
+        if secs == 0 || secs > MAX_DECREASE_TIMELOCK_SECS {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::DecreaseTimelockSecs, &secs);
+        Ok(())
+    }
+
+    /// Returns the configured allowance-decrease timelock in seconds.
+    pub fn get_decrease_timelock_secs(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DecreaseTimelockSecs)
+            .unwrap_or(DEFAULT_DECREASE_TIMELOCK_SECS)
+    }
+
     pub fn set_velocity_limit(
         env: Env,
         admin: Address,
@@ -3064,3 +3390,43 @@ impl PermissionsContract {
 mod integration_tests;
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod absent_key_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn absent_pair() -> (Env, Address, Address) {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        (env, owner, delegate)
+    }
+
+    #[test]
+    fn get_permission_absent_returns_not_found() {
+        let (env, owner, delegate) = absent_pair();
+        assert_eq!(
+            PermissionsContract::get_permission(env, owner, delegate),
+            Err(PermissionError::PermissionNotFound)
+        );
+    }
+
+    #[test]
+    fn get_remaining_allowance_absent_returns_not_found() {
+        let (env, owner, delegate) = absent_pair();
+        assert_eq!(
+            PermissionsContract::get_remaining_allowance(env, owner, delegate),
+            Err(PermissionError::PermissionNotFound)
+        );
+    }
+
+    #[test]
+    fn get_pause_metadata_absent_returns_not_found() {
+        let (env, owner, delegate) = absent_pair();
+        assert_eq!(
+            PermissionsContract::get_pause_metadata(env, owner, delegate),
+            Err(PermissionError::PermissionNotFound)
+        );
+    }
+}

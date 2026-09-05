@@ -21,7 +21,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          toolchain-file: rust-toolchain.toml
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -36,7 +36,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          toolchain-file: rust-toolchain.toml
 
       - uses: actions/cache@v4
         with:
@@ -49,7 +49,7 @@ jobs:
             cargo-${{ runner.os }}-
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: Test
@@ -61,7 +61,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          toolchain-file: rust-toolchain.toml
 
       - uses: actions/cache@v4
         with:
@@ -76,6 +76,9 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      - name: Check Marketplace Version Consistency
+        run: bash scripts/check_version.sh
+
   build:
     name: Build WASM
     runs-on: ubuntu-latest
@@ -87,7 +90,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          toolchain-file: rust-toolchain.toml
 
       - uses: actions/cache@v4
         with:
@@ -101,3 +104,69 @@ jobs:
 
       - name: Build contracts
         run: cargo build --target wasm32-unknown-unknown --release
+
+  audit:
+    name: Supply-chain audit (cargo-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # cargo-audit reads Cargo.lock directly; no compilation needed, so we
+      # skip the Rust toolchain / build cache setup to keep this job fast.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # --deny warnings promotes every advisory (including informational /
+      # unmaintained) to a hard failure.  Exceptions require a documented entry
+      # in audit.toml (see that file for the approval process).
+      - name: Run cargo audit
+        run: cargo audit --deny warnings --file audit.toml
+
+  wasm-proof:
+    name: WASM build proof (every crate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain-file: rust-toolchain.toml
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-wasm-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-wasm-${{ runner.os }}-
+
+      - name: Build all contract crates individually for wasm32-unknown-unknown
+        run: |
+          set -euo pipefail
+          # Enumerate every workspace member that has a lib target (i.e. a
+          # deployable contract crate).  The "tests" crate has no lib and
+          # is not a deployable contract, so it is intentionally excluded.
+          for package in $(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.targets[] | .kind[] == "cdylib") | .name'); do
+            echo "Building ${package} for wasm32-unknown-unknown..."
+            cargo build --package "${package}" --target wasm32-unknown-unknown --release
+          done
+
+      - name: Verify WASM artifacts were produced
+        run: |
+          set -euo pipefail
+          echo "WASM artifacts produced:"
+          find target/wasm32-unknown-unknown/release -maxdepth 1 -name '*.wasm' -print
+          count=$(find target/wasm32-unknown-unknown/release -maxdepth 1 -name '*.wasm' | wc -l)
+          if [ "$count" -lt 5 ]; then
+            echo "::error::Expected at least 5 .wasm artifacts (one per contract crate), found $count"
+            exit 1
+          fi

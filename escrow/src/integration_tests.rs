@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use crate::{
-    BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowContract,
+    BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig, EscrowContract,
     EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, TreasuryShare,
     MAX_TREASURIES,
 };
@@ -44,11 +44,27 @@ impl TestEnv {
             soroban_sdk::token::StellarAssetClient::new(&env, &token_contract_id);
         token_admin_client.mint(&buyer, &10000);
 
-        let escrow_contract_id = env.register(EscrowContract, ());
-        let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
         let min_amount = 100i128;
         let max_amount = 10000i128;
-        escrow_client.initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps,
+            treasury,
+            min_amount,
+            max_amount,
+        };
+        let escrow_contract_id = env.register(EscrowContract, (config,));
+        let escrow_contract_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: admin.clone(),
+                fee_bps,
+                treasury: treasury.clone(),
+                min_amount: 100i128,
+                max_amount: 10000i128,
+            },),
+        );
+        let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
         escrow_client.add_token(&admin, &token_contract_id);
 
         TestEnv {
@@ -129,12 +145,28 @@ fn test_add_token_by_non_admin_fails() {
     let agent = Address::generate(&env);
     let treasury = Address::generate(&env);
 
-    let escrow_contract_id = env.register(EscrowContract, ());
-    let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
     let fee_bps = 0u32;
     let min_amount = 100i128;
     let max_amount = 10000i128;
-    escrow_client.initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
+    let config = EscrowConfig {
+        admin: admin.clone(),
+        fee_bps,
+        treasury,
+        min_amount,
+        max_amount,
+    };
+    let escrow_contract_id = env.register(EscrowContract, (config,));
+    let escrow_contract_id = env.register(
+        EscrowContract,
+        (EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury: treasury.clone(),
+            min_amount: 100i128,
+            max_amount: 10000i128,
+        },),
+    );
+    let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
 
     let new_token = Address::generate(&env);
 
@@ -972,7 +1004,26 @@ fn test_get_merchant_receipt_not_found() {
 fn test_version_callable_without_auth() {
     let env = Env::default();
     // Intentionally do NOT mock all auths — version() requires no auth.
-    let contract_id = env.register(EscrowContract, ());
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let config = EscrowConfig {
+        admin,
+        fee_bps: 0u32,
+        treasury,
+        min_amount: 100i128,
+        max_amount: 10000i128,
+    };
+    let contract_id = env.register(EscrowContract, (config,));
+    let contract_id = env.register(
+        EscrowContract,
+        (EscrowConfig {
+            admin,
+            fee_bps: 0u32,
+            treasury,
+            min_amount: 100i128,
+            max_amount: 10000i128,
+        },),
+    );
     let client = EscrowContractClient::new(&env, &contract_id);
 
     let version = client.version();
@@ -1005,7 +1056,7 @@ fn test_set_fee_distribution_rejects_zero_address_treasury() {
     let t = TestEnv::setup();
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
 
-    let zero_address = Address::from_str(&t.env, crate::ZERO_CONTRACT_STRKEY);
+    let zero_address = soroban_sdk::Address::from_str(&t.env, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4");
     let mut config = Vec::new(&t.env);
     config.push_back(TreasuryShare {
         treasury: zero_address,
@@ -1886,7 +1937,9 @@ fn test_fund_pool_increases_balance() {
     let new_balance = escrow_client.fund_pool(&funder, &t.token_contract_id, &2000);
     assert_eq!(new_balance, 2000);
 
-    let pool = escrow_client.get_liquidity_pool(&t.token_contract_id);
+    let pool = escrow_client
+        .get_liquidity_pool(&t.token_contract_id)
+        .unwrap();
     assert_eq!(pool.balance, 2000);
     assert_eq!(pool.token, t.token_contract_id);
     assert_eq!(token_client.balance(&t.escrow_contract_id), 2000);
@@ -1896,6 +1949,7 @@ fn test_fund_pool_increases_balance() {
     assert_eq!(
         escrow_client
             .get_liquidity_pool(&t.token_contract_id)
+            .unwrap()
             .balance,
         2500
     );
@@ -1943,7 +1997,9 @@ fn test_settle_from_pool_transfers_to_seller() {
 
     // Pool balance is debited by the settled amount, mirroring the real
     // token movement out of the reserve.
-    let pool = escrow_client.get_liquidity_pool(&t.token_contract_id);
+    let pool = escrow_client
+        .get_liquidity_pool(&t.token_contract_id)
+        .unwrap();
     assert_eq!(pool.balance, 4000);
 }
 
@@ -1965,6 +2021,7 @@ fn test_settle_from_pool_decrements_balance_and_blocks_overcommit() {
     assert_eq!(
         escrow_client
             .get_liquidity_pool(&t.token_contract_id)
+            .unwrap()
             .balance,
         4000
     );
@@ -2042,6 +2099,7 @@ fn test_withdraw_from_pool_respects_available_balance() {
     assert_eq!(
         escrow_client
             .get_liquidity_pool(&t.token_contract_id)
+            .unwrap()
             .balance,
         600
     );
@@ -2072,13 +2130,54 @@ fn test_withdraw_from_pool_rejects_non_admin() {
 }
 
 #[test]
-fn test_get_liquidity_pool_defaults_to_zero_for_unfunded_token() {
+fn test_get_liquidity_pool_returns_not_found_for_unfunded_token() {
     let t = TestEnv::setup();
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
 
-    let pool = escrow_client.get_liquidity_pool(&t.token_contract_id);
-    assert_eq!(pool.balance, 0);
+    // No pool has ever been funded for the (whitelisted) token, so the getter
+    // reports PoolNotFound rather than fabricating a zero-balance pool.
+    assert_eq!(
+        escrow_client.try_get_liquidity_pool(&t.token_contract_id),
+        Err(Ok(EscrowError::PoolNotFound))
+    );
+}
+
+#[test]
+fn test_get_liquidity_pool_distinguishes_funded_empty_from_funded_nonzero() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let funder = Address::generate(&t.env);
+    let token_admin_client =
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token_contract_id);
+    token_admin_client.mint(&funder, &3000);
+    escrow_client.fund_pool(&funder, &t.token_contract_id, &1000);
+
+    // Funded and non-zero: the pool returns its real balance.
+    let pool = escrow_client
+        .get_liquidity_pool(&t.token_contract_id)
+        .unwrap();
+    assert_eq!(pool.balance, 1000);
     assert_eq!(pool.token, t.token_contract_id);
+
+    // Withdraw everything: a funded-but-empty pool is distinct from a
+    // never-funded one — it returns a zero-balance pool, not PoolNotFound.
+    escrow_client.withdraw_from_pool(&t.admin, &t.token_contract_id, &1000);
+    let empty_pool = escrow_client
+        .get_liquidity_pool(&t.token_contract_id)
+        .unwrap();
+    assert_eq!(empty_pool.balance, 0);
+
+    // A different token that was never funded still reports PoolNotFound.
+    let other_admin = Address::generate(&t.env);
+    let other_token = t
+        .env
+        .register_stellar_asset_contract_v2(other_admin.clone())
+        .address();
+    assert_eq!(
+        escrow_client.try_get_liquidity_pool(&other_token),
+        Err(Ok(EscrowError::PoolNotFound))
+    );
 }
 
 // --- batch_deposit / batch_release / batch_refund (issue #317) ---
@@ -2376,4 +2475,39 @@ fn test_upgrade_with_admin_handover_preserves_state_and_emits_event() {
         record_before, record_after,
         "escrow record must survive the upgrade"
     );
+}
+
+#[test]
+fn test_split_release_multi_treasury() {
+    let t = TestEnv::setup_with_fee_bps(500);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    // Setup multi-treasury
+    let treasury1 = Address::generate(&t.env);
+    let treasury2 = Address::generate(&t.env);
+    let mut shares = soroban_sdk::Vec::new(&t.env);
+    shares.push_back(crate::TreasuryShare { treasury: treasury1.clone(), bps: 200 }); // 2%
+    shares.push_back(crate::TreasuryShare { treasury: treasury2.clone(), bps: 300 }); // 3%
+    assert!(escrow_client.set_fee_distribution(&t.admin, &shares));
+    let escrow_id = deposit_escrow(&t, 10000, 100);
+    let recipient1 = Address::generate(&t.env);
+    let recipient2 = Address::generate(&t.env);
+    let mut release_shares = soroban_sdk::Vec::new(&t.env);
+    release_shares.push_back((recipient1.clone(), 4000));
+    release_shares.push_back((recipient2.clone(), 6000));
+    // Release shares
+    assert!(escrow_client.split_release(&escrow_id, &t.buyer, &release_shares));
+    // Fees:
+    // total base amount = 10000
+    // share1 amount = 4000
+    // fee1 = 4000 * 500 / 10000 = 200. Net = 3800.
+    // share2 amount = 6000
+    // fee2 = 6000 * 500 / 10000 = 300. Net = 5700.
+    // Total fee = 500.
+    // treasury1 = 500 * 200 / 500 = 200
+    // treasury2 = 500 * 300 / 500 = 300
+    assert_eq!(token_client.balance(&recipient1), 3800);
+    assert_eq!(token_client.balance(&recipient2), 5700);
+    assert_eq!(token_client.balance(&treasury1), 200);
+    assert_eq!(token_client.balance(&treasury2), 300);
 }

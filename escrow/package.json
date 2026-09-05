@@ -5,6 +5,8 @@
   "scripts": {
     "build-wasm": "cargo build --target wasm32-unknown-unknown --release",
     "test": "cargo test",
-    "lint": "cargo clippy --all-targets -- -D warnings"
+    "lint": "cargo clippy --all-targets -- -D warnings",
+    "fmt-check": "cargo fmt --all -- --check",
+    "ci": "npm run fmt-check && npm run lint && npm test && npm run build-wasm"
   }
 }

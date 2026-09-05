@@ -30,6 +30,8 @@ pause/resume, and permission transfers.
 | `get_pause_metadata` | — | Pause state and reason |
 | `set_admin` / `propose_admin` / `accept_admin` | admin | Admin management (two-step transfer) |
 | `pause_grants` | admin | Pause all new grants |
+| `sweep_expired` / `sweep_expired_batch` | any | Sweep expired permissions into Expired status (single or bounded batch) |
+| `sweep_inactive` / `sweep_inactive_batch` | any | Auto-revoke inactive permissions idle past threshold (single or bounded batch) |
 
 ## Events
 

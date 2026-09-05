@@ -20,3 +20,8 @@ ed25519-dalek = "2"
 [[test]]
 name = "cross_contract"
 path = "cross_contract.rs"
+
+[[test]]
+name = "no_std_consistency"
+path = "no_std_consistency.rs"
+

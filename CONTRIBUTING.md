@@ -165,6 +165,22 @@ pub fn escrow_funds(env: Env, amount: i128) {
 - **Function Length**: Keep functions focused and reasonably short
 - **Imports**: Organize imports logically (stdlib, external, internal)
 
+### no_std Policy
+
+All contract crates (`delegation_registry`, `escrow`, `permissions`, `reputation`, `marketplace`) must declare `no_std` using the exact conditional attribute form:
+
+```rust
+// Contract crates compile as no_std for release and wasm builds, but keep std
+// enabled during testing so dev-dependencies and test assertions operate normally.
+// This exact conditional form must be consistent across all workspace contract crates.
+#![cfg_attr(not(test), no_std)]
+```
+
+#### Rationale & Consistency
+- **Why conditional?** Contracts compile as `no_std` for release and `wasm32-unknown-unknown` deployment targets, but test suites and dev-dependencies (such as cryptographic test helpers or `ed25519-dalek`) require the Rust standard library (`std`) when executing under `cargo test`.
+- **Why consistency matters:** `cargo test` links `std` regardless of whether unconditional `#![no_std]` or conditional `#![cfg_attr(not(test), no_std)]` is declared. If attributes drift across crates, a contract using unconditional `#![no_std]` can pass `cargo test` while its actual `wasm32-unknown-unknown` build fails. Enforcing this exact attribute across all contract crates guarantees uniform build and testing behavior across the workspace.
+
+
 ## Project Layout
 
 ```

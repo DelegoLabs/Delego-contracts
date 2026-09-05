@@ -72,3 +72,20 @@ jobs:
               core.warning('This PR is very large. Consider breaking it into smaller PRs.');
             }
 
+  test-snapshot-check:
+    name: Test Snapshot Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Verify no test_snapshots files are committed
+        shell: bash
+        run: |
+          if git ls-files | grep -q "test_snapshots"; then
+            echo "Error: Found committed test_snapshots files:"
+            git ls-files | grep "test_snapshots" || true
+            exit 1
+          else
+            echo "No test_snapshots files committed."
+          fi
+

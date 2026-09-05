@@ -4,6 +4,12 @@
 //! paginated category and name discovery, commission configuration, metadata cooldown lock,
 //! status lifecycle controls, and reputation score snapshot integration.
 
+// Contract crates compile as no_std for release and wasm builds, but keep std
+// enabled during testing so dev-dependencies and test assertions operate normally.
+// This exact conditional form must be consistent across all workspace contract crates.
+#![cfg_attr(not(test), no_std)]
+#![allow(clippy::too_many_arguments)]
+#![warn(missing_docs)]
 #![no_std]
 
 use soroban_sdk::{
@@ -19,6 +25,7 @@ pub enum MerchantStatus {
     Verified = 1,   // Passed verification
     Suspended = 2,  // Temporarily disabled (admin action / review)
     Closed = 3,     // Permanently removed
+    All = 4,        // Filter sentinel for cursor discovery (matches every status)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,10 +60,46 @@ pub struct MerchantView {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
+pub enum ReputationResolution {
+    NotConfigured,
+    Available(u32, u64),
+    CallFailed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct MerchantStats {
+    pub total: u64,
+    pub active: u64,
+    pub suspended: u64,
+    pub closed: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
 pub struct DiscoveryPage {
     pub items: Vec<MerchantView>,
     pub total: u32,
     pub next_offset: Option<u32>,
+    pub next_cursor: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct MerchantOperationalView {
+    pub id: u64,
+    pub name: String,
+    pub status: MerchantStatus,
+    pub verified: bool,
+    pub effective: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct MerchantCursor {
+    pub after_id: u64,
+    pub status: MerchantStatus,
+    pub limit: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,6 +108,22 @@ pub struct NameRelease {
     pub name: String,
     pub released_at: u64,
     pub previous_merchant: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct MerchantViewDetailed {
+    pub view: MerchantView,
+    pub reputation: ReputationResolution,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct CategoryEntry {
+    pub key: Symbol,
+    pub normalized: Symbol,
+    pub display: String,
+    pub added_at: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,29 +159,66 @@ pub struct ContractVersion {
     pub semver: Symbol,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MerchantValidationError {
+    EmptyName,
+    EmptyDescription,
+    WhitespaceOnly,
+}
+
+impl From<MerchantValidationError> for MarketplaceError {
+    fn from(e: MerchantValidationError) -> Self {
+        match e {
+            MerchantValidationError::EmptyName
+            | MerchantValidationError::EmptyDescription
+            | MerchantValidationError::WhitespaceOnly => MarketplaceError::InvalidParam,
+        }
+    }
+}
+
+/// Cross-contract error code allocation.
+///
+/// To keep bridge error mapping unambiguous, each contract owns a disjoint
+/// numeric range. The Marketplace contract must stay within its range:
+/// | Contract            | Error code range |
+/// |---------------------|------------------|
+/// | `PermissionError`   | 1..=999          |
+/// | `EscrowError`       | 1000..=1999      |
+/// | `ReputationError`   | 2000..=2999      |
+/// | `DelegationError`   | 3000..=3999      |
+/// | `MarketplaceError`  | 4000..=4999      |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum MarketplaceError {
-    AlreadyInitialized = 1,
-    NotInitialized = 2,
-    Unauthorized = 3,
-    MerchantNotFound = 4,
-    AlreadyVerified = 5,
-    InvalidCommissionBps = 6,
-    DuplicateMerchantName = 7,
-    MerchantFrozen = 8,
-    MerchantClosed = 9,
-    VerifierAlreadyExists = 10,
-    VerifierNotFound = 11,
-    InsufficientVerifications = 12,
-    MetadataLockActive = 13,
-    InvalidCategory = 14,
-    InvalidParam = 15,
-    NoPendingAdmin = 16,
+    AlreadyInitialized = 4001,
+    NotInitialized = 4002,
+    Unauthorized = 4003,
+    MerchantNotFound = 4004,
+    AlreadyVerified = 4005,
+    InvalidCommissionBps = 4006,
+    DuplicateMerchantName = 4007,
+    MerchantFrozen = 4008,
+    MerchantClosed = 4009,
+    VerifierAlreadyExists = 4010,
+    VerifierNotFound = 4011,
+    InsufficientVerifications = 4012,
+    MetadataLockActive = 4013,
+    InvalidCategory = 4014,
+    InvalidParam = 4015,
+    NoPendingAdmin = 4016,
+    VerificationCountOverflow = 4017,
 }
 
 // --- Events ---
+//
+// Merchant-scoped events are published as `(mkplc, <action>, merchant_id)` so
+// off-chain indexers and Soroban RPC subscriptions can filter by merchant from
+// the topics alone, without deserializing the event body (issue #142). The
+// `merchant_id` is also retained in the event data. Events that are not scoped
+// to a single merchant — verifier add/remove and admin transfer — keep the
+// two-topic `(mkplc, <action>)` form.
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -145,6 +241,22 @@ pub struct MerchantVerifiedEvent {
 pub struct MerchantProfileUpdatedEvent {
     pub merchant_id: u64,
     pub updated_fields: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CategoryChange {
+    pub merchant_id: u64,
+    pub from: Symbol,
+    pub to: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MerchantCategoryChangedEvent {
+    pub merchant_id: u64,
+    pub from: Symbol,
+    pub to: Symbol,
 }
 
 #[contracttype]
@@ -225,15 +337,16 @@ pub struct MerchantVerificationRevokedEvent {
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminProposedEvent {
     pub current_admin: Address,
     pub new_admin: Address,
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminAcceptedEvent {
+    pub previous_admin: Address,
     pub new_admin: Address,
 }
 
@@ -245,6 +358,27 @@ pub struct MerchantReputationSetEvent {
     pub set_by: Address,
 }
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CategoryAddedEvent {
+    pub key: Symbol,
+    pub normalized: Symbol,
+    pub added_by: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CategoryRemovedEvent {
+    pub key: Symbol,
+    pub removed_by: Address,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantPrunedEvent {
+    pub pruned_count: u32,
+    pub pruned_by: Address,
+}
+
 // --- Storage Keys ---
 
 #[contracttype]
@@ -252,10 +386,12 @@ pub enum DataKey {
     Admin,
     PendingAdmin,
     NextMerchantId,
+    MerchantStats,
     Merchant(u64),
     MerchantName(String),
     FreedName(String),
     ArchivedMerchant(u64),
+    MerchantArchivedAt(u64),
     VerifiedCount(u64),
     Verifiers,
     MerchantIds,
@@ -267,6 +403,7 @@ pub enum DataKey {
     VerificationPolicy(u64),
     LastMetadataUpdate(u64),
     GlobalReputationContract,
+    Categories,
 }
 
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.
@@ -291,6 +428,48 @@ const MAX_PAGE_LIMIT: u32 = 50;
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
 
+pub(crate) fn normalize_symbol(env: &Env, sym: &Symbol) -> Symbol {
+    use soroban_sdk::xdr::ToXdr;
+    let xdr = sym.clone().to_xdr(env);
+    let xdr_len = xdr.len() as usize;
+    // XDR encoding of ScVal::Symbol:
+    // 4-byte tag (ScValType::Symbol = 10) + 4-byte big-endian length + characters + 0..3 padding bytes
+    if xdr_len >= 8 {
+        let mut xdr_bytes = [0u8; 48];
+        let read_len = xdr_len.min(48);
+        xdr.copy_into_slice(&mut xdr_bytes[..read_len]);
+        let sym_len =
+            u32::from_be_bytes([xdr_bytes[4], xdr_bytes[5], xdr_bytes[6], xdr_bytes[7]]) as usize;
+        if sym_len <= 32 && 8 + sym_len <= read_len {
+            let mut lower_buf = [0u8; 32];
+            for i in 0..sym_len {
+                lower_buf[i] = xdr_bytes[8 + i].to_ascii_lowercase();
+            }
+            if let Ok(lower_str) = core::str::from_utf8(&lower_buf[..sym_len]) {
+                return Symbol::new(env, lower_str);
+            }
+        }
+    }
+    sym.clone()
+}
+// --- Merchant profile field bounds ---
+//
+// Caps on `RegisterParams` (and the corresponding `update_merchant_profile`)
+// string fields. Enforced *before* any bytes are copied off the host string,
+// so a caller cannot force unbounded storage growth or unbounded gas by
+// submitting an arbitrarily large `name`/`description`/`image_url`/`metadata`.
+pub const MAX_NAME_LEN: u32 = 64;
+pub const MAX_DESCRIPTION_LEN: u32 = 512;
+pub const MAX_IMAGE_URL_LEN: u32 = 256;
+pub const MAX_METADATA_LEN: u32 = 1024;
+
+// Largest of the caps above; used to size the stack buffer that string
+// normalization copies host bytes into. `#![no_std]` without the `alloc`
+// feature means we cannot heap-allocate a buffer sized to the actual string,
+// so we bound the buffer at the biggest field cap and always bounds-check
+// the raw string length against the field-specific cap before copying.
+const MAX_FIELD_BUF_LEN: usize = MAX_METADATA_LEN as usize;
+
 #[contract]
 pub struct MarketplaceContract;
 
@@ -311,9 +490,21 @@ impl MarketplaceContract {
         env.storage()
             .instance()
             .set(&DataKey::NextMerchantId, &1u64);
+        env.storage().instance().set(
+            &DataKey::MerchantStats,
+            &MerchantStats {
+                total: 0,
+                active: 0,
+                suspended: 0,
+                closed: 0,
+            },
+        );
         env.storage()
             .instance()
             .set(&DataKey::Verifiers, &Vec::<Verifier>::new(&env));
+        env.storage()
+            .instance()
+            .set(&DataKey::Categories, &Vec::<CategoryEntry>::new(&env));
         env.storage()
             .instance()
             .set(&DataKey::MetadataCooldown, &DEFAULT_METADATA_COOLDOWN_SECS);
@@ -329,6 +520,27 @@ impl MarketplaceContract {
         Ok(())
     }
 
+    // --- Archived Merchant ---
+
+    pub fn get_archived_merchant(env: Env, id: u64) -> Option<ArchivedMerchant> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ArchivedMerchant(id))
+    fn validate_merchant_input(
+        name: &String,
+        description: &String,
+    ) -> Result<(), MerchantValidationError> {
+        if name.is_empty() {
+            return Err(MerchantValidationError::EmptyName);
+        }
+        if name.trim().is_empty() {
+            return Err(MerchantValidationError::WhitespaceOnly);
+        if description.is_empty() {
+            return Err(MerchantValidationError::EmptyDescription);
+        if description.trim().is_empty() {
+        Ok(())
+    }
+
     // --- Merchant Lifecycle ---
 
     pub fn register_merchant(
@@ -338,9 +550,8 @@ impl MarketplaceContract {
     ) -> Result<u64, MarketplaceError> {
         merchant.require_auth();
 
-        if params.name.is_empty() {
-            return Err(MarketplaceError::InvalidParam);
-        }
+        Self::validate_merchant_input(&params.name, &params.description)?;
+                let params = Self::validate_and_normalize(&env, &params)?;
 
         let name_key = DataKey::MerchantName(params.name.clone());
         if env.storage().persistent().has(&name_key) {
@@ -351,6 +562,23 @@ impl MarketplaceContract {
         let freed_key = DataKey::FreedName(params.name.clone());
         if env.storage().persistent().has(&freed_key) {
             env.storage().persistent().remove(&freed_key);
+        }
+
+        let normalized_category = normalize_symbol(&env, &params.category);
+
+        // Allowlist gating: When non-empty, only allowlisted categories are accepted
+        let categories = Self::get_categories(env.clone());
+        if !categories.is_empty() {
+            let mut allowed = false;
+            for c in categories.iter() {
+                if c.normalized == normalized_category {
+                    allowed = true;
+                    break;
+                }
+            }
+            if !allowed {
+                return Err(MarketplaceError::InvalidCategory);
+            }
         }
 
         let now = env.ledger().timestamp();
@@ -380,7 +608,7 @@ impl MarketplaceContract {
             owner: Some(merchant.clone()),
             name: params.name.clone(),
             description: params.description,
-            category: params.category.clone(),
+            category: normalized_category.clone(),
             image_url: params.image_url,
             commission_rate_bps: 0,
             metadata: params.metadata.clone(),
@@ -425,8 +653,13 @@ impl MarketplaceContract {
             .persistent()
             .set(&DataKey::MerchantIds, &merchant_ids);
 
+        let mut stats = Self::get_merchant_stats(env.clone());
+        stats.total = stats.total.saturating_add(1);
+        stats.active = stats.active.saturating_add(1);
+        env.storage().instance().set(&DataKey::MerchantStats, &stats);
+
         // Append to category index
-        let cat_key = DataKey::CategoryIndex(params.category.clone());
+        let cat_key = DataKey::CategoryIndex(normalized_category.clone());
         let mut cat_ids: Vec<u64> = env
             .storage()
             .persistent()
@@ -479,7 +712,7 @@ impl MarketplaceContract {
             .set(&DataKey::NextMerchantId, &incremented);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("reg")),
+            (symbol_short!("mkplc"), symbol_short!("reg"), next_id),
             MerchantRegisteredEvent {
                 merchant_id: next_id,
                 owner: merchant,
@@ -502,12 +735,20 @@ impl MarketplaceContract {
         name: String,
         description: String,
         image_url: String,
+        new_category: Option<Symbol>,
     ) -> Result<(), MarketplaceError> {
         caller.require_auth();
 
+        let name = Self::normalize_bounded_string(&env, &name, MAX_NAME_LEN)?;
         if name.is_empty() {
             return Err(MarketplaceError::InvalidParam);
         }
+        let description = Self::normalize_bounded_string(&env, &description, MAX_DESCRIPTION_LEN)?;
+        let image_url = Self::normalize_bounded_string(&env, &image_url, MAX_IMAGE_URL_LEN)?;
+
+        // Validate new_category when provided: must be a valid (non-default) Symbol.
+        // Soroban Symbol values are always non-empty when created via symbol_short! or
+        // Symbol::new, so no additional validation is needed here beyond type safety.
 
         let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
         Self::check_not_frozen_or_closed(&merchant)?;
@@ -530,6 +771,68 @@ impl MarketplaceContract {
 
         merchant.description = description;
         merchant.image_url = image_url;
+
+        // Re-index CategoryIndex when category changes.
+        if let Some(to_cat) = new_category {
+            let from_cat = merchant.category.clone();
+            if from_cat != to_cat {
+                // Remove merchant_id from old category index (filter-rebuild shrinks the Vec).
+                let old_cat_key = DataKey::CategoryIndex(from_cat.clone());
+                let old_ids: Vec<u64> = env
+                    .storage()
+                    .persistent()
+                    .get(&old_cat_key)
+                    .unwrap_or_else(|| Vec::new(&env));
+                let mut new_old_ids: Vec<u64> = Vec::new(&env);
+                for id in old_ids.iter() {
+                    if id != merchant_id {
+                        new_old_ids.push_back(id);
+                    }
+                }
+                env.storage()
+                    .persistent()
+                    .set(&old_cat_key, &new_old_ids);
+
+                // Append merchant_id to new category index.
+                let new_cat_key = DataKey::CategoryIndex(to_cat.clone());
+                let mut new_ids: Vec<u64> = env
+                    .storage()
+                    .persistent()
+                    .get(&new_cat_key)
+                    .unwrap_or_else(|| Vec::new(&env));
+                new_ids.push_back(merchant_id);
+                env.storage()
+                    .persistent()
+                    .set(&new_cat_key, &new_ids);
+
+                // Extend TTL for both category index keys.
+                let storage = env.storage().persistent();
+                storage.extend_ttl(
+                    &old_cat_key,
+                    PERSISTENT_BUMP_THRESHOLD,
+                    PERSISTENT_BUMP_AMOUNT,
+                );
+                storage.extend_ttl(
+                    &new_cat_key,
+                    PERSISTENT_BUMP_THRESHOLD,
+                    PERSISTENT_BUMP_AMOUNT,
+                );
+
+                // Update the merchant's stored category.
+                merchant.category = to_cat.clone();
+
+                // Emit category-changed event.
+                env.events().publish(
+                    (symbol_short!("mkplc"), symbol_short!("cat_chg")),
+                    MerchantCategoryChangedEvent {
+                        merchant_id,
+                        from: from_cat,
+                        to: to_cat,
+                    },
+                );
+            }
+        }
+
         merchant.updated_at = env.ledger().timestamp();
 
         env.storage()
@@ -537,7 +840,11 @@ impl MarketplaceContract {
             .set(&DataKey::Merchant(merchant_id), &merchant);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("profile")),
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("profile"),
+                merchant_id,
+            ),
             MerchantProfileUpdatedEvent {
                 merchant_id,
                 updated_fields: symbol_short!("profile"),
@@ -597,7 +904,7 @@ impl MarketplaceContract {
             .set(&DataKey::LastMetadataUpdate(merchant_id), &now);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("meta")),
+            (symbol_short!("mkplc"), symbol_short!("meta"), merchant_id),
             MerchantMetadataUpdatedEvent {
                 merchant_id,
                 new_metadata,
@@ -605,6 +912,106 @@ impl MarketplaceContract {
         );
 
         Ok(())
+    }
+
+    // --- Category Management ---
+
+    pub fn add_category(
+        env: Env,
+        admin: Address,
+        category: CategoryEntry,
+    ) -> Result<(), MarketplaceError> {
+        admin.require_auth();
+        let current_admin = Self::get_admin(env.clone())?;
+        if admin != current_admin {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        let normalized = normalize_symbol(&env, &category.key);
+        let mut categories = Self::get_categories(env.clone());
+        for c in categories.iter() {
+            if c.normalized == normalized || c.key == category.key {
+                return Err(MarketplaceError::InvalidCategory);
+            }
+        }
+
+        let now = env.ledger().timestamp();
+        let entry = CategoryEntry {
+            key: category.key.clone(),
+            normalized: normalized.clone(),
+            display: category.display,
+            added_at: if category.added_at == 0 {
+                now
+            } else {
+                category.added_at
+            },
+        };
+
+        categories.push_back(entry);
+        env.storage()
+            .instance()
+            .set(&DataKey::Categories, &categories);
+
+        env.events().publish(
+            (symbol_short!("mkplc"), symbol_short!("cat_add")),
+            CategoryAddedEvent {
+                key: category.key,
+                normalized,
+                added_by: admin,
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn remove_category(
+        env: Env,
+        admin: Address,
+        category: Symbol,
+    ) -> Result<(), MarketplaceError> {
+        admin.require_auth();
+        let current_admin = Self::get_admin(env.clone())?;
+        if admin != current_admin {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        let normalized = normalize_symbol(&env, &category);
+        let categories = Self::get_categories(env.clone());
+        let mut new_categories = Vec::new(&env);
+        let mut found = false;
+
+        for c in categories.iter() {
+            if c.key == category || c.normalized == normalized {
+                found = true;
+            } else {
+                new_categories.push_back(c);
+            }
+        }
+
+        if !found {
+            return Err(MarketplaceError::InvalidCategory);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Categories, &new_categories);
+
+        env.events().publish(
+            (symbol_short!("mkplc"), symbol_short!("cat_rem")),
+            CategoryRemovedEvent {
+                key: category,
+                removed_by: admin,
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn get_categories(env: Env) -> Vec<CategoryEntry> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Categories)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // --- Verification ---
@@ -679,6 +1086,7 @@ impl MarketplaceContract {
             .get(&DataKey::MerchantIds)
             .unwrap_or_else(|| Vec::new(&env));
         for id in merchant_ids.iter() {
+            Self::bump_merchant_state(&env, id);
             let policy: Option<VerificationPolicy> = env
                 .storage()
                 .persistent()
@@ -754,7 +1162,9 @@ impl MarketplaceContract {
             .persistent()
             .get(&DataKey::VerifiedCount(merchant_id))
             .unwrap_or(0);
-        let new_count = current_count.saturating_add(1);
+        let new_count = current_count
+            .checked_add(1)
+            .ok_or(MarketplaceError::VerificationCountOverflow)?;
         env.storage()
             .persistent()
             .set(&DataKey::VerifiedCount(merchant_id), &new_count);
@@ -778,7 +1188,7 @@ impl MarketplaceContract {
             .set(&DataKey::Merchant(merchant_id), &merchant);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("verif")),
+            (symbol_short!("mkplc"), symbol_short!("verif"), merchant_id),
             MerchantVerifiedEvent {
                 merchant_id,
                 verifier,
@@ -834,7 +1244,7 @@ impl MarketplaceContract {
             .set(&DataKey::Merchant(merchant_id), &merchant);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("v_rev")),
+            (symbol_short!("mkplc"), symbol_short!("v_rev"), merchant_id),
             MerchantVerificationRevokedEvent {
                 merchant_id,
                 revoked_by: admin,
@@ -846,6 +1256,18 @@ impl MarketplaceContract {
 
     // --- Discovery & Query ---
 
+    pub fn get_merchant_stats(env: Env) -> MerchantStats {
+        env.storage()
+            .instance()
+            .get(&DataKey::MerchantStats)
+            .unwrap_or(MerchantStats {
+                total: 0,
+                active: 0,
+                suspended: 0,
+                closed: 0,
+            })
+    }
+
     pub fn get_merchant(env: Env, merchant_id: u64) -> Result<Merchant, MarketplaceError> {
         let merchant: Merchant = env
             .storage()
@@ -853,19 +1275,31 @@ impl MarketplaceContract {
             .get(&DataKey::Merchant(merchant_id))
             .ok_or(MarketplaceError::MerchantNotFound)?;
 
-        let storage = env.storage().persistent();
-        storage.extend_ttl(
-            &DataKey::Merchant(merchant_id),
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-        storage.extend_ttl(
-            &DataKey::MerchantName(merchant.name.clone()),
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
+        Self::bump_merchant_state(&env, merchant_id);
 
         Ok(merchant)
+    }
+
+    pub fn get_merchant_view_detailed(env: Env, merchant_id: u64) -> Result<MerchantViewDetailed, MarketplaceError> {
+    fn bump_merchant_state(env: &Env, id: u64) {
+        let storage = env.storage().persistent();
+        let merchant: Merchant = match storage.get(&DataKey::Merchant(id)) {
+            Some(merchant) => merchant,
+            None => return,
+        };
+        let keys = [
+            DataKey::Merchant(id),
+            DataKey::MerchantName(merchant.name.clone()),
+            DataKey::VerifiedCount(id),
+            DataKey::VerificationPolicy(id),
+            DataKey::MerchantVerifierList(id),
+            DataKey::LastMetadataUpdate(id),
+        ];
+        for key in keys {
+            if storage.has(&key) {
+                storage.extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+            }
+        }
     }
 
     pub fn get_merchant_view(env: Env, merchant_id: u64) -> Result<MerchantView, MarketplaceError> {
@@ -877,7 +1311,7 @@ impl MarketplaceContract {
                 .get(&DataKey::GlobalReputationContract)
         });
 
-        let reputation_score = if let Some(rep_addr) = reputation_contract {
+        let reputation = if let Some(rep_addr) = reputation_contract {
             if let Some(owner) = merchant.owner.clone() {
                 let args = soroban_sdk::vec![&env, owner.to_val()];
                 let call_result = env.try_invoke_contract::<ExternalReputationScore, InvokeError>(
@@ -886,17 +1320,22 @@ impl MarketplaceContract {
                     args,
                 );
                 match call_result {
-                    Ok(Ok(rep)) => Some(rep.score),
-                    _ => None,
+                    Ok(Ok(rep)) => ReputationResolution::Available(rep.score, rep.last_updated),
+                    _ => ReputationResolution::CallFailed,
                 }
             } else {
-                None
+                ReputationResolution::NotConfigured
             }
         } else {
-            None
+            ReputationResolution::NotConfigured
         };
 
-        Ok(MerchantView {
+        let reputation_score = match &reputation {
+            ReputationResolution::Available(score, _) => Some(*score),
+            _ => None,
+        };
+
+        let view = MerchantView {
             id: merchant.id,
             name: merchant.name,
             category: merchant.category,
@@ -904,6 +1343,30 @@ impl MarketplaceContract {
             verified: merchant.verified,
             status: merchant.status,
             reputation_score,
+        };
+
+        Ok(MerchantViewDetailed {
+            view,
+            reputation,
+        })
+    }
+
+    pub fn get_merchant_view(env: Env, merchant_id: u64) -> Result<MerchantView, MarketplaceError> {
+        let detailed = Self::get_merchant_view_detailed(env, merchant_id)?;
+        Ok(detailed.view)
+    pub fn get_merchant_operational_view(
+        env: Env,
+        merchant_id: u64,
+    ) -> Result<MerchantOperationalView, MarketplaceError> {
+        let merchant = Self::get_merchant(env.clone(), merchant_id)?;
+
+        let effective = merchant.verified && merchant.status == MerchantStatus::Verified;
+        Ok(MerchantOperationalView {
+            id: merchant.id,
+            name: merchant.name,
+            status: merchant.status,
+            verified: merchant.verified,
+            effective,
         })
     }
 
@@ -933,11 +1396,38 @@ impl MarketplaceContract {
         status_filter: Option<MerchantStatus>,
     ) -> Result<DiscoveryPage, MarketplaceError> {
         let limit = limit.min(MAX_PAGE_LIMIT);
-        let merchant_ids: Vec<u64> = env
+
+        // Probe id-scoped `DataKey::Merchant(u64)` entries directly instead of
+        // deserializing the whole `MerchantIds` index (issue #120). Merchant ids
+        // are assigned monotonically from `NextMerchantId`, so the id space is
+        // contiguous and each id in `1..NextMerchantId` maps to a record.
+        let next_merchant_id: u64 = env
             .storage()
+            .instance()
+            .get(&DataKey::NextMerchantId)
+            .unwrap_or(1);
+
+        // Filter merchants by status if provided
+        let mut filtered_ids = Vec::new(&env);
+        let mut id = 1u64;
+        while id < next_merchant_id {
+        let merchant_ids: Vec<u64> = env
             .persistent()
             .get(&DataKey::MerchantIds)
             .unwrap_or_else(|| Vec::new(&env));
+        for id in merchant_ids.iter() {
+            if let Ok(merchant) = Self::get_merchant(env.clone(), id) {
+                if let Some(status) = status_filter {
+                    if merchant.status == status {
+                        filtered_ids.push_back(id);
+                    }
+                } else {
+                    // No filter: include all
+                    filtered_ids.push_back(id);
+                }
+            }
+            id += 1;
+        }
 
         // Filter merchants by status if provided
         let mut filtered_ids = Vec::new(&env);
@@ -958,8 +1448,10 @@ impl MarketplaceContract {
         if offset >= total || limit == 0 {
             return Ok(DiscoveryPage {
                 items: Vec::new(&env),
-                total: total as u32,
+                total,
                 next_offset: None,
+                next_cursor: None,
+                total: total as u32,
             });
         }
 
@@ -974,11 +1466,19 @@ impl MarketplaceContract {
         }
 
         let next_offset = if end < total { Some(end) } else { None };
+        // Expose the last returned id so callers can pivot to cursor pagination.
+        let next_cursor = if end < total {
+            Some(filtered_ids.get(end.saturating_sub(1)).unwrap())
+        } else {
+            None
+        };
 
         Ok(DiscoveryPage {
             items,
-            total: total as u32,
+            total,
             next_offset,
+            next_cursor,
+            total: total as u32,
         })
     }
 
@@ -1011,11 +1511,24 @@ impl MarketplaceContract {
         status_filter: Option<MerchantStatus>,
     ) -> Result<DiscoveryPage, MarketplaceError> {
         let limit = limit.min(MAX_PAGE_LIMIT);
-        let cat_ids: Vec<u64> = env
+        let normalized = normalize_symbol(&env, &category);
+        let mut cat_ids: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&DataKey::CategoryIndex(category))
+            .get(&DataKey::CategoryIndex(normalized.clone()))
             .unwrap_or_else(|| Vec::new(&env));
+
+        // Backward compatibility: If no merchants found under normalized key,
+        // and raw category differs from normalized, check raw category index.
+        if cat_ids.is_empty() && normalized != category {
+            if let Some(legacy_ids) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::CategoryIndex(category))
+            {
+                cat_ids = legacy_ids;
+            }
+        }
 
         // Filter merchants by status if provided
         let mut filtered_ids = Vec::new(&env);
@@ -1036,8 +1549,9 @@ impl MarketplaceContract {
         if offset >= total || limit == 0 {
             return Ok(DiscoveryPage {
                 items: Vec::new(&env),
-                total: total as u32,
+                total,
                 next_offset: None,
+                next_cursor: None,
             });
         }
 
@@ -1052,9 +1566,137 @@ impl MarketplaceContract {
         }
 
         let next_offset = if end < total { Some(end) } else { None };
+        // Expose the last returned id so callers can pivot to cursor pagination.
+        let next_cursor = if end < total {
+            Some(filtered_ids.get(end.saturating_sub(1)).unwrap())
+        } else {
+            None
+        };
 
         Ok(DiscoveryPage {
             items,
+            total,
+            next_offset,
+            next_cursor,
+        })
+    }
+
+    pub fn get_merchants_cursor(
+        env: Env,
+        cursor: MerchantCursor,
+    ) -> Result<DiscoveryPage, MarketplaceError> {
+        let limit = cursor.limit.min(MAX_PAGE_LIMIT);
+        let status_filter = cursor.status;
+
+        // Iterate id-scoped `DataKey::Merchant(u64)` entries from `after_id`
+        // without deserializing the whole `MerchantIds` index (issue #120). The
+        // loop reads at most `limit` merchant views, so cost is bounded by the
+        // page size (plus cheap key probes for skipped ids), not by the registry
+        // size, and deep pages never pay for the full index.
+        let next_merchant_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextMerchantId)
+            .unwrap_or(1);
+
+        let mut items = Vec::new(&env);
+        let mut last_id = cursor.after_id;
+        let mut id = cursor.after_id.saturating_add(1);
+
+        while items.len() < limit && id < next_merchant_id {
+            if env.storage().persistent().has(&DataKey::Merchant(id)) {
+                let merchant = Self::get_merchant(env.clone(), id)?;
+                let matches =
+                    status_filter == MerchantStatus::All || merchant.status == status_filter;
+                if matches {
+                    let view = Self::get_merchant_view(env.clone(), id)?;
+                    items.push_back(view);
+                    last_id = id;
+                }
+            }
+            id += 1;
+        }
+
+        let next_cursor = if !items.is_empty() && id < next_merchant_id {
+            Some(last_id)
+        } else {
+            None
+        };
+
+        Ok(DiscoveryPage {
+            items,
+            total: 0,
+            next_offset: None,
+            next_cursor,
+        })
+    }
+
+    pub fn get_merchants_by_category_cursor(
+        env: Env,
+        category: Symbol,
+        after_id: u64,
+        limit: u32,
+    ) -> Result<DiscoveryPage, MarketplaceError> {
+        let limit = limit.min(MAX_PAGE_LIMIT);
+
+        // Category membership is already scoped by `CategoryIndex(category)`, so
+        // page that id list from `after_id` without scanning the global registry.
+        let cat_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CategoryIndex(category))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut items = Vec::new(&env);
+        let mut last_id = after_id;
+        let n = cat_ids.len();
+
+        // Skip ids already seen by the caller (after_id is exclusive).
+        let mut i = 0u32;
+        while i < n && cat_ids.get(i).unwrap() <= after_id {
+            i += 1;
+        }
+
+        while i < n && items.len() < limit {
+            let id = cat_ids.get(i).unwrap();
+            let view = Self::get_merchant_view(env.clone(), id)?;
+            items.push_back(view);
+            last_id = id;
+            i += 1;
+        }
+
+        let next_cursor = if i < n { Some(last_id) } else { None };
+
+        Ok(DiscoveryPage {
+            items,
+            total: 0,
+            next_offset: None,
+            next_cursor,
+        // Filter merchants by status if provided
+        let mut filtered_ids = Vec::new(&env);
+        for id in cat_ids.iter() {
+            if let Ok(merchant) = Self::get_merchant(env.clone(), id) {
+                if let Some(status) = status_filter {
+                    if merchant.status == status {
+                        filtered_ids.push_back(id);
+                    }
+                } else {
+                    // No filter: include all
+                    filtered_ids.push_back(id);
+                }
+            }
+        let total = filtered_ids.len();
+        if offset >= total || limit == 0 {
+            return Ok(DiscoveryPage {
+                items: Vec::new(&env),
+                total: total as u32,
+                next_offset: None,
+            });
+        let end = offset.saturating_add(limit).min(total);
+        let mut i = offset;
+        while i < end {
+            let id = filtered_ids.get(i).unwrap();
+        let next_offset = if end < total { Some(end) } else { None };
             total: total as u32,
             next_offset,
         })
@@ -1093,7 +1735,7 @@ impl MarketplaceContract {
             .set(&DataKey::Merchant(merchant_id), &merchant);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("comm")),
+            (symbol_short!("mkplc"), symbol_short!("comm"), merchant_id),
             MerchantCommissionSetEvent {
                 merchant_id,
                 commission_bps,
@@ -1127,6 +1769,14 @@ impl MarketplaceContract {
             return Err(MarketplaceError::MerchantClosed);
         }
 
+        let prev_status = merchant.status;
+        if prev_status != MerchantStatus::Suspended {
+            let mut stats = Self::get_merchant_stats(env.clone());
+            stats.active = stats.active.saturating_sub(1);
+            stats.suspended = stats.suspended.saturating_add(1);
+            env.storage().instance().set(&DataKey::MerchantStats, &stats);
+        }
+
         merchant.status = MerchantStatus::Suspended;
         merchant.updated_at = env.ledger().timestamp();
 
@@ -1135,7 +1785,11 @@ impl MarketplaceContract {
             .set(&DataKey::Merchant(merchant_id), &merchant);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("suspend")),
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("suspend"),
+                merchant_id,
+            ),
             MerchantSuspendedEvent {
                 merchant_id,
                 suspended_by: admin,
@@ -1161,6 +1815,14 @@ impl MarketplaceContract {
             return Err(MarketplaceError::MerchantClosed);
         }
 
+        let prev_status = merchant.status;
+        if prev_status == MerchantStatus::Suspended {
+            let mut stats = Self::get_merchant_stats(env.clone());
+            stats.suspended = stats.suspended.saturating_sub(1);
+            stats.active = stats.active.saturating_add(1);
+            env.storage().instance().set(&DataKey::MerchantStats, &stats);
+        }
+
         merchant.status = if merchant.verified {
             MerchantStatus::Verified
         } else {
@@ -1173,7 +1835,7 @@ impl MarketplaceContract {
             .set(&DataKey::Merchant(merchant_id), &merchant);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("unsusp")),
+            (symbol_short!("mkplc"), symbol_short!("unsusp"), merchant_id),
             MerchantUnsuspendedEvent {
                 merchant_id,
                 unsuspended_by: admin,
@@ -1196,7 +1858,72 @@ impl MarketplaceContract {
         }
 
         let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
+        let prev_status = merchant.status;
+        if prev_status != MerchantStatus::Closed {
+            let mut stats = Self::get_merchant_stats(env.clone());
+            match prev_status {
+                MerchantStatus::Suspended => {
+                    stats.suspended = stats.suspended.saturating_sub(1);
+                }
+                MerchantStatus::Registered | MerchantStatus::Verified => {
+                    stats.active = stats.active.saturating_sub(1);
+                }
+                MerchantStatus::Closed => {}
+            }
+            stats.closed = stats.closed.saturating_add(1);
+            env.storage().instance().set(&DataKey::MerchantStats, &stats);
+        }
+
         merchant.status = MerchantStatus::Closed;
+
+        // Prune from global merchant index
+        let mut merchant_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantIds)
+            .unwrap_or_else(|| Vec::new(&env));
+        if let Some(pos) = merchant_ids.iter().position(|&x| x == id) {
+            merchant_ids.swap_remove(pos as u32);
+            env.storage()
+                .persistent()
+                .set(&DataKey::MerchantIds, &merchant_ids);
+        }
+
+        // Prune from category index
+        let cat_key = DataKey::CategoryIndex(merchant.category.clone());
+        let mut cat_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&cat_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if let Some(pos) = cat_ids.iter().position(|&x| x == id) {
+            cat_ids.swap_remove(pos as u32);
+            env.storage()
+                .persistent()
+                .set(&cat_key, &cat_ids);
+        }
+
+        // Archive the merchant snapshot
+        let closed_at = env.ledger().timestamp();
+        let archived = ArchivedMerchant {
+            id: merchant.id,
+            closed_at,
+            last_view: MerchantView {
+                id: merchant.id,
+                name: merchant.name.clone(),
+                category: merchant.category.clone(),
+                commission_rate_bps: merchant.commission_rate_bps,
+                verified: merchant.verified,
+                status: merchant.status,
+                reputation_score: None,
+            },
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArchivedMerchant(id), &archived);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantArchivedAt(id), &closed_at);
         merchant.updated_at = env.ledger().timestamp();
 
         env.storage()
@@ -1204,7 +1931,7 @@ impl MarketplaceContract {
             .set(&DataKey::Merchant(merchant_id), &merchant);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("closed")),
+            (symbol_short!("mkplc"), symbol_short!("closed"), merchant_id),
             MerchantClosedEvent {
                 merchant_id,
                 closed_by: admin,
@@ -1215,6 +1942,71 @@ impl MarketplaceContract {
         );
 
         Ok(())
+    }
+
+    /// Prunes closed merchants from `MerchantIds` and `CategoryIndex` (state maintenance).
+    ///
+    /// Callable by admin in bounded batches (`merchant_ids.len() <= MAX_PAGE_LIMIT`).
+    /// Returns the number of closed merchants pruned from active indices.
+    pub fn prune_closed_merchants(
+        env: Env,
+        admin: Address,
+        merchant_ids: Vec<u64>,
+    ) -> Result<u32, MarketplaceError> {
+        admin.require_auth();
+        let current_admin = Self::get_admin(env.clone())?;
+        if admin != current_admin {
+            return Err(MarketplaceError::Unauthorized);
+        }
+        if merchant_ids.len() > MAX_PAGE_LIMIT {
+            return Err(MarketplaceError::InvalidParam);
+        }
+
+        let mut all_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantIds)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut pruned_count: u32 = 0;
+
+        for id in merchant_ids.iter() {
+            if let Ok(merchant) = Self::get_merchant(env.clone(), id) {
+                if merchant.status == MerchantStatus::Closed {
+                    let mut modified = false;
+                    if let Some(pos) = all_ids.iter().position(|x| x == id) {
+                        all_ids.remove(pos as u32);
+                        modified = true;
+                    }
+                    let cat_key = DataKey::CategoryIndex(merchant.category.clone());
+                    if let Some(mut cat_ids) =
+                        env.storage().persistent().get::<_, Vec<u64>>(&cat_key)
+                    {
+                        if let Some(pos) = cat_ids.iter().position(|x| x == id) {
+                            cat_ids.remove(pos as u32);
+                            env.storage().persistent().set(&cat_key, &cat_ids);
+                        }
+                    }
+                    if modified {
+                        pruned_count += 1;
+                    }
+                }
+            }
+        }
+
+        if pruned_count > 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::MerchantIds, &all_ids);
+            env.events().publish(
+                (symbol_short!("mkplc"), symbol_short!("pruned")),
+                MerchantPrunedEvent {
+                    pruned_count,
+                    pruned_by: admin,
+                },
+            );
+        }
+
+        Ok(pruned_count)
     }
 
     // --- Reputation Pairing Config ---
@@ -1242,7 +2034,11 @@ impl MarketplaceContract {
             .set(&DataKey::Merchant(merchant_id), &merchant);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("rep_set")),
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("rep_set"),
+                merchant_id,
+            ),
             MerchantReputationSetEvent {
                 merchant_id,
                 reputation,
@@ -1277,11 +2073,15 @@ impl MarketplaceContract {
         env: Env,
         current_admin: Address,
         new_admin: Address,
-    ) -> Result<(), MarketplaceError> {
+    ) -> Result<bool, MarketplaceError> {
         current_admin.require_auth();
         let admin = Self::get_admin(env.clone())?;
         if current_admin != admin {
             return Err(MarketplaceError::Unauthorized);
+        }
+
+        if new_admin == current_admin {
+            return Ok(false);
         }
 
         env.storage()
@@ -1296,7 +2096,7 @@ impl MarketplaceContract {
             },
         );
 
-        Ok(())
+        Ok(true)
     }
 
     pub fn accept_admin(env: Env, caller: Address) -> Result<(), MarketplaceError> {
@@ -1318,6 +2118,8 @@ impl MarketplaceContract {
             return Err(MarketplaceError::Unauthorized);
         }
 
+        let previous_admin = Self::get_admin(env.clone())?;
+
         env.storage().instance().set(&DataKey::Admin, &caller);
         env.storage()
             .instance()
@@ -1325,7 +2127,10 @@ impl MarketplaceContract {
 
         env.events().publish(
             (symbol_short!("mkplc"), symbol_short!("adm_acc")),
-            AdminAcceptedEvent { new_admin: caller },
+            AdminAcceptedEvent {
+                previous_admin,
+                new_admin: caller,
+            },
         );
 
         Ok(())
@@ -1401,6 +2206,7 @@ impl MarketplaceContract {
         ContractVersion {
             name: symbol_short!("market"),
             semver: symbol_short!("0_2_0"),
+            semver: soroban_sdk::Symbol::new(&_env, env!("CARGO_PKG_VERSION_SYM")),
         }
     }
 
@@ -1413,7 +2219,289 @@ impl MarketplaceContract {
             _ => Ok(()),
         }
     }
+
+    /// Trims leading/trailing ASCII whitespace from `s` and enforces that its
+    /// (pre-trim) byte length does not exceed `max_len`.
+    ///
+    /// The length check happens *before* any bytes are copied out of the
+    /// host string, so an oversized string is rejected in constant work
+    /// rather than first being paid for byte-by-byte.
+    ///
+    /// Trimming only ever strips single-byte ASCII whitespace characters
+    /// (space, tab, CR, LF, form feed, see `u8::is_ascii_whitespace`), which
+    /// can never appear as a continuation byte of a multi-byte UTF-8
+    /// sequence, so the remaining slice is always valid UTF-8.
+    fn normalize_bounded_string(
+        env: &Env,
+        s: &String,
+        max_len: u32,
+    ) -> Result<String, MarketplaceError> {
+        let raw_len = s.len();
+        if raw_len > max_len {
+            return Err(MarketplaceError::InvalidParam);
+        }
+
+        let mut buf = [0u8; MAX_FIELD_BUF_LEN];
+        let n = raw_len as usize;
+        s.copy_into_slice(&mut buf[..n]);
+
+        let mut start = 0usize;
+        let mut end = n;
+        while start < end && buf[start].is_ascii_whitespace() {
+            start += 1;
+        }
+        while end > start && buf[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+
+        Ok(String::from_bytes(env, &buf[start..end]))
+    }
+
+    /// Normalizes and bounds-checks every string field on `RegisterParams`,
+    /// used by both `register_merchant` and, field-by-field, by
+    /// `update_merchant_profile`. Whitespace is trimmed to a canonical form
+    /// before persistence, and every field is rejected with
+    /// `MarketplaceError::InvalidParam` if it exceeds its configured cap.
+    /// `name` is additionally required to be non-empty after trimming.
+    fn validate_and_normalize(
+        env: &Env,
+        p: &RegisterParams,
+    ) -> Result<RegisterParams, MarketplaceError> {
+        let name = Self::normalize_bounded_string(env, &p.name, MAX_NAME_LEN)?;
+        if name.is_empty() {
+            return Err(MarketplaceError::InvalidParam);
+        }
+        let description = Self::normalize_bounded_string(env, &p.description, MAX_DESCRIPTION_LEN)?;
+        let image_url = Self::normalize_bounded_string(env, &p.image_url, MAX_IMAGE_URL_LEN)?;
+        let metadata = match &p.metadata {
+            Some(m) => Some(Self::normalize_bounded_string(env, m, MAX_METADATA_LEN)?),
+            None => None,
+        };
+
+        Ok(RegisterParams {
+            name,
+            description,
+            category: p.category.clone(),
+            image_url,
+            metadata,
+            required_verifications: p.required_verifications,
+        })
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn verify_merchant_count_overflow_returns_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register_contract(None, MarketplaceContract);
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        client.__constructor(&admin).unwrap();
+
+        let owner = Address::generate(&env);
+        let params = RegisterParams {
+            name: String::from_str(&env, "overflow-merchant"),
+            description: String::from_str(&env, "desc"),
+            category: symbol_short!("cate"),
+            image_url: String::from_str(&env, "https://example.com/image.png"),
+            metadata: None,
+            required_verifications: 1,
+        };
+
+        let merchant_id = client.register_merchant(&owner, ¶ms).unwrap();
+
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::VerifiedCount(merchant_id), &u32::MAX);
+        });
+
+        let verifier = Address::generate(&env);
+        let verifier_struct = Verifier {
+            address: verifier.clone(),
+            label: symbol_short!("v"),
+            registered_at: env.ledger().timestamp(),
+        };
+        client.add_verifier(&admin, &verifier_struct).unwrap();
+
+        assert_eq!(
+            client.verify_merchant(&merchant_id, &verifier),
+            Err(MarketplaceError::VerificationCountOverflow)
+        );
+    }
+
+    #[test]
+    fn verification_count_overflow_error_payload() {
+        assert_eq!(MarketplaceError::VerificationCountOverflow as u32, 16);
+mod error_code_uniqueness_tests {
+    const PERMISSION_ERROR_RANGE: (u32, u32) = (1, 999);
+    const ESCROW_ERROR_RANGE: (u32, u32) = (1000, 1999);
+    const REPUTATION_ERROR_RANGE: (u32, u32) = (2000, 2999);
+    const DELEGATION_ERROR_RANGE: (u32, u32) = (3000, 3999);
+    const MARKETPLACE_ERROR_RANGE: (u32, u32) = (4000, 4999);
+    fn marketplace_error_codes() -> [u32; 16] {
+        [
+            MarketplaceError::AlreadyInitialized as u32,
+            MarketplaceError::NotInitialized as u32,
+            MarketplaceError::Unauthorized as u32,
+            MarketplaceError::MerchantNotFound as u32,
+            MarketplaceError::AlreadyVerified as u32,
+            MarketplaceError::InvalidCommissionBps as u32,
+            MarketplaceError::DuplicateMerchantName as u32,
+            MarketplaceError::MerchantFrozen as u32,
+            MarketplaceError::MerchantClosed as u32,
+            MarketplaceError::VerifierAlreadyExists as u32,
+            MarketplaceError::VerifierNotFound as u32,
+            MarketplaceError::InsufficientVerifications as u32,
+            MarketplaceError::MetadataLockActive as u32,
+            MarketplaceError::InvalidCategory as u32,
+            MarketplaceError::InvalidParam as u32,
+            MarketplaceError::NoPendingAdmin as u32,
+        ]
+    fn marketplace_error_codes_are_unique() {
+        let codes = marketplace_error_codes();
+        for (i, code) in codes.iter().enumerate() {
+            for other in codes.iter().skip(i + 1) {
+                assert!(
+                    code != other,
+                    "duplicate error code {} in MarketplaceError",
+                    code
+                );
+            }
+        }
+    fn marketplace_error_codes_are_in_allocated_range() {
+        for code in marketplace_error_codes() {
+            assert!(
+                (MARKETPLACE_ERROR_RANGE.0..=MARKETPLACE_ERROR_RANGE.1).contains(&code),
+                "MarketplaceError code {} outside allocated range",
+                code
+            );
+    fn marketplace_error_codes_do_not_collide_with_other_contracts() {
+        let other_ranges = [
+            PERMISSION_ERROR_RANGE,
+            ESCROW_ERROR_RANGE,
+            REPUTATION_ERROR_RANGE,
+            DELEGATION_ERROR_RANGE,
+        ];
+            for &(start, end) in &other_ranges {
+                    !(start..=end).contains(&code),
+                    "MarketplaceError code {} collides with reserved range {}-{}",
+                    code,
+                    start,
+                    end
+    }
 }
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod merchant_operational_view_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{Address, Env, String, Symbol};
+
+    fn seed_merchant(
+        env: &Env,
+        contract_id: &soroban_sdk::BytesN<32>,
+        id: u64,
+        status: MerchantStatus,
+        verified: bool,
+    ) {
+        let merchant = Merchant {
+            id,
+            owner: None,
+            name: String::from_slice(env, b"Matrix Merchant"),
+            description: String::from_slice(env, b""),
+            category: Symbol::new(env, "general"),
+            image_url: String::from_slice(env, b""),
+            commission_rate_bps: 0,
+            metadata: None,
+            status,
+            verified,
+            created_at: 0,
+            updated_at: 0,
+            reputation: None,
+        };
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Merchant(id), &merchant);
+            env.storage()
+                .persistent()
+                .set(&DataKey::MerchantName(merchant.name.clone()), &id);
+        });
+    }
+
+    #[test]
+    fn operational_view_effective_matrix() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register_contract(None, MarketplaceContract);
+        let client = MarketplaceContractClient::new(&env, contract_id.clone());
+        drop(client.__constructor(&admin));
+
+        let cases = [
+            (MerchantStatus::Registered, false, false),
+            (MerchantStatus::Registered, true, false),
+            (MerchantStatus::Verified, false, false),
+            (MerchantStatus::Verified, true, true),
+            (MerchantStatus::Suspended, false, false),
+            (MerchantStatus::Suspended, true, false),
+            (MerchantStatus::Closed, false, false),
+            (MerchantStatus::Closed, true, false),
+        ];
+
+        for (i, (status, verified, effective)) in cases.iter().enumerate() {
+            let id = i as u64 + 1;
+            seed_merchant(&env, &contract_id, id, *status, *verified);
+            let view = client.get_merchant_operational_view(&id).unwrap();
+            assert_eq!(view.status, *status);
+            assert_eq!(view.verified, *verified);
+            assert_eq!(view.effective, *effective);
+        }
+    }
+
+    #[test]
+    fn suspend_keeps_verified_flag_but_not_effective() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register_contract(None, MarketplaceContract);
+        let client = MarketplaceContractClient::new(&env, contract_id.clone());
+        drop(client.__constructor(&admin));
+
+        let verifier = Verifier {
+            address: Address::generate(&env),
+            label: Symbol::new(&env, "gov"),
+            registered_at: 0,
+        };
+        drop(client.add_verifier(&admin, &verifier));
+
+        let owner = Address::generate(&env);
+        let params = RegisterParams {
+            name: String::from_slice(&env, b"Verified Merchant"),
+            description: String::from_slice(&env, b"desc"),
+            category: Symbol::new(&env, "general"),
+            image_url: String::from_slice(&env, b"https://example.com/img.png"),
+            metadata: None,
+            required_verifications: 1,
+        };
+        let id = client.register_merchant(&owner, &params).unwrap();
+        drop(client.verify_merchant(&id, &verifier.address));
+        drop(client.suspend_merchant(&admin, &id));
+
+        let view = client.get_merchant_operational_view(&id).unwrap();
+        assert_eq!(view.status, MerchantStatus::Suspended);
+        assert!(view.verified);
+        assert!(!view.effective);
+    }
+}

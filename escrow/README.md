@@ -47,6 +47,7 @@ Soroban smart contract for holding purchase funds until fulfillment.
 | `add_co_admin` | primary admin | Add a co-admin |
 | `remove_co_admin` | primary admin | Remove a co-admin |
 | `is_admin` | — | Check if an address is admin or co-admin |
+| `prune_dispute_votes` | admin | Prune dispute and timeout votes for settled escrows (bounded batch) |
 
 ## `get_admin`
 
