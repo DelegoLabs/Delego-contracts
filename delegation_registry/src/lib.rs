@@ -114,6 +114,25 @@ pub enum DelegationError {
     VersionNotLower = 7,
     SnapshotNotFound = 8,
     InvalidAgentId = 9,
+    /// `owner` or `permissions_contract` is a zero / void address.
+    InvalidParam = 10,
+}
+
+// ── Zero-address guard ────────────────────────────────────────────────────────
+
+const ZERO_ACCOUNT_STRKEY: &str =
+    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+const ZERO_CONTRACT_STRKEY: &str =
+    "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
+/// Returns `true` when `address` is either of the two canonical zero/void
+/// addresses (account or contract form).  Mirrors the same helper used in
+/// the escrow and permissions contracts so validation is consistent across
+/// the entire contract suite.
+fn is_zero_address(env: &Env, address: &Address) -> bool {
+    let zero_account = Address::from_str(env, ZERO_ACCOUNT_STRKEY);
+    let zero_contract = Address::from_str(env, ZERO_CONTRACT_STRKEY);
+    address == &zero_account || address == &zero_contract
 }
 
 #[contract]
@@ -152,6 +171,15 @@ impl DelegationRegistry {
         // failing closed.
         if agent_id == BytesN::from_array(&env, &[0u8; 32]) {
             return Err(DelegationError::InvalidAgentId);
+        }
+
+        // Reject zero/void addresses for owner and permissions_contract so a
+        // delegation can never be pinned to a dead account or contract.
+        if is_zero_address(&env, &owner) {
+            return Err(DelegationError::InvalidParam);
+        }
+        if is_zero_address(&env, &permissions_contract) {
+            return Err(DelegationError::InvalidParam);
         }
 
         let id = env

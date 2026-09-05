@@ -535,3 +535,80 @@ fn test_revoke_paused_delegation_returns_true() {
     assert!(!repeat_result);
     assert_eq!(client.get_delegation_version(&id), 3);
 }
+
+// ── Zero-address guard tests ─────────────────────────────────────────────────
+
+#[test]
+fn test_zero_account_permissions_contract_rejected() {
+    let (env, client, _, owner, agent_id, _) = setup();
+    env.mock_all_auths();
+
+    // The canonical zero account address must be refused for permissions_contract.
+    let zero_permissions = Address::from_str(
+        &env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    );
+    let label = Symbol::new(&env, "Zero_Perm_Acct");
+
+    let result =
+        client.try_create_delegation(&owner, &agent_id, &zero_permissions, &label, &1000);
+    assert_eq!(result, Err(Ok(DelegationError::InvalidParam)));
+
+    // No record should have been stored.
+    let records = client.get_delegations_by_owner(&owner);
+    assert_eq!(records.len(), 0);
+}
+
+#[test]
+fn test_zero_contract_permissions_contract_rejected() {
+    let (env, client, _, owner, agent_id, _) = setup();
+    env.mock_all_auths();
+
+    // The canonical zero contract address must be refused for permissions_contract.
+    let zero_permissions = Address::from_str(
+        &env,
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+    );
+    let label = Symbol::new(&env, "Zero_Perm_Cont");
+
+    let result =
+        client.try_create_delegation(&owner, &agent_id, &zero_permissions, &label, &1000);
+    assert_eq!(result, Err(Ok(DelegationError::InvalidParam)));
+
+    let records = client.get_delegations_by_owner(&owner);
+    assert_eq!(records.len(), 0);
+}
+
+#[test]
+fn test_zero_account_owner_rejected() {
+    let (env, client, _, _, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    // The canonical zero account address must be refused for owner.
+    let zero_owner = Address::from_str(
+        &env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    );
+    let label = Symbol::new(&env, "Zero_Owner_Acct");
+
+    let result =
+        client.try_create_delegation(&zero_owner, &agent_id, &permissions_contract, &label, &1000);
+    assert_eq!(result, Err(Ok(DelegationError::InvalidParam)));
+}
+
+#[test]
+fn test_zero_contract_owner_rejected() {
+    let (env, client, _, _, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    // The canonical zero contract address must be refused for owner.
+    let zero_owner = Address::from_str(
+        &env,
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+    );
+    let label = Symbol::new(&env, "Zero_Owner_Cont");
+
+    let result =
+        client.try_create_delegation(&zero_owner, &agent_id, &permissions_contract, &label, &1000);
+    assert_eq!(result, Err(Ok(DelegationError::InvalidParam)));
+}
