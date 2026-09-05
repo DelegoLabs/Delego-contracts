@@ -265,6 +265,15 @@ impl DelegationRegistry {
             return Err(DelegationError::InvalidAgentId);
         }
 
+        // Reject zero/void addresses for owner and permissions_contract so a
+        // delegation can never be pinned to a dead account or contract.
+        if is_zero_address(&env, &owner) {
+            return Err(DelegationError::InvalidParam);
+        }
+        if is_zero_address(&env, &permissions_contract) {
+            return Err(DelegationError::InvalidParam);
+        }
+
         let id = env
             .storage()
             .instance()
