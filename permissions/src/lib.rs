@@ -129,20 +129,6 @@ pub enum PermissionError {
     NotInitialized = 2500,
 }
 
-/// Epoch period for allowance reset logic.
-/// Controls how frequently the spent counter resets based on ledger time.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Epoch {
-    /// Reset spent daily (every ledger day)
-    Daily,
-    /// Reset spent weekly (every 7 ledger days)
-    Weekly,
-    /// Reset spent monthly (every 30 ledgers, roughly)
-    Monthly,
-}
-
-
 #[cfg(test)]
 mod error_code_tests {
     use super::PermissionError;
