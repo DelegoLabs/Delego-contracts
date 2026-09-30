@@ -1,6 +1,6 @@
 # Escrow Contract
 
-Soroban smart contract for holding purchase funds until fulfillment.
+Soroban smart contract for holding purchase funds until fulfillment..
 
 ## Functions
 
