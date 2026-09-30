@@ -169,3 +169,4 @@ will reject the change.
   cross-contract adapter, plus the `MockLendingPool` test double (with
   `testutils` feature) for locally simulating external yield accrual. Escrow
   delegates `get_accrued_yield` reads to this interface.
+...
