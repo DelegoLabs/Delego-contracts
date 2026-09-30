@@ -63,7 +63,7 @@ pub fn compute_versioned_domain_separator(env: &Env) -> BytesN<32> {
 fn relayed_spend_signing_payload(env: &Env, message: &RelayedSpendMessage) -> soroban_sdk::Bytes {
     let mut payload = soroban_sdk::Bytes::new(env);
     payload.append(&compute_versioned_domain_separator(env).into());
-    payload.append(&message.to_xdr(env));
+    payload.append(&message.clone().to_xdr(env));
     payload
 }
 
@@ -201,15 +201,15 @@ pub enum PermissionError {
     /// Admin-gated call made before `set_admin` has ever been called
     NotInitialized = 2500,
     /// Allowance sweep targeted a delegation that is still live
-    DelegationNotExpired = 2414,
+    DelegationNotExpired = 2418,
     /// A child permission grant would exceed `MAX_HIERARCHY_DEPTH`
-    MaxHierarchyDepthExceeded = 2414,
+    MaxHierarchyDepthExceeded = 2419,
     /// Merchant's verification is below the currently required policy
     /// threshold and the grace period has elapsed.
-    VerificationBelowPolicy = 2414,
+    VerificationBelowPolicy = 2420,
     /// Merchant's verification is below the currently required policy
     /// threshold but still within the grace period.
-    VerificationGracePeriod = 2415,
+    VerificationGracePeriod = 2421,
 }
 
 #[cfg(test)]
@@ -596,6 +596,37 @@ pub struct RelayedSpendMessage {
     pub epoch: u32,
 }
 
+/// Canonical payload a delegate signs off-chain to authorize a gasless spend
+/// on a specific channel, submitted by a relayer (issue #367). Includes
+/// `channel_id` to bind the signature to a specific nonce lane, preventing
+/// cross-channel replay.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct ChannelRelayedSpendMessage {
+    pub owner: Address,
+    pub delegate: Address,
+    pub merchant: Address,
+    pub amount: i128,
+    pub channel_id: u32,
+    pub nonce: u64,
+    pub expiration_ledger: u32,
+    pub epoch: u32,
+}
+
+/// Signature bundle for a channel-based relayed spend (issue #367).
+/// Carries the `channel_id` so the on-chain verifier can look up the correct
+/// nonce lane, the `nonce` for replay protection within that lane, and the
+/// ed25519 `signature` over the [`ChannelRelayedSpendMessage`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct ChannelSpendSignature {
+    pub channel_id: u32,
+    pub nonce: u64,
+    pub signature: BytesN<64>,
+}
+
 /// Owner-controlled, seller-specific allowlist enforced on every spend for a
 /// sensitive `(owner, delegate)` delegation (issue #296).
 ///
@@ -821,6 +852,8 @@ pub struct TimeWindowRestrictionSetEvent {
     pub start_hour_utc: u32,
     pub end_hour_utc: u32,
     pub allowed_days_bitmap: u32,
+}
+
 /// Rolling-window spend cap for a single (owner, delegate) pair (issue #368).
 ///
 /// Complements the per-transaction limit: even a delegate that stays under
@@ -1058,7 +1091,7 @@ pub struct VerificationPolicy {
 pub struct MerchantVerification {
     pub verifications: u32,
     pub verified_at: u64,
-    pub policy_required_at_verification: u32,
+    pub required_at_verification: u32,
 }
 
 /// Emitted when a merchant's verification status is re-evaluated against the
@@ -1171,6 +1204,18 @@ pub enum DataKey {
     PermissionScope(Address, Address),
     /// Index of owner addresses that have granted permissions to a given delegate.
     DelegatePermissions(Address),
+    /// Delegation-hierarchy metadata for a (owner, delegate) permission.
+    Hierarchy(Address, Address),
+    /// Next expected nonce for a (owner, delegate, channel_id) triple's relayed spends.
+    /// Enables parallel multi-channel nonce lanes (issue #367).
+    ChannelNonce(Address, Address, u32),
+    /// Instance-level active verification policy.
+    VerificationPolicy,
+    /// Per-merchant verification state, keyed by merchant id.
+    MerchantVerification(u64),
+    /// Instance-level grace period (seconds) granted to pre-existing
+    /// merchants when the required verification count increases.
+    VerificationGracePeriodSecs,
 }
 
 /// Computes `current + ttl` as an absolute expiry ledger.
@@ -1182,15 +1227,6 @@ pub fn compute_expiry_ledger(current: u32, ttl: u32) -> Result<u32, PermissionEr
     current
         .checked_add(ttl)
         .ok_or(PermissionError::InvalidExpiry)
-    /// Delegation-hierarchy metadata for a (owner, delegate) permission.
-    Hierarchy(Address, Address),
-    /// Instance-level active verification policy.
-    VerificationPolicy,
-    /// Per-merchant verification state, keyed by merchant id.
-    MerchantVerification(u64),
-    /// Instance-level grace period (seconds) granted to pre-existing
-    /// merchants when the required verification count increases.
-    VerificationGracePeriodSecs,
 }
 
 #[contract]
@@ -1252,7 +1288,7 @@ impl PermissionsContract {
 
     /// Returns the configured grace period (seconds) for pre-existing
     /// merchants when the required verification count increases.
-    fn get_verification_grace_period_secs(env: &Env) -> u64 {
+    fn get_verif_grace_secs(env: &Env) -> u64 {
         env.storage()
             .instance()
             .get(&DataKey::VerificationGracePeriodSecs)
@@ -1267,7 +1303,7 @@ impl PermissionsContract {
     pub fn recheck_merchant_verification(
         env: &Env,
         merchant_id: u64,
-        policy: &VerificationPolicy,
+        policy: VerificationPolicy,
     ) -> bool {
         let current_verifications = Self::get_merchant_verifications_count(env, merchant_id);
         current_verifications >= policy.required
@@ -1278,7 +1314,7 @@ impl PermissionsContract {
     /// When the required attestation count increases, merchants already
     /// verified under the previous policy are not immediately invalidated;
     /// instead they receive a grace period (see
-    /// `set_verification_grace_period_secs`) during which they may acquire
+    /// `set_verif_grace_secs`) during which they may acquire
     /// the additional attestations.
     pub fn set_verification_policy(
         env: Env,
@@ -1300,7 +1336,7 @@ impl PermissionsContract {
     /// Configures the grace period (seconds) granted to pre-existing
     /// merchants when the required verification count increases. Admin-only.
     /// Values are bounded to `MAX_VERIFICATION_GRACE_PERIOD_SECS`.
-    pub fn set_verification_grace_period_secs(
+    pub fn set_verif_grace_secs(
         env: Env,
         admin: Address,
         secs: u64,
@@ -1313,11 +1349,6 @@ impl PermissionsContract {
             .instance()
             .set(&DataKey::VerificationGracePeriodSecs, &secs);
         Ok(())
-    }
-
-    /// Returns the configured verification grace period in seconds.
-    pub fn get_verification_grace_period_secs(env: Env) -> u64 {
-        Self::get_verification_grace_period_secs(&env)
     }
 
     /// Records (or updates) the attestation count for a merchant. Admin-only.
@@ -1351,7 +1382,7 @@ impl PermissionsContract {
             &MerchantVerification {
                 verifications,
                 verified_at,
-                policy_required_at_verification: policy.required,
+                required_at_verification: policy.required,
             },
         );
 
@@ -1398,7 +1429,7 @@ impl PermissionsContract {
         // Below the current policy threshold. Determine whether the merchant
         // is still within the grace period granted for pre-existing
         // verifications.
-        let grace_secs = Self::get_verification_grace_period_secs(&env);
+        let grace_secs = Self::get_verif_grace_secs(&env);
         let now = env.ledger().timestamp();
 
         let verified_at = env
@@ -1660,6 +1691,8 @@ impl PermissionsContract {
             status: PermissionStatus::Active,
             expires_at_ledger,
             created_at: env.ledger().timestamp(),
+            not_before_ledger: 0,
+            not_after_ledger: 0,
             parent_owner: None,
             parent_delegate: None,
         };
@@ -1860,6 +1893,8 @@ impl PermissionsContract {
             status: PermissionStatus::Active,
             expires_at_ledger,
             created_at: env.ledger().timestamp(),
+            not_before_ledger: 0,
+            not_after_ledger: 0,
             parent_owner: Some(parent_owner.clone()),
             parent_delegate: Some(parent_delegate.clone()),
         };
@@ -1872,6 +1907,7 @@ impl PermissionsContract {
                 current_epoch: 0,
                 epoch_started_ledger: env.ledger().sequence(),
             },
+        );
         Self::add_to_address_index(
             &env,
             &DataKey::DelegatePermissions(child_delegate.clone()),
@@ -2067,6 +2103,8 @@ impl PermissionsContract {
             status: PermissionStatus::Active,
             expires_at_ledger: old_record.expires_at_ledger,
             created_at: env.ledger().timestamp(),
+            not_before_ledger: old_record.not_before_ledger,
+            not_after_ledger: old_record.not_after_ledger,
             parent_owner: old_record.parent_owner.clone(),
             parent_delegate: old_record.parent_delegate.clone(),
         };
@@ -3433,6 +3471,21 @@ impl PermissionsContract {
             .unwrap_or(0)
     }
 
+    /// Returns the next nonce a channel-based relayed spend for this
+    /// (owner, delegate, channel_id) triple must use (issue #367).
+    /// Channels are independent lanes (0..=255), enabling parallel spends.
+    pub fn get_channel_nonce(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        channel_id: u32,
+    ) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ChannelNonce(owner, delegate, channel_id))
+            .unwrap_or(0)
+    }
+
     /// Returns the current execution epoch for relayed spends.
     pub fn get_execution_epoch(env: Env, owner: Address, delegate: Address) -> EpochConfig {
         env.storage()
@@ -3683,6 +3736,127 @@ impl PermissionsContract {
 
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("relayed"), delegate.clone()),
+            PermissionSpendEvent {
+                owner,
+                delegate,
+                merchant,
+                amount,
+                remaining: result.remaining_allowance,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Execute a spend on the delegate's behalf from a relayer, using a
+    /// specific channel nonce lane (issue #367).
+    ///
+    /// This is the multi-channel analogue of [`Self::execute_spend_via_relayer`].
+    /// The delegate authorizes the spend by signing a
+    /// [`ChannelRelayedSpendMessage`] off-chain with the key registered via
+    /// `set_relayer_key`; any relayer can then submit that message and
+    /// signature here. The signature is verified against the delegate's
+    /// registered public key. The `channel_id` (0..=255) selects an independent
+    /// nonce lane, so concurrent spends on different channels never block each
+    /// other. The `nonce` must match the current expected nonce for that
+    /// channel, and `expiration_ledger` must not yet have been reached.
+    ///
+    /// The signed payload names no contract entrypoint, so this path is only
+    /// usable by unscoped delegations: for a permission carrying a
+    /// [`ScopedPermissionConfig`] (issue #369) the shared validation rejects
+    /// the relayed spend with [`PermissionError::UnauthorizedFunction`],
+    /// because there is no way for the signature to attest *which* function
+    /// the relayer is invoking on the delegate's behalf. Relayed agents on a
+    /// scoped grant must therefore submit [`Self::execute_spend_scoped`]
+    /// themselves. Scoping fails closed here rather than being skipped.
+    // Reason: Soroban ABI entry point — signature is part of the published
+    // on-chain ABI and cannot be restructured without a breaking change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_spend_via_channel(
+        env: Env,
+        relayer: Address,
+        owner: Address,
+        delegate: Address,
+        amount: i128,
+        merchant: Address,
+        channel_sig: ChannelSpendSignature,
+        expiration_ledger: u32,
+        epoch: u32,
+    ) -> Result<(), PermissionError> {
+        relayer.require_auth();
+
+        if env.ledger().sequence() >= expiration_ledger {
+            return Err(PermissionError::SignatureExpired);
+        }
+
+        let epoch_config =
+            Self::get_execution_epoch(env.clone(), owner.clone(), delegate.clone());
+        if epoch != epoch_config.current_epoch {
+            return Err(PermissionError::StaleEpoch);
+        }
+
+        // Validate channel_id range (0..=255)
+        if channel_sig.channel_id > 255 {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        let nonce_key = DataKey::ChannelNonce(owner.clone(), delegate.clone(), channel_sig.channel_id);
+        let expected_nonce: u64 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
+        if channel_sig.nonce != expected_nonce {
+            return Err(PermissionError::InvalidNonce);
+        }
+
+        let public_key: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RelayerKey(delegate.clone()))
+            .ok_or(PermissionError::RelayerKeyNotSet)?;
+
+        let message = ChannelRelayedSpendMessage {
+            owner: owner.clone(),
+            delegate: delegate.clone(),
+            merchant: merchant.clone(),
+            amount,
+            channel_id: channel_sig.channel_id,
+            nonce: channel_sig.nonce,
+            expiration_ledger,
+            epoch,
+        };
+        let message_bytes = message.to_xdr(&env);
+        env.crypto()
+            .ed25519_verify(&public_key, &message_bytes, &channel_sig.signature);
+
+        // Signature verified — apply the same validation rules as a direct
+        // execute_spend before mutating state.
+        Self::can_spend(
+            env.clone(),
+            owner.clone(),
+            delegate.clone(),
+            amount,
+            merchant.clone(),
+        )?;
+
+        // #54: Velocity check — reject if min_spend_interval has not yet elapsed
+        // since the last recorded spend ledger for this (owner, delegate) pair.
+        // Shared with execute_spend so direct and relayed spends share the
+        // same throttle (issue #179).
+        Self::check_velocity(&env, &owner, &delegate)?;
+
+        // #368: Rolling-window cap, shared with the direct spend path.
+        Self::check_rolling_window(&env, &owner, &delegate, amount)?;
+
+        // Advance the nonce before mutating spend state so a replay attempt
+        // within the same ledger is rejected even if apply_spend panics.
+        let next_nonce = channel_sig.nonce.checked_add(1).ok_or(PermissionError::InvalidNonce)?;
+        env.storage().persistent().set(&nonce_key, &next_nonce);
+
+        // apply_spend increments the child record, walks the full parent chain,
+        // updates usage stats, and records the last spend ledger — identical to
+        // the direct execute_spend path (issue #55).
+        let result = Self::apply_spend(&env, &owner, &delegate, amount)?;
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("chn_spnd"), delegate.clone()),
             PermissionSpendEvent {
                 owner,
                 delegate,
@@ -4012,11 +4186,6 @@ impl PermissionsContract {
         records
     }
 
-    pub fn get_permission(
-        env: Env,
-        owner: Address,
-        delegate: Address,
-    ) -> Result<PermissionRecord, PermissionError> {
     /// Returns stored permissions granted to `delegate` by every indexed owner.
     pub fn get_permissions_by_delegate(env: Env, delegate: Address) -> Vec<PermissionRecord> {
         let owners: Vec<Address> = env
@@ -4038,7 +4207,6 @@ impl PermissionsContract {
         records
     }
 
-    pub fn get_permission(env: Env, owner: Address, delegate: Address) -> Result<PermissionRecord, PermissionError> {
     /// Resets the owner's SAC allowance for `delegate` on `token` to zero once
     /// the delegation has expired, so a lapsed delegation cannot keep pulling
     /// funds through a stale `approve`.
@@ -4092,14 +4260,6 @@ impl PermissionsContract {
     }
 
 
-
-    pub fn get_remaining_allowance(env: Env, owner: Address, delegate: Address) -> Result<i128, PermissionError> {
-        let key = DataKey::Permission(owner, delegate);
-        env.storage()
-            .persistent()
-            .get(&key)
-            .ok_or(PermissionError::PermissionNotFound)
-    }
 
     pub fn get_remaining_allowance(
         env: Env,
@@ -4745,6 +4905,12 @@ impl PermissionsContract {
         env.storage()
             .persistent()
             .remove(&DataKey::RelayerNonce(owner.clone(), delegate.clone()));
+        // Clean up all channel nonce lanes (0..=255)
+        for channel_id in 0u32..=255 {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ChannelNonce(owner.clone(), delegate.clone(), channel_id));
+        }
         env.storage()
             .persistent()
             .remove(&DataKey::LastSpendLedger(owner.clone(), delegate.clone()));

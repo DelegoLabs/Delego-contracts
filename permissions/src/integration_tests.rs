@@ -1,14 +1,15 @@
 #![cfg(test)]
 
 use crate::{
-    MerchantAllowlist, PermissionError, PermissionStatus, PermissionsContract,
+    ChannelRelayedSpendMessage, ChannelSpendSignature, MerchantAllowlist,
+    PermissionError, PermissionStatus, PermissionsContract,
     PermissionsContractClient, RelayedSpendMessage, ScopedPermissionConfig,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
     xdr::ToXdr,
-    Address, BytesN, Env, Symbol, TryIntoVal, Vec,
+    Address, BytesN, Env, Symbol, TryIntoVal, Vec, symbol_short,
 };
 
 /// Deterministic test keypair plus its raw ed25519 public key bytes.
@@ -44,6 +45,22 @@ fn sign_relayed_spend(
     env: &Env,
     signing_key: &SigningKey,
     message: RelayedSpendMessage,
+) -> BytesN<64> {
+    let message_bytes = message.to_xdr(env);
+    let len = message_bytes.len() as usize;
+    let mut buf = [0u8; 512];
+    message_bytes.copy_into_slice(&mut buf[..len]);
+    let signature = signing_key.sign(&buf[..len]);
+    BytesN::from_array(env, &signature.to_bytes())
+}
+
+/// Sign a `ChannelRelayedSpendMessage` with the given key, returning the
+/// raw 64-byte ed25519 signature over the message's canonical XDR encoding —
+/// the exact bytes `execute_spend_via_channel` re-derives and verifies.
+fn sign_channel_spend(
+    env: &Env,
+    signing_key: &SigningKey,
+    message: ChannelRelayedSpendMessage,
 ) -> BytesN<64> {
     let message_bytes = message.to_xdr(env);
     let len = message_bytes.len() as usize;
@@ -1857,6 +1874,7 @@ fn test_scoped_grant_rejects_relayed_spend() {
         amount: 40,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
 
@@ -1869,6 +1887,7 @@ fn test_scoped_grant_rejects_relayed_spend() {
             &t.seller,
             &0u64,
             &expiration_ledger,
+            &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::UnauthorizedFunction))
@@ -1891,6 +1910,8 @@ fn test_scoped_grant_rejects_relayed_spend() {
         Ok(Ok(()))
     );
     assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 960);
+}
+
 // ── Issue: Handle Verification Policy Threshold Increases ─────────────────
 
 /// Helper: register a merchant with the given number of verifications under
@@ -2039,4 +2060,228 @@ fn test_policy_threshold_decrease_keeps_merchant_verified() {
     client.set_verification_policy(&t.admin, &1u32);
     assert!(client.is_merchant_verified(&merchant_id));
     assert!(client.revalidate_merchant_status(&merchant_id));
+}
+
+/// 10 concurrent transactions executing across different channels (issue #367).
+/// Each channel has an independent nonce, so spends on channel A do not block
+/// or interfere with channel B. Nonce replay protection holds independently
+/// per channel.
+#[test]
+fn test_execute_spend_via_channel_parallel_channels() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(&t.buyer, &t.agent, &10000, &1000, &merchants, &3600u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 42);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 1000;
+
+    // Execute 10 spends across 10 different channels (0..9), each with nonce 0.
+    // All should succeed because each channel has its own independent nonce.
+    for channel_id in 0u32..10 {
+        let message = ChannelRelayedSpendMessage {
+            owner: t.buyer.clone(),
+            delegate: t.agent.clone(),
+            merchant: t.seller.clone(),
+            amount: 10,
+            channel_id,
+            nonce: 0,
+            expiration_ledger,
+            epoch: 0,
+        };
+        let signature = sign_channel_spend(&t.env, &signing_key, message);
+        let channel_sig = ChannelSpendSignature {
+            channel_id,
+            nonce: 0,
+            signature,
+        };
+
+        client.execute_spend_via_channel(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &10,
+            &t.seller,
+            &channel_sig,
+            &expiration_ledger,
+            &0u32,
+        );
+    }
+
+    // All 10 spends succeeded (100 total spent)
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 9900);
+
+    // Each channel's nonce advanced independently to 1
+    for channel_id in 0u32..10 {
+        assert_eq!(client.get_channel_nonce(&t.buyer, &t.agent, &channel_id), 1);
+    }
+
+    // Relayed (single-lane) nonce is untouched
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 0);
+}
+
+/// Replay protection: reusing a channel signature fails (issue #367).
+#[test]
+fn test_execute_spend_via_channel_rejects_replayed_nonce() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &3600u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 43);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 1000;
+
+    // First spend on channel 5 succeeds
+    let message = ChannelRelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 50,
+        channel_id: 5,
+        nonce: 0,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let signature = sign_channel_spend(&t.env, &signing_key, message);
+    let channel_sig = ChannelSpendSignature {
+        channel_id: 5,
+        nonce: 0,
+        signature,
+    };
+
+    client.execute_spend_via_channel(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &50,
+        &t.seller,
+        &channel_sig,
+        &expiration_ledger,
+        &0u32,
+    );
+
+    // Replay the exact same signature (same channel, same nonce) fails
+    assert_eq!(
+        client.try_execute_spend_via_channel(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &50,
+            &t.seller,
+            &channel_sig,
+            &expiration_ledger,
+            &0u32,
+        ),
+        Err(Ok(PermissionError::InvalidNonce))
+    );
+
+    // Channel 5 nonce is now 1
+    assert_eq!(client.get_channel_nonce(&t.buyer, &t.agent, &5), 1);
+    // Other channels unaffected
+    assert_eq!(client.get_channel_nonce(&t.buyer, &t.agent, &0), 0);
+    assert_eq!(client.get_channel_nonce(&t.buyer, &t.agent, &6), 0);
+}
+
+/// Cross-channel independence: spend on channel A doesn't affect channel B's nonce (issue #367).
+#[test]
+fn test_execute_spend_via_channel_independent_lanes() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &3600u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 44);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 1000;
+
+    // Spend on channel 0
+    let msg0 = ChannelRelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 10,
+        channel_id: 0,
+        nonce: 0,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let sig0 = sign_channel_spend(&t.env, &signing_key, msg0);
+    client.execute_spend_via_channel(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &10,
+        &t.seller,
+        &ChannelSpendSignature { channel_id: 0, nonce: 0, signature: sig0 },
+        &expiration_ledger,
+        &0u32,
+    );
+
+    // Spend on channel 1 (should succeed independently)
+    let msg1 = ChannelRelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        channel_id: 1,
+        nonce: 0,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let sig1 = sign_channel_spend(&t.env, &signing_key, msg1);
+    client.execute_spend_via_channel(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &20,
+        &t.seller,
+        &ChannelSpendSignature { channel_id: 1, nonce: 0, signature: sig1 },
+        &expiration_ledger,
+        &0u32,
+    );
+
+    // Channel 0 nonce advanced, channel 1 nonce advanced, but they're independent
+    assert_eq!(client.get_channel_nonce(&t.buyer, &t.agent, &0), 1);
+    assert_eq!(client.get_channel_nonce(&t.buyer, &t.agent, &1), 1);
+
+    // Second spend on channel 0 uses nonce 1
+    let msg0b = ChannelRelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 10,
+        channel_id: 0,
+        nonce: 1,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let sig0b = sign_channel_spend(&t.env, &signing_key, msg0b);
+    client.execute_spend_via_channel(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &10,
+        &t.seller,
+        &ChannelSpendSignature { channel_id: 0, nonce: 1, signature: sig0b },
+        &expiration_ledger,
+        &0u32,
+    );
+
+    // Channel 0 nonce now 2, channel 1 still 1
+    assert_eq!(client.get_channel_nonce(&t.buyer, &t.agent, &0), 2);
+    assert_eq!(client.get_channel_nonce(&t.buyer, &t.agent, &1), 1);
 }
