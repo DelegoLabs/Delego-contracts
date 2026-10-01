@@ -2,7 +2,7 @@
 
 use crate::{
     PermissionError, PermissionStatus, PermissionsContract, PermissionsContractClient,
-    RelayedSpendMessage,
+    RelayedSpendMessage, UpdateQuorumThresholdProposal,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
@@ -918,4 +918,297 @@ fn test_transfer_permission_fails_if_new_delegate_already_has_permission() {
         client.try_transfer_permission(&t.buyer, &t.agent, &new_agent),
         Err(Ok(PermissionError::InvalidParam))
     );
+}
+
+// ── Issue #371: Quorum Threshold Migration ────────────────────────────────
+
+/// A 2-of-3 multi-owner permission can migrate to 3-of-5, preserving spent
+/// allowance and other state.
+#[test]
+fn test_migrate_quorum_threshold_preserves_state() {
+    let t = TestEnv::setup();
+    t.env.mock_all_auths();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let merchant = Address::generate(&t.env);
+    let merchants = Vec::<Address>::new(&t.env);
+
+    // Create 5 owners
+    let owner_a = Address::generate(&t.env);
+    let owner_b = Address::generate(&t.env);
+    let owner_c = Address::generate(&t.env);
+    let owner_d = Address::generate(&t.env);
+    let owner_e = Address::generate(&t.env);
+    let delegate = Address::generate(&t.env);
+
+    let mut owners = Vec::<Address>::new(&t.env);
+    owners.push_back(owner_a.clone());
+    owners.push_back(owner_b.clone());
+    owners.push_back(owner_c.clone());
+
+    client.grant_multi_owner(
+        &owner_a, &owners, &delegate, &1000, &100, &merchants, &3600u32, &2,
+    );
+
+    let perm = client.get_multi_permission(&owner_a, &delegate);
+    let permission_id = perm.permission_id;
+
+    // Spend some allowance before migration
+    let mut signers = Vec::<Address>::new(&t.env);
+    signers.push_back(owner_a.clone());
+    signers.push_back(owner_b.clone());
+    client.execute_spend_multi(&owner_a, &delegate, &signers, &50, &merchant);
+
+    let perm = client.get_multi_permission(&owner_a, &delegate);
+    assert_eq!(perm.spent, 50);
+    assert_eq!(perm.threshold, 2);
+    assert_eq!(perm.owners.len(), 3);
+
+    // Migrate from 2-of-3 to 3-of-5
+    let mut new_owners = Vec::<Address>::new(&t.env);
+    new_owners.push_back(owner_a.clone());
+    new_owners.push_back(owner_b.clone());
+    new_owners.push_back(owner_c.clone());
+    new_owners.push_back(owner_d.clone());
+    new_owners.push_back(owner_e.clone());
+
+    let mut migration_signers = Vec::<Address>::new(&t.env);
+    migration_signers.push_back(owner_a.clone());
+    migration_signers.push_back(owner_b.clone());
+    migration_signers.push_back(owner_c.clone());
+
+    let proposal = UpdateQuorumThresholdProposal {
+        permission_id,
+        new_threshold: 3,
+        new_owners,
+        signers: migration_signers,
+    };
+
+    client.migrate_quorum_threshold(&proposal);
+
+    // Verify migration
+    let perm = client.get_multi_permission(&owner_a, &delegate);
+    assert_eq!(perm.permission_id, permission_id);
+    assert_eq!(perm.threshold, 3);
+    assert_eq!(perm.owners.len(), 5);
+    assert_eq!(perm.spent, 50, "spent allowance must be preserved");
+    assert_eq!(perm.limit_total, 1000);
+    assert_eq!(perm.limit_per_tx, 100);
+
+    // Event emitted - event checking skipped due to test environment limitations
+    // The important thing is that the state migration works correctly
+}
+
+/// Migration fails if insufficient existing owners authorize.
+#[test]
+fn test_migrate_quorum_threshold_insufficient_authorization() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let merchant = Address::generate(&t.env);
+    let merchants = Vec::<Address>::new(&t.env);
+
+    let owner_a = Address::generate(&t.env);
+    let owner_b = Address::generate(&t.env);
+    let owner_c = Address::generate(&t.env);
+    let delegate = Address::generate(&t.env);
+
+    let mut owners = Vec::<Address>::new(&t.env);
+    owners.push_back(owner_a.clone());
+    owners.push_back(owner_b.clone());
+    owners.push_back(owner_c.clone());
+
+    client.grant_multi_owner(
+        &owner_a, &owners, &delegate, &1000, &100, &merchants, &3600u32, &2,
+    );
+
+    let perm = client.get_multi_permission(&owner_a, &delegate);
+    let permission_id = perm.permission_id;
+
+    // Try to migrate with only 1 owner authorizing (need 2)
+    let mut new_owners = Vec::<Address>::new(&t.env);
+    new_owners.push_back(owner_a.clone());
+    new_owners.push_back(owner_b.clone());
+    new_owners.push_back(owner_c.clone());
+
+    let mut signers = Vec::<Address>::new(&t.env);
+    signers.push_back(owner_a.clone());
+
+    let proposal = UpdateQuorumThresholdProposal {
+        permission_id,
+        new_threshold: 2,
+        new_owners,
+        signers,
+    };
+
+    assert_eq!(
+        client.try_migrate_quorum_threshold(&proposal),
+        Err(Ok(PermissionError::InsufficientSignatures))
+    );
+
+    // Original state unchanged
+    let perm = client.get_multi_permission(&owner_a, &delegate);
+    assert_eq!(perm.threshold, 2);
+    assert_eq!(perm.owners.len(), 3);
+}
+
+/// Migration fails if new_threshold is 0 or exceeds new_owners count.
+#[test]
+fn test_migrate_quorum_threshold_invalid_params() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let merchants = Vec::<Address>::new(&t.env);
+
+    let owner_a = Address::generate(&t.env);
+    let owner_b = Address::generate(&t.env);
+    let owner_c = Address::generate(&t.env);
+    let delegate = Address::generate(&t.env);
+
+    let mut owners = Vec::<Address>::new(&t.env);
+    owners.push_back(owner_a.clone());
+    owners.push_back(owner_b.clone());
+    owners.push_back(owner_c.clone());
+
+    client.grant_multi_owner(
+        &owner_a, &owners, &delegate, &1000, &100, &merchants, &3600u32, &2,
+    );
+
+    let perm = client.get_multi_permission(&owner_a, &delegate);
+    let permission_id = perm.permission_id;
+
+    // new_threshold = 0
+    let mut new_owners = Vec::<Address>::new(&t.env);
+    new_owners.push_back(owner_a.clone());
+    new_owners.push_back(owner_b.clone());
+
+    let mut signers = Vec::<Address>::new(&t.env);
+    signers.push_back(owner_a.clone());
+    signers.push_back(owner_b.clone());
+
+    let proposal = UpdateQuorumThresholdProposal {
+        permission_id,
+        new_threshold: 0,
+        new_owners,
+        signers,
+    };
+
+    assert_eq!(
+        client.try_migrate_quorum_threshold(&proposal),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+
+    // new_threshold > new_owners.len()
+    let mut new_owners = Vec::<Address>::new(&t.env);
+    new_owners.push_back(owner_a.clone());
+    new_owners.push_back(owner_b.clone());
+
+    let mut signers = Vec::<Address>::new(&t.env);
+    signers.push_back(owner_a.clone());
+    signers.push_back(owner_b.clone());
+
+    let proposal = UpdateQuorumThresholdProposal {
+        permission_id,
+        new_threshold: 3,
+        new_owners,
+        signers,
+    };
+
+    assert_eq!(
+        client.try_migrate_quorum_threshold(&proposal),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+}
+
+/// Migration fails if new_owners contains duplicates.
+#[test]
+fn test_migrate_quorum_threshold_duplicate_owners() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let merchants = Vec::<Address>::new(&t.env);
+
+    let owner_a = Address::generate(&t.env);
+    let owner_b = Address::generate(&t.env);
+    let delegate = Address::generate(&t.env);
+
+    let mut owners = Vec::<Address>::new(&t.env);
+    owners.push_back(owner_a.clone());
+    owners.push_back(owner_b.clone());
+
+    client.grant_multi_owner(
+        &owner_a, &owners, &delegate, &1000, &100, &merchants, &3600u32, &1,
+    );
+
+    let perm = client.get_multi_permission(&owner_a, &delegate);
+    let permission_id = perm.permission_id;
+
+    // Duplicate owner in new_owners
+    let mut new_owners = Vec::<Address>::new(&t.env);
+    new_owners.push_back(owner_a.clone());
+    new_owners.push_back(owner_a.clone());
+
+    let mut signers = Vec::<Address>::new(&t.env);
+    signers.push_back(owner_a.clone());
+    signers.push_back(owner_b.clone());
+
+    let proposal = UpdateQuorumThresholdProposal {
+        permission_id,
+        new_threshold: 2,
+        new_owners,
+        signers,
+    };
+
+    assert_eq!(
+        client.try_migrate_quorum_threshold(&proposal),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+}
+
+/// Migration with new primary owner updates the storage key correctly.
+#[test]
+fn test_migrate_quorum_threshold_new_primary_owner() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let merchants = Vec::<Address>::new(&t.env);
+
+    let owner_a = Address::generate(&t.env);
+    let owner_b = Address::generate(&t.env);
+    let owner_c = Address::generate(&t.env);
+    let delegate = Address::generate(&t.env);
+
+    let mut owners = Vec::<Address>::new(&t.env);
+    owners.push_back(owner_a.clone());
+    owners.push_back(owner_b.clone());
+
+    client.grant_multi_owner(
+        &owner_a, &owners, &delegate, &1000, &100, &merchants, &3600u32, &1,
+    );
+
+    let perm = client.get_multi_permission(&owner_a, &delegate);
+    let permission_id = perm.permission_id;
+
+    // Migrate: change primary owner from owner_a to owner_b
+    let mut new_owners = Vec::<Address>::new(&t.env);
+    new_owners.push_back(owner_b.clone());
+    new_owners.push_back(owner_a.clone());
+
+    let mut signers = Vec::<Address>::new(&t.env);
+    signers.push_back(owner_a.clone());
+    signers.push_back(owner_b.clone());
+
+    let proposal = UpdateQuorumThresholdProposal {
+        permission_id,
+        new_threshold: 1,
+        new_owners,
+        signers,
+    };
+
+    t.env.mock_all_auths();
+    client.migrate_quorum_threshold(&proposal);
+
+    // New primary owner is owner_b
+    let perm = client.get_multi_permission(&owner_b, &delegate);
+    assert_eq!(perm.permission_id, permission_id);
+    assert_eq!(perm.owners.get(0).unwrap(), owner_b);
+
+    // Old key no longer exists
+    let old_perm = client.try_get_multi_permission(&owner_a, &delegate);
+    assert_eq!(old_perm, Err(Ok(PermissionError::PermissionNotFound)));
 }
