@@ -1,14 +1,15 @@
 #![cfg(test)]
 
 use crate::{
-    MerchantAllowlist, PermissionError, PermissionStatus, PermissionsContract,
-    PermissionsContractClient, RelayedSpendMessage, ScopedPermissionConfig,
+    MerchantAllowlist, MultiOwnerSpendEvent, PermissionError, PermissionStatus,
+    PermissionsContract, PermissionsContractClient, RelayedSpendMessage, ScopedPermissionConfig,
+    SpendProposalApprovedEvent, MAX_PENDING_SPEND_PROPOSALS, SPEND_PROPOSAL_TTL_LEDGERS,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
     xdr::ToXdr,
-    Address, BytesN, Env, Symbol, TryIntoVal, Vec,
+    Address, BytesN, Env, Symbol, TryFromVal, TryIntoVal, Vec,
 };
 
 /// Deterministic test keypair plus its raw ed25519 public key bytes.
@@ -2039,4 +2040,446 @@ fn test_policy_threshold_decrease_keeps_merchant_verified() {
     client.set_verification_policy(&t.admin, &1u32);
     assert!(client.is_merchant_verified(&merchant_id));
     assert!(client.revalidate_merchant_status(&merchant_id));
+}
+
+// ── Issue #377: asynchronous multi-sig spend approval queue ──────────────
+
+/// Grants a 2-of-3 multi-owner grant from `t.buyer` to `t.agent` and returns the
+/// two remaining co-signers.
+fn enterprise_grant(t: &TestEnv) -> (Address, Address) {
+    enterprise_grant_with(t, 1_000, 500, 36_000)
+}
+
+/// [`enterprise_grant`] with explicit limits and lifetime.
+fn enterprise_grant_with(
+    t: &TestEnv,
+    limit_total: i128,
+    limit_per_tx: i128,
+    duration_ledgers: u32,
+) -> (Address, Address) {
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let owner_b = Address::generate(&t.env);
+    let owner_c = Address::generate(&t.env);
+
+    let mut owners = Vec::<Address>::new(&t.env);
+    owners.push_back(t.buyer.clone());
+    owners.push_back(owner_b.clone());
+    owners.push_back(owner_c.clone());
+    let merchants = Vec::<Address>::new(&t.env);
+
+    client.grant_multi_owner(
+        &t.buyer,
+        &owners,
+        &t.agent,
+        &limit_total,
+        &limit_per_tx,
+        &merchants,
+        &duration_ledgers,
+        &2u32,
+    );
+
+    (owner_b, owner_c)
+}
+
+/// Raises the mock ledger's entry TTLs so a proposal can sit in the queue for
+/// its full 24-hour window without the grant or its records being archived.
+/// Call before the contract writes anything.
+fn configure_ledger_ttl(t: &TestEnv) {
+    let ttl = SPEND_PROPOSAL_TTL_LEDGERS * 4;
+    t.env.ledger().set_min_temp_entry_ttl(ttl);
+    t.env.ledger().set_min_persistent_entry_ttl(ttl);
+    t.env.ledger().set_max_entry_ttl(ttl);
+    // The contract instance was written when `TestEnv` registered it, under the
+    // mock ledger's default 4,096-ledger TTL, and is not re-stamped on call.
+    t.env.as_contract(&t.permissions_contract_id, || {
+        t.env.storage().instance().extend_ttl(ttl, ttl);
+    });
+}
+
+/// Advance the ledger by `ledgers` sequential ledgers.
+fn advance_ledgers(t: &TestEnv, ledgers: u32) {
+    let mut sequence = t.env.ledger().sequence();
+    let mut timestamp = t.env.ledger().timestamp();
+    for _ in 0..ledgers {
+        sequence += 1;
+        timestamp += 5;
+    }
+    t.env.ledger().set_sequence_number(sequence);
+    t.env.ledger().set_timestamp(timestamp);
+}
+
+/// Every event this contract published under `topic`, oldest first.
+///
+/// Mirrors the `find_event` decoding used elsewhere in the workspace: topics
+/// are `(perm, action, ..)`, so the action is at index 1.
+fn events_under<T>(env: &Env, topic: &str) -> std::vec::Vec<T>
+where
+    T: TryFromVal<Env, soroban_sdk::Val>,
+{
+    let action: Symbol = Symbol::new(env, topic);
+    env.events()
+        .all()
+        .iter()
+        .filter(|(_, topics, _)| topics.len() >= 2)
+        .filter_map(|(_, topics, data)| {
+            let event_topic: Symbol = topics.get(1).unwrap().try_into_val(env).unwrap();
+            if event_topic == action {
+                T::try_from_val(env, &data).ok()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The headline case: co-signers are in different places at different times, so
+/// the delegate queues the spend in one transaction and each co-signer signs in
+/// a transaction of its own — days of ledgers apart. Nothing moves until the
+/// second signature lands, and the spend then settles on its own, inside that
+/// signature's transaction, with no separate execution step.
+#[test]
+fn test_multi_owner_spend_co_signs_asynchronously_and_settles_at_quorum() {
+    let t = TestEnv::setup();
+    configure_ledger_ttl(&t);
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let (owner_b, owner_c) = enterprise_grant(&t);
+
+    // The delegate queues the spend. No approval is collected yet.
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &300);
+    let queued = client.get_spend_proposal(&proposal_id);
+    assert_eq!(queued.proposal_id, proposal_id);
+    assert_eq!(queued.recipient, t.seller);
+    assert_eq!(queued.amount, 300);
+    assert_eq!(queued.threshold, 2);
+    assert_eq!(queued.primary_owner, t.buyer);
+    assert_eq!(queued.delegate, t.agent);
+    assert_eq!(queued.approvals.len(), 0);
+    assert!(!queued.is_executed);
+    assert_eq!(
+        queued.expires_at_ledger,
+        t.env.ledger().sequence() + SPEND_PROPOSAL_TTL_LEDGERS
+    );
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 0);
+
+    // First co-signer signs much later — still short of the 2-of-3 quorum, so
+    // the allowance must stay untouched.
+    advance_ledgers(&t, 6_000);
+    client.approve_spend_proposal(&proposal_id, &t.buyer);
+    let partial = client.get_spend_proposal(&proposal_id);
+    assert_eq!(partial.approvals.len(), 1);
+    assert!(partial.approvals.get(0).unwrap() == t.buyer);
+    assert!(!partial.is_executed);
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 0);
+
+    // Second co-signer signs in a later transaction, just inside the 24-hour
+    // window: the queued spend settles automatically.
+    advance_ledgers(&t, 6_000);
+    client.approve_spend_proposal(&proposal_id, &owner_b);
+
+    let settled = client.get_spend_proposal(&proposal_id);
+    assert_eq!(settled.approvals.len(), 2);
+    assert!(settled.approvals.get(1).unwrap() == owner_b);
+    assert!(settled.is_executed);
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 300);
+
+    // A settled spend is out of the queue and cannot be settled again.
+    assert_eq!(client.get_spend_proposals(&t.agent).len(), 0);
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &owner_c),
+        Err(Ok(PermissionError::ProposalAlreadyExecuted))
+    );
+}
+
+/// A single approval, however late, must never settle on its own: the queue is
+/// only a way to co-sign asynchronously, not a way around the quorum.
+#[test]
+fn test_multi_owner_spend_queue_requires_full_quorum() {
+    let t = TestEnv::setup();
+    configure_ledger_ttl(&t);
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let (owner_b, _owner_c) = enterprise_grant(&t);
+
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &100);
+    advance_ledgers(&t, 17_000);
+    client.approve_spend_proposal(&proposal_id, &owner_b);
+
+    let proposal = client.get_spend_proposal(&proposal_id);
+    assert_eq!(proposal.approvals.len(), 1);
+    assert!(!proposal.is_executed);
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 0);
+
+    // The delegate cannot supply the missing signature itself.
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &t.agent),
+        Err(Ok(PermissionError::Unauthorized))
+    );
+}
+
+/// The approval that reaches the quorum emits the same multi-owner spend event
+/// as a synchronous spend, so indexers need no separate path for queued spends.
+#[test]
+fn test_queued_spend_emits_multi_owner_spend_event_at_quorum() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let (owner_b, _owner_c) = enterprise_grant(&t);
+
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &250);
+
+    // Every approval is reported, and only the quorum-reaching one is flagged
+    // as having settled the spend. Nothing moves on the first signature.
+    client.approve_spend_proposal(&proposal_id, &t.buyer);
+    let approvals = events_under::<SpendProposalApprovedEvent>(&t.env, "sappr");
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0].approval_count, 1);
+    assert_eq!(approvals[0].threshold, 2);
+    assert!(approvals[0].approver == t.buyer);
+    assert!(!approvals[0].executed);
+    assert!(events_under::<MultiOwnerSpendEvent>(&t.env, "mspent").is_empty());
+
+    client.approve_spend_proposal(&proposal_id, &owner_b);
+    let approvals = events_under::<SpendProposalApprovedEvent>(&t.env, "sappr");
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0].approval_count, 2);
+    assert!(approvals[0].executed);
+
+    // The spend itself is reported through the same event a synchronous
+    // multi-owner spend uses, so indexers need no separate path.
+    let spend = events_under::<MultiOwnerSpendEvent>(&t.env, "mspent");
+    assert_eq!(spend.len(), 1);
+    assert_eq!(spend[0].amount, 250);
+    assert_eq!(spend[0].merchant, t.seller);
+    assert_eq!(spend[0].remaining, 750);
+    assert_eq!(spend[0].signer_count, 2);
+}
+
+/// Co-signing must not be repeatable: the same owner cannot sign twice, and a
+/// queue left unapproved never settles.
+#[test]
+fn test_multi_owner_spend_queue_rejects_duplicate_signature() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    enterprise_grant(&t);
+
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &100);
+    client.approve_spend_proposal(&proposal_id, &t.buyer);
+
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &t.buyer),
+        Err(Ok(PermissionError::ProposalAlreadyApproved))
+    );
+    assert_eq!(client.get_spend_proposal(&proposal_id).approvals.len(), 1);
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 0);
+}
+
+/// The 24-hour window is a hard deadline: a co-signer that arrives after it
+/// cannot revive the proposal, and nothing is debited.
+#[test]
+fn test_multi_owner_spend_proposal_expires_after_window() {
+    let t = TestEnv::setup();
+    configure_ledger_ttl(&t);
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let (owner_b, _owner_c) = enterprise_grant(&t);
+
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &100);
+    advance_ledgers(&t, SPEND_PROPOSAL_TTL_LEDGERS);
+
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &t.buyer),
+        Err(Ok(PermissionError::ProposalExpired))
+    );
+
+    // An expired proposal stops occupying a queue slot: queueing again works.
+    let next_id = client.propose_spend(&t.agent, &t.seller, &100);
+    assert_ne!(next_id, proposal_id);
+    assert_eq!(client.get_spend_proposals(&t.agent).len(), 1);
+    assert_eq!(client.get_spend_proposal(&next_id).proposal_id, next_id);
+    let _ = owner_b;
+}
+
+/// Only registered owners of the grant may co-sign; an outsider with a valid
+/// signature is rejected and cannot move the allowance.
+#[test]
+fn test_multi_owner_spend_proposal_rejects_non_owner() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    enterprise_grant(&t);
+    let outsider = Address::generate(&t.env);
+
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &100);
+
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &outsider),
+        Err(Ok(PermissionError::Unauthorized))
+    );
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 0);
+}
+
+/// The grant is re-validated at settlement time, so a proposal queued against a
+/// grant that has since lapsed can never spend through it — a day in the queue
+/// must not widen the grant's lifetime.
+#[test]
+fn test_queued_spend_cannot_settle_after_grant_expires() {
+    let t = TestEnv::setup();
+    configure_ledger_ttl(&t);
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    // The grant outlives neither the co-signing window nor the queue wait.
+    let (owner_b, _owner_c) = enterprise_grant_with(&t, 1_000, 500, 3_600);
+
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &100);
+    client.approve_spend_proposal(&proposal_id, &t.buyer);
+
+    // Still inside the proposal's window, but the grant is long gone.
+    advance_ledgers(&t, 4_000);
+    assert!(t.env.ledger().sequence() < SPEND_PROPOSAL_TTL_LEDGERS);
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &owner_b),
+        Err(Ok(PermissionError::Expired))
+    );
+    // The failed approval left no trace: the second owner never co-signed.
+    let proposal = client.get_spend_proposal(&proposal_id);
+    assert_eq!(proposal.approvals.len(), 1);
+    assert!(!proposal.is_executed);
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 0);
+}
+
+/// A queued spend is bound by the grant's allowance when it is co-signed, not
+/// only when it is queued: other spends landing in the meantime consume the
+/// allowance first, and the queue must not overdraw the grant to reach quorum.
+#[test]
+fn test_queued_spend_respects_allowance_at_settlement() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let (owner_b, _owner_c) = enterprise_grant_with(&t, 1_000, 1_000, 36_000);
+
+    // Queued while the full 1000 allowance is available.
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &400);
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 0);
+
+    // A synchronous multi-owner spend of 700 lands first, leaving 300.
+    let mut signers = Vec::<Address>::new(&t.env);
+    signers.push_back(t.buyer.clone());
+    signers.push_back(owner_b.clone());
+    client.execute_spend_multi(&t.buyer, &t.agent, &signers, &700, &t.seller);
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 700);
+
+    // The queued spend no longer fits, so co-signing refuses it outright — no
+    // approval is recorded and the grant is left as the other spend left it.
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &t.buyer),
+        Err(Ok(PermissionError::ExceedsTotalLimit))
+    );
+    let proposal = client.get_spend_proposal(&proposal_id);
+    assert_eq!(proposal.approvals.len(), 0);
+    assert!(!proposal.is_executed);
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 700);
+
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &owner_b),
+        Err(Ok(PermissionError::ExceedsTotalLimit))
+    );
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 700);
+}
+
+/// A delegate can withdraw a queued spend it no longer needs, and a co-signer
+/// can veto one the delegate queued in error.
+#[test]
+fn test_multi_owner_spend_proposal_can_be_cancelled() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let (owner_b, _owner_c) = enterprise_grant(&t);
+    let outsider = Address::generate(&t.env);
+
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &100);
+
+    // Neither an outsider nor the delegate's counterparty may cancel.
+    assert_eq!(
+        client.try_cancel_spend_proposal(&proposal_id, &outsider),
+        Err(Ok(PermissionError::Unauthorized))
+    );
+
+    // A co-signer vetoes it.
+    client.cancel_spend_proposal(&proposal_id, &owner_b);
+    assert_eq!(
+        client.try_get_spend_proposal(&proposal_id),
+        Err(Ok(PermissionError::ProposalNotFound))
+    );
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &t.buyer),
+        Err(Ok(PermissionError::ProposalNotFound))
+    );
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 0);
+
+    // The delegate may withdraw its own proposal too.
+    let second_id = client.propose_spend(&t.agent, &t.seller, &100);
+    client.cancel_spend_proposal(&second_id, &t.agent);
+    assert_eq!(client.get_spend_proposals(&t.agent).len(), 0);
+}
+
+/// The queue is bounded per delegate so a delegate cannot park an unbounded
+/// backlog; once a slot frees up, queueing works again.
+#[test]
+fn test_multi_owner_spend_queue_is_bounded() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    enterprise_grant(&t);
+
+    for _ in 0..MAX_PENDING_SPEND_PROPOSALS {
+        client.propose_spend(&t.agent, &t.seller, &10);
+    }
+    assert_eq!(
+        client.get_spend_proposals(&t.agent).len(),
+        MAX_PENDING_SPEND_PROPOSALS
+    );
+    assert_eq!(
+        client.try_propose_spend(&t.agent, &t.seller, &10),
+        Err(Ok(PermissionError::TooManyPendingProposals))
+    );
+
+    client.cancel_spend_proposal(&1, &t.agent);
+    client.propose_spend(&t.agent, &t.seller, &10);
+}
+
+/// The queue only exists for enterprise (multi-owner) grants, and it enforces
+/// the grant's policy up front: whitelist, limits and a positive amount.
+#[test]
+fn test_propose_spend_validates_grant_policy() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let outsider = Address::generate(&t.env);
+
+    // No multi-owner grant at all.
+    assert_eq!(
+        client.try_propose_spend(&t.agent, &t.seller, &10),
+        Err(Ok(PermissionError::NoMultiOwnerGrant))
+    );
+
+    enterprise_grant(&t);
+
+    // Non-positive amounts are refused.
+    assert_eq!(
+        client.try_propose_spend(&t.agent, &t.seller, &0),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+    assert_eq!(
+        client.try_propose_spend(&t.agent, &t.seller, &-1),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+
+    // Over the per-transaction and total limits.
+    assert_eq!(
+        client.try_propose_spend(&t.agent, &t.seller, &501),
+        Err(Ok(PermissionError::ExceedsPerTxLimit))
+    );
+    assert_eq!(
+        client.try_propose_spend(&t.agent, &t.seller, &1001),
+        Err(Ok(PermissionError::ExceedsPerTxLimit))
+    );
+
+    // Not every address is spendable under a whitelisted grant: a second grant
+    // restricted to `t.seller` makes the delegate's grants ambiguous, so the
+    // policy is checked on an unambiguous setup.
+    assert_eq!(
+        client.try_propose_spend(&t.agent, &outsider, &100),
+        Ok(Ok(1))
+    );
 }
