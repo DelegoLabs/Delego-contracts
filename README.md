@@ -771,3 +771,8 @@ Verification Matrix & Final Checklist
 | Docker Builder Stage | docker build -t indexer:test . | Multi-stage builder layer succeeds | PASSED |
 | Production Runtime Engine | docker run --rm indexer:test | Container boots and serves /health | PASSED |
 
+
+
+## Contributing
+
+Please check [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and development workflow.
