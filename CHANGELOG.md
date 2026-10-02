@@ -84,6 +84,10 @@ will reject the change.
 
 ### Unreleased
 
+### 0.0.1 - 2026-09-30
+
+- Fix pre-existing build breakage: restore missing `[features]` table header in `marketplace/Cargo.toml` so the `testutils` feature is correctly declared.
+
 ### 0.2.0 - 2026-08-29
 
 - Initial tracked release for this contract. On-chain `version()` returns `0.2.0`

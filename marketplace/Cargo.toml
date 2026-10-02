@@ -14,5 +14,5 @@ soroban-sdk = { workspace = true }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 delego-reputation = { path = "../reputation", features = ["testutils"] }
 
-#features
+[features]
 testutils = ["soroban-sdk/testutils"]
