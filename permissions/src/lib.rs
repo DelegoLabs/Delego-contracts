@@ -108,6 +108,7 @@ pub struct PermissionRecord {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MultiOwnerPermission {
+    pub permission_id: u64,
     pub owners: Vec<Address>,
     pub threshold: u32,
     pub delegate: Address,
@@ -118,6 +119,19 @@ pub struct MultiOwnerPermission {
     pub status: PermissionStatus,
     pub expires_at_ledger: u32,
     pub created_at: u64,
+}
+
+/// Proposal to update the quorum threshold and/or owner set of a multi-owner
+/// permission (issue #371). The proposal includes the list of signers who
+/// authorize the migration; at least the current `threshold` of the existing
+/// `owners` must be among the signers and must authorize the call.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateQuorumThresholdProposal {
+    pub permission_id: u64,
+    pub new_threshold: u32,
+    pub new_owners: Vec<Address>,
+    pub signers: Vec<Address>,
 }
 
 #[contracttype]
@@ -140,6 +154,20 @@ pub struct MultiOwnerSpendEvent {
     pub amount: i128,
     pub remaining: i128,
     pub signer_count: u32,
+}
+
+/// Emitted when a multi-owner permission's quorum threshold and/or owner set
+/// is migrated (issue #371). Preserves the spent allowance and other state.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct QuorumThresholdMigratedEvent {
+    pub permission_id: u64,
+    pub primary_owner: Address,
+    pub delegate: Address,
+    pub old_threshold: u32,
+    pub new_threshold: u32,
+    pub old_owner_count: u32,
+    pub new_owner_count: u32,
 }
 
 /// Emitted when an admin registers a new approved metadata schema (issue #328).
@@ -458,6 +486,10 @@ pub enum DataKey {
     LastSpendLedger(Address, Address),
     /// Append-only audit log for a (owner, delegate) pair.
     AuditLog(Address, Address),
+    /// Counter for assigning unique IDs to multi-owner permissions (issue #371).
+    NextMultiOwnerPermissionId,
+    /// Index mapping multi-owner permission_id to (primary_owner, delegate) for lookup (issue #371).
+    MultiOwnerPermissionIdIndex(u64),
 }
 
 #[contract]
@@ -1303,7 +1335,20 @@ impl PermissionsContract {
         let primary_owner = unique_owners.get(0).unwrap();
         let expires_at_ledger = env.ledger().sequence() + ttl_ledgers;
 
+        // Assign a unique permission_id for this multi-owner permission.
+        let permission_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextMultiOwnerPermissionId)
+            .unwrap_or(0u64)
+            .checked_add(1)
+            .ok_or(PermissionError::InvalidParam)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::NextMultiOwnerPermissionId, &permission_id);
+
         let record = MultiOwnerPermission {
+            permission_id,
             owners: unique_owners.clone(),
             threshold,
             delegate: delegate.clone(),
@@ -1319,6 +1364,12 @@ impl PermissionsContract {
         env.storage().persistent().set(
             &DataKey::MultiPermission(primary_owner.clone(), delegate.clone()),
             &record,
+        );
+
+        // Store index for permission_id -> (primary_owner, delegate) lookup
+        env.storage().persistent().set(
+            &DataKey::MultiOwnerPermissionIdIndex(permission_id),
+            &(primary_owner.clone(), delegate.clone()),
         );
 
         env.events().publish(
@@ -1458,6 +1509,113 @@ impl PermissionsContract {
             .persistent()
             .get(&DataKey::MultiPermission(primary_owner, delegate))
             .ok_or(PermissionError::PermissionNotFound)
+    }
+
+    /// Migrate the quorum threshold and/or owner set of a multi-owner permission
+    /// without resetting the spent allowance or other state (issue #371).
+    ///
+    /// The migration requires authorization from the delegate plus at least the
+    /// current `threshold` of the existing `owners`. This mirrors the
+    /// authorization pattern of `execute_spend_multi`, ensuring the existing
+    /// quorum authorizes the configuration change.
+    ///
+    /// # Errors
+    /// - [`PermissionError::PermissionNotFound`] if no permission with the given `permission_id` exists.
+    /// - [`PermissionError::InvalidParam`] if `new_threshold` is 0 or exceeds `new_owners.len()`,
+    ///   or if `new_owners` contains duplicates.
+    pub fn migrate_quorum_threshold(
+        env: Env,
+        proposal: UpdateQuorumThresholdProposal,
+    ) -> Result<(), PermissionError> {
+        // Look up the permission by permission_id
+        let index_key = DataKey::MultiOwnerPermissionIdIndex(proposal.permission_id);
+        let (primary_owner, delegate): (Address, Address) = env
+            .storage()
+            .persistent()
+            .get(&index_key)
+            .ok_or(PermissionError::PermissionNotFound)?;
+
+        let perm_key = DataKey::MultiPermission(primary_owner.clone(), delegate.clone());
+        let mut record: MultiOwnerPermission = env
+            .storage()
+            .persistent()
+            .get(&perm_key)
+            .ok_or(PermissionError::PermissionNotFound)?;
+
+        // Validate the new configuration
+        if proposal.new_threshold == 0 || proposal.new_threshold > proposal.new_owners.len() {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        // Check for duplicates in new_owners
+        let mut unique_new_owners: Vec<Address> = Vec::new(&env);
+        for owner in proposal.new_owners.iter() {
+            if unique_new_owners.contains(&owner) {
+                return Err(PermissionError::InvalidParam);
+            }
+            unique_new_owners.push_back(owner);
+        }
+
+        // Require authorization from the delegate
+        delegate.require_auth();
+
+        // Verify that at least the current threshold of existing owners are among
+        // the signers and that all signers authorize the migration.
+        let mut authorized_count: u32 = 0;
+        for signer in proposal.signers.iter() {
+            // Check if this signer is one of the current owners
+            if record.owners.contains(&signer) {
+                signer.require_auth();
+                authorized_count = authorized_count.checked_add(1).unwrap();
+            }
+        }
+
+        if authorized_count < record.threshold {
+            return Err(PermissionError::InsufficientSignatures);
+        }
+
+        // Migration authorized — update the record
+        let old_threshold = record.threshold;
+        let old_owner_count = record.owners.len();
+
+        record.threshold = proposal.new_threshold;
+        record.owners = unique_new_owners;
+
+        env.storage().persistent().set(&perm_key, &record);
+
+        // Update the index if the primary owner changed
+        // (The primary owner is owners[0], so if the first owner changed, we need to update the key)
+        let new_primary_owner = record.owners.get(0).unwrap();
+        if new_primary_owner != primary_owner {
+            // Remove old index entry
+            env.storage().persistent().remove(&index_key);
+            // Add new index entry with new primary owner
+            env.storage().persistent().set(
+                &DataKey::MultiOwnerPermissionIdIndex(proposal.permission_id),
+                &(new_primary_owner.clone(), delegate.clone()),
+            );
+            // Also need to move the MultiPermission data to the new key
+            env.storage().persistent().remove(&perm_key);
+            let new_perm_key =
+                DataKey::MultiPermission(new_primary_owner.clone(), delegate.clone());
+            env.storage().persistent().set(&new_perm_key, &record);
+        }
+
+        // Emit migration event
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("qmigrate")),
+            QuorumThresholdMigratedEvent {
+                permission_id: proposal.permission_id,
+                primary_owner: new_primary_owner,
+                delegate,
+                old_threshold,
+                new_threshold: proposal.new_threshold,
+                old_owner_count,
+                new_owner_count: proposal.new_owners.len(),
+            },
+        );
+
+        Ok(())
     }
 
     /// Dry-run a spend and report whether it would succeed, without mutating state.
