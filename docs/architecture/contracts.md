@@ -132,6 +132,9 @@ The permissions contract manages delegated spending authority, allowing users to
 - `renew_permission(...)` / `update_expiry(...)`: Manage expiry
 - `execute_spend_via_relayer(...)`: Gasless spend via relayer signature
 - `grant_multi_owner(...)`: Multi-owner (quorum) grants
+- `execute_spend_multi(...)`: Spend authorized by a quorum of co-signers in one transaction
+- `propose_spend(...)` / `approve_spend_proposal(...)`: Asynchronous quorum spends — the delegate queues a `PendingSpendProposal`, co-signers approve in separate transactions, and the spend settles automatically once the grant's `threshold` is met
+- `cancel_spend_proposal(...)` / `get_spend_proposal(...)` / `get_spend_proposals(...)`: Manage and inspect the pending spend queue (issue #377)
 - `pause(...)` / `resume(...)` / `pause_grants(...)`: Pause controls
 - `set_admin(...)` / `propose_admin(...)` / `accept_admin(...)`: Admin management
 
