@@ -446,6 +446,22 @@ pub struct SignedDeliveryProof {
     pub signature: BytesN<64>,
 }
 
+/// Buyer/seller authorization envelope for an absolute timeout extension.
+///
+/// The signatures are included in the canonical authorization arguments. The
+/// contract additionally calls `require_auth_for_args` for both participants,
+/// so Soroban verifies each participant's cryptographic signature over the
+/// complete voucher and a voucher cannot be replayed with changed fields.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeoutExtensionVoucher {
+    pub escrow_id: u64,
+    pub new_timeout_ledger: u32,
+    pub nonce: u64,
+    pub buyer_signature: BytesN<64>,
+    pub seller_signature: BytesN<64>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SignedDeliveryPayload {
@@ -1713,6 +1729,8 @@ pub enum DataKey {
     /// Buyer agreement that lets the seller cancel inside the protection
     /// window (issue #355).
     CancelBuyerAgreement(u64),
+    /// Highest accepted mutual timeout-extension nonce for an escrow.
+    TimeoutExtensionNonce(u64),
     /// Contract-wide default cancel lockout window, in ledgers (issue #355).
     CancelLockoutLedgers,
     /// Minimum release fee floor, in the token's smallest unit, configurable by
@@ -2129,6 +2147,10 @@ pub enum EscrowError {
     InspectionConfigNotSet = 446,
     /// Inspection auto-release ledger has not been reached yet.
     InspectionAutoReleaseNotReady = 447,
+    /// Voucher nonce was already consumed.
+    TimeoutExtensionNonceUsed = 448,
+    /// Voucher signatures did not identify both escrow participants.
+    InvalidTimeoutExtensionVoucher = 449,
 }
 
 /// Runs `f` under a re-entrancy lock and returns its result unchanged.
@@ -10696,6 +10718,66 @@ impl EscrowContract {
             },
         );
 
+        Ok(true)
+    }
+
+    /// Extend a funded escrow timeout using a mutually signed voucher (#357).
+    ///
+    /// The buyer and seller each authenticate the exact voucher arguments.
+    /// This keeps the extension gas-efficient for a relayer while ensuring
+    /// that changing the escrow, deadline, nonce, or either signature causes
+    /// authorization to fail. Nonces make a valid voucher single-use.
+    pub fn extend_timeout_with_mutual_signatures(
+        env: Env,
+        voucher: TimeoutExtensionVoucher,
+    ) -> Result<bool, EscrowError> {
+        let key = DataKey::Escrow(voucher.escrow_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+        if record.status != EscrowStatus::Funded {
+            return Err(EscrowError::InvalidStatus);
+        }
+        if voucher.new_timeout_ledger <= record.timeout_ledger {
+            return Err(EscrowError::InvalidExtension);
+        }
+        let previous_nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TimeoutExtensionNonce(voucher.escrow_id))
+            .unwrap_or(0);
+        if voucher.nonce <= previous_nonce {
+            return Err(EscrowError::TimeoutExtensionNonceUsed);
+        }
+
+        let auth_args = (
+            voucher.escrow_id,
+            voucher.new_timeout_ledger,
+            voucher.nonce,
+            voucher.buyer_signature.clone(),
+            voucher.seller_signature.clone(),
+        );
+        record.buyer.require_auth_for_args(auth_args.clone());
+        record.seller.require_auth_for_args(auth_args);
+
+        let old_timeout = record.timeout_ledger;
+        record.timeout_ledger = voucher.new_timeout_ledger;
+        record.updated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TimeoutExtensionNonce(voucher.escrow_id), &voucher.nonce);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("exttime"), voucher.escrow_id),
+            EscrowTimeoutExtendedEvent {
+                escrow_id: voucher.escrow_id,
+                old_timeout_ledger: old_timeout,
+                new_timeout_ledger: voucher.new_timeout_ledger,
+                extended_by: record.buyer,
+            },
+        );
         Ok(true)
     }
 
