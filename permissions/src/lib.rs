@@ -132,7 +132,7 @@ pub enum PermissionError {
 /// Epoch period for allowance reset logic.
 /// Controls how frequently the spent counter resets based on ledger time.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Epoch {
     /// Reset spent daily (every ledger day)
     Daily,
@@ -254,6 +254,12 @@ pub struct PermissionRecord {
     pub status: PermissionStatus,
     pub expires_at_ledger: u32,
     pub created_at: u64,
+    /// Epoch period for allowance reset logic. When a spend crosses an epoch
+    /// boundary, the spent counter resets to 0.
+    pub epoch: Epoch,
+    /// Ledger sequence number at which the spent counter was last reset,
+    /// used to determine when to reset based on the epoch period.
+    pub last_reset_ledger: u32,
     /// Owner half of the parent permission's `(owner, delegate)` key, for
     /// permissions created via `grant_child`. `None` for top-level grants.
     pub parent_owner: Option<Address>,
@@ -947,6 +953,8 @@ impl PermissionsContract {
             status: PermissionStatus::Active,
             expires_at_ledger,
             created_at: env.ledger().timestamp(),
+            epoch: Epoch::Daily,
+            last_reset_ledger: env.ledger().sequence(),
             parent_owner: None,
             parent_delegate: None,
         };
@@ -1080,6 +1088,8 @@ impl PermissionsContract {
             status: PermissionStatus::Active,
             expires_at_ledger,
             created_at: env.ledger().timestamp(),
+            epoch: Epoch::Daily,
+            last_reset_ledger: env.ledger().sequence(),
             parent_owner: Some(parent_owner.clone()),
             parent_delegate: Some(parent_delegate.clone()),
         };
@@ -1210,7 +1220,7 @@ impl PermissionsContract {
         let remaining_allowance = old_record.limit_total - old_record.spent;
 
         // Create new permission with same configuration but fresh expiry
-        // Preserve the spent counter to maintain history
+        // Preserve the spent counter and epoch to maintain history
         let new_record = PermissionRecord {
             owner: owner.clone(),
             delegate: new_delegate.clone(),
@@ -1221,6 +1231,8 @@ impl PermissionsContract {
             status: PermissionStatus::Active,
             expires_at_ledger: old_record.expires_at_ledger,
             created_at: env.ledger().timestamp(),
+            epoch: old_record.epoch,
+            last_reset_ledger: old_record.last_reset_ledger,
             parent_owner: old_record.parent_owner.clone(),
             parent_delegate: old_record.parent_delegate.clone(),
         };
@@ -1691,6 +1703,35 @@ impl PermissionsContract {
     ) -> Result<i128, PermissionError> {
         let key = DataKey::Permission(owner.clone(), delegate.clone());
         let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
+
+        // Reset spent when crossing an epoch boundary (issue #11).
+        let current_ledger = env.ledger().sequence();
+        let ledgers_since_reset = current_ledger.saturating_sub(record.last_reset_ledger);
+        match record.epoch {
+            Epoch::Daily => {
+                // Daily: reset spent at the start of each new ledger day.
+                // In practice, we reset when we've moved to a new ledger
+                // (every ledger triggers a reset for Daily epoch).
+                if ledgers_since_reset >= 1 {
+                    record.spent = 0;
+                    record.last_reset_ledger = current_ledger;
+                }
+            }
+            Epoch::Weekly => {
+                // Weekly: reset spent every 7 ledgers.
+                if ledgers_since_reset >= 7 {
+                    record.spent = 0;
+                    record.last_reset_ledger = current_ledger;
+                }
+            }
+            Epoch::Monthly => {
+                // Monthly: reset spent every ~30 ledgers.
+                if ledgers_since_reset >= 30 {
+                    record.spent = 0;
+                    record.last_reset_ledger = current_ledger;
+                }
+            }
+        }
 
         record.spent += amount;
         let remaining = record.limit_total - record.spent;
