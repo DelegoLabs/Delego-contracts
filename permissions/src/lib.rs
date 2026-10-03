@@ -244,7 +244,7 @@ pub enum PermissionError {
 /// Epoch period for allowance reset logic.
 /// Controls how frequently the spent counter resets based on ledger time.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Epoch {
     /// Reset spent daily (every ledger day)
     Daily,
@@ -442,6 +442,12 @@ pub struct PermissionRecord {
     pub not_before_ledger: u32,
     /// Ledger after which this grant is no longer spendable.
     pub not_after_ledger: u32,
+    /// Epoch period for allowance reset logic. When a spend crosses an epoch
+    /// boundary, the spent counter resets to 0.
+    pub epoch: Epoch,
+    /// Ledger sequence number at which the spent counter was last reset,
+    /// used to determine when to reset based on the epoch period.
+    pub last_reset_ledger: u32,
     /// Owner half of the parent permission's `(owner, delegate)` key, for
     /// permissions created via `grant_child`. `None` for top-level grants.
     pub parent_owner: Option<Address>,
@@ -1916,6 +1922,8 @@ impl PermissionsContract {
             created_at: env.ledger().timestamp(),
             not_before_ledger: 0,
             not_after_ledger: 0,
+            epoch: Epoch::Daily,
+            last_reset_ledger: env.ledger().sequence(),
             parent_owner: None,
             parent_delegate: None,
         };
@@ -2118,6 +2126,8 @@ impl PermissionsContract {
             created_at: env.ledger().timestamp(),
             not_before_ledger: 0,
             not_after_ledger: 0,
+            epoch: Epoch::Daily,
+            last_reset_ledger: env.ledger().sequence(),
             parent_owner: Some(parent_owner.clone()),
             parent_delegate: Some(parent_delegate.clone()),
         };
@@ -2315,7 +2325,7 @@ impl PermissionsContract {
         let remaining_allowance = old_record.limit_total - old_record.spent;
 
         // Create new permission with same configuration but fresh expiry
-        // Preserve the spent counter to maintain history
+        // Preserve the spent counter and epoch to maintain history
         let new_record = PermissionRecord {
             owner: owner.clone(),
             delegate: new_delegate.clone(),
@@ -2328,6 +2338,8 @@ impl PermissionsContract {
             created_at: env.ledger().timestamp(),
             not_before_ledger: old_record.not_before_ledger,
             not_after_ledger: old_record.not_after_ledger,
+            epoch: old_record.epoch,
+            last_reset_ledger: old_record.last_reset_ledger,
             parent_owner: old_record.parent_owner.clone(),
             parent_delegate: old_record.parent_delegate.clone(),
         };
@@ -3488,6 +3500,33 @@ impl PermissionsContract {
     ) -> Result<SpendExecutionResult, PermissionError> {
         let key = DataKey::Permission(owner.clone(), delegate.clone());
         let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
+
+let key = DataKey::Permission(owner.clone(), delegate.clone());
+        let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
+
+        // Reset spent when crossing an epoch boundary (issue #11).
+        let current_ledger = env.ledger().sequence();
+        let ledgers_since_reset = current_ledger.saturating_sub(record.last_reset_ledger);
+        match record.epoch {
+            Epoch::Daily => {
+                if ledgers_since_reset >= 1 {
+                    record.spent = 0;
+                    record.last_reset_ledger = current_ledger;
+                }
+            }
+            Epoch::Weekly => {
+                if ledgers_since_reset >= 7 {
+                    record.spent = 0;
+                    record.last_reset_ledger = current_ledger;
+                }
+            }
+            Epoch::Monthly => {
+                if ledgers_since_reset >= 30 {
+                    record.spent = 0;
+                    record.last_reset_ledger = current_ledger;
+                }
+            }
+        }
 
         if amount <= 0 {
             return Err(PermissionError::InvalidParam);
