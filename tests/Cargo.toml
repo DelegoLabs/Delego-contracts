@@ -10,8 +10,6 @@ delego-escrow = { path = "../escrow" }
 delego-interfaces = { path = "../interfaces" }
 delego-permissions = { path = "../permissions" }
 delego-reputation = { path = "../reputation" }
-delego-merchant = { path = "../merchant" }
-delego-identity = { path = "../identity" }
 delego-delegation-registry = { path = "../delegation_registry" }
 delego-marketplace = { path = "../marketplace" }
 
@@ -21,8 +19,6 @@ delego-escrow = { path = "../escrow", features = ["testutils"] }
 delego-interfaces = { path = "../interfaces", features = ["testutils"] }
 delego-permissions = { path = "../permissions", features = ["testutils"] }
 delego-reputation = { path = "../reputation", features = ["testutils"] }
-delego-merchant = { path = "../merchant", features = ["testutils"] }
-delego-identity = { path = "../identity", features = ["testutils"] }
 delego-delegation-registry = { path = "../delegation_registry", features = ["testutils"] }
 delego-marketplace = { path = "../marketplace", features = ["testutils"] }
 ed25519-dalek = "2"

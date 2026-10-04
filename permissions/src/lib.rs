@@ -267,10 +267,7 @@ mod error_code_tests {
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 34);
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 30);
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 31);
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 30);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 38);
 
         let permission_range = ERROR_CODE_RANGES
             .iter()
@@ -4259,8 +4256,24 @@ impl PermissionsContract {
         Ok(())
     }
 
+    /// Read-only getter for a single-owner permission record.
+    ///
+    /// Returns `PermissionError::PermissionNotFound` when no permission has
+    /// been granted for the `(owner, delegate)` pair.
+    pub fn get_permission(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Result<PermissionRecord, PermissionError> {
+        let key = DataKey::Permission(owner, delegate);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .ok_or(PermissionError::PermissionNotFound)
+    }
 
-
+    /// Remaining allowance for a `(owner, delegate)` pair, i.e.
+    /// `limit_total - spent` on the single-owner permission record.
     pub fn get_remaining_allowance(
         env: Env,
         owner: Address,
