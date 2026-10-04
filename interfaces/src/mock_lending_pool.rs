@@ -58,13 +58,18 @@ impl MockLendingPool {
         if rate_bps > 10_000 {
             return Err(MockLendingPoolError::InvalidYieldRate);
         }
-        env.storage().instance().set(&MockDataKey::YieldRateBps, &rate_bps);
+        env.storage()
+            .instance()
+            .set(&MockDataKey::YieldRateBps, &rate_bps);
         Ok(rate_bps)
     }
 
     /// Current annual yield rate in basis points.
     pub fn get_yield_rate(env: Env) -> u32 {
-        env.storage().instance().get(&MockDataKey::YieldRateBps).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&MockDataKey::YieldRateBps)
+            .unwrap_or(0)
     }
 
     /// Pause the pool; while paused every `get_accrued_yield` call aborts so
@@ -76,7 +81,10 @@ impl MockLendingPool {
 
     /// Whether the pool is currently paused.
     pub fn get_paused(env: Env) -> bool {
-        env.storage().instance().get(&MockDataKey::Paused).unwrap_or(false)
+        env.storage()
+            .instance()
+            .get(&MockDataKey::Paused)
+            .unwrap_or(false)
     }
 
     /// Seeding hook: directly attribute `principal` of `token` to `user`
@@ -88,14 +96,18 @@ impl MockLendingPool {
             principal,
             opened_at: now,
         };
-        env.storage().persistent().set(&MockDataKey::Position(user.clone(), token.clone()), &pos);
+        env.storage()
+            .persistent()
+            .set(&MockDataKey::Position(user.clone(), token.clone()), &pos);
         Self::add_user_token(&env, &user, &token);
         principal
     }
 
     /// Read back a user's position for a token (None when unset).
     pub fn get_position(env: Env, user: Address, token: Address) -> Option<MockPosition> {
-        env.storage().persistent().get(&MockDataKey::Position(user, token))
+        env.storage()
+            .persistent()
+            .get(&MockDataKey::Position(user, token))
     }
 
     fn add_user_token(env: &Env, user: &Address, token: &Address) {
@@ -113,7 +125,9 @@ impl MockLendingPool {
         }
         if !present {
             tokens.push_back(token.clone());
-            env.storage().persistent().set(&MockDataKey::UserTokens(user.clone()), &tokens);
+            env.storage()
+                .persistent()
+                .set(&MockDataKey::UserTokens(user.clone()), &tokens);
         }
     }
 }
@@ -130,12 +144,17 @@ impl LendingPoolInterface for MockLendingPool {
             .storage()
             .persistent()
             .get(&MockDataKey::Position(user.clone(), token.clone()))
-            .unwrap_or(MockPosition { principal: 0, opened_at: now });
+            .unwrap_or(MockPosition {
+                principal: 0,
+                opened_at: now,
+            });
         if pos.principal == 0 {
             pos.opened_at = now;
         }
         pos.principal += amount;
-        env.storage().persistent().set(&MockDataKey::Position(user.clone(), token.clone()), &pos);
+        env.storage()
+            .persistent()
+            .set(&MockDataKey::Position(user.clone(), token.clone()), &pos);
         MockLendingPool::add_user_token(&env, &user, &token);
         Ok(pos.principal)
     }
@@ -154,7 +173,9 @@ impl LendingPoolInterface for MockLendingPool {
             return Err(Error::from(MockLendingPoolError::InsufficientShares));
         }
         pos.principal -= shares;
-        env.storage().persistent().set(&MockDataKey::Position(user, token), &pos);
+        env.storage()
+            .persistent()
+            .set(&MockDataKey::Position(user, token), &pos);
         Ok(shares)
     }
 
@@ -167,7 +188,11 @@ impl LendingPoolInterface for MockLendingPool {
         if paused {
             panic!("MockLendingPool is paused");
         }
-        let rate_bps: u32 = env.storage().instance().get(&MockDataKey::YieldRateBps).unwrap_or(0);
+        let rate_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&MockDataKey::YieldRateBps)
+            .unwrap_or(0);
         let now = env.ledger().timestamp();
         let tokens: Vec<Address> = env
             .storage()
@@ -183,7 +208,8 @@ impl LendingPoolInterface for MockLendingPool {
                 .get::<MockDataKey, MockPosition>(&MockDataKey::Position(user.clone(), token))
             {
                 let elapsed = now.saturating_sub(pos.opened_at) as i128;
-                total += pos.principal * rate_bps as i128 * elapsed / (10_000i128 * SECONDS_PER_YEAR);
+                total +=
+                    pos.principal * rate_bps as i128 * elapsed / (10_000i128 * SECONDS_PER_YEAR);
             }
         }
         total
@@ -208,8 +234,14 @@ mod test {
     fn clients<'a>(
         env: &'a Env,
         id: &'a Address,
-    ) -> (crate::lending_pool::LendingPoolClient<'a>, MockLendingPoolClient<'a>) {
-        (crate::lending_pool::LendingPoolClient::new(env, id), MockLendingPoolClient::new(env, id))
+    ) -> (
+        crate::lending_pool::LendingPoolClient<'a>,
+        MockLendingPoolClient<'a>,
+    ) {
+        (
+            crate::lending_pool::LendingPoolClient::new(env, id),
+            MockLendingPoolClient::new(env, id),
+        )
     }
 
     #[test]
@@ -235,9 +267,15 @@ mod test {
         let (env, id, token) = setup();
         let (client, _mock) = clients(&env, &id);
         let dep = client.try_deposit(&token, &0i128);
-        assert_eq!(dep, Err(Ok(Error::from(MockLendingPoolError::InvalidAmount))));
+        assert_eq!(
+            dep,
+            Err(Ok(Error::from(MockLendingPoolError::InvalidAmount)))
+        );
         let wd = client.try_withdraw(&token, &0i128);
-        assert_eq!(wd, Err(Ok(Error::from(MockLendingPoolError::InvalidAmount))));
+        assert_eq!(
+            wd,
+            Err(Ok(Error::from(MockLendingPoolError::InvalidAmount)))
+        );
     }
 
     #[test]
@@ -246,7 +284,10 @@ mod test {
         let (client, _mock) = clients(&env, &id);
         client.deposit(&token, &100i128);
         let wd = client.try_withdraw(&token, &101i128);
-        assert_eq!(wd, Err(Ok(Error::from(MockLendingPoolError::InsufficientShares))));
+        assert_eq!(
+            wd,
+            Err(Ok(Error::from(MockLendingPoolError::InsufficientShares)))
+        );
     }
 
     #[test]
@@ -300,6 +341,9 @@ mod test {
     fn rate_out_of_bounds_rejected() {
         let (env, id, _token) = setup();
         let (_client, mock) = clients(&env, &id);
-        assert_eq!(mock.try_set_yield_rate(&10_001u32), Err(Ok(MockLendingPoolError::InvalidYieldRate)));
+        assert_eq!(
+            mock.try_set_yield_rate(&10_001u32),
+            Err(Ok(MockLendingPoolError::InvalidYieldRate))
+        );
     }
 }

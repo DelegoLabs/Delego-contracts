@@ -789,7 +789,11 @@ impl ReputationContract {
         };
 
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("tx_rec"), entity.clone()),
+            (
+                symbol_short!("reput"),
+                symbol_short!("tx_rec"),
+                entity.clone(),
+            ),
             TransactionRecordedEvent {
                 escrow_id,
                 entity,
@@ -850,7 +854,11 @@ impl ReputationContract {
         Self::recompute_score(&env, &entity)?;
 
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("rated"), entity.clone()),
+            (
+                symbol_short!("reput"),
+                symbol_short!("rated"),
+                entity.clone(),
+            ),
             EntityRatedEvent {
                 rater,
                 entity,
@@ -1218,10 +1226,7 @@ impl ReputationContract {
         while id > 0 {
             id -= 1;
 
-            let entity: Address = match env
-                .storage()
-                .persistent()
-                .get(&DataKey::MerchantEntity(id))
+            let entity: Address = match env.storage().persistent().get(&DataKey::MerchantEntity(id))
             {
                 Some(entity) => entity,
                 None => continue,
@@ -1277,9 +1282,7 @@ impl ReputationContract {
     /// is allocated lazily the first time an entity's reputation record is
     /// written, and never changes thereafter.
     pub fn get_merchant_id(env: Env, entity: Address) -> Option<u64> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::MerchantId(entity))
+        env.storage().persistent().get(&DataKey::MerchantId(entity))
     }
 
     // --- Flagging ---
@@ -1335,7 +1338,11 @@ impl ReputationContract {
         let active_count = flags.iter().filter(|f| !f.resolved).count() as u32;
 
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("flagged"), entity.clone()),
+            (
+                symbol_short!("reput"),
+                symbol_short!("flagged"),
+                entity.clone(),
+            ),
             EntityFlaggedEvent {
                 reporter,
                 entity: entity.clone(),
@@ -1351,7 +1358,11 @@ impl ReputationContract {
                 .persistent()
                 .set(&DataKey::FrozenStatus(entity.clone()), &true);
             env.events().publish(
-                (symbol_short!("reput"), symbol_short!("frozen"), entity.clone()),
+                (
+                    symbol_short!("reput"),
+                    symbol_short!("frozen"),
+                    entity.clone(),
+                ),
                 EntityFrozenEvent {
                     entity,
                     frozen_by: env.current_contract_address(),
@@ -1413,7 +1424,11 @@ impl ReputationContract {
             .persistent()
             .set(&DataKey::FrozenStatus(entity.clone()), &true);
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("frozen"), entity.clone()),
+            (
+                symbol_short!("reput"),
+                symbol_short!("frozen"),
+                entity.clone(),
+            ),
             EntityFrozenEvent {
                 entity,
                 frozen_by: admin,
@@ -1434,7 +1449,11 @@ impl ReputationContract {
             .persistent()
             .set(&DataKey::FrozenStatus(entity.clone()), &false);
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("unfrozn"), entity.clone()),
+            (
+                symbol_short!("reput"),
+                symbol_short!("unfrozn"),
+                entity.clone(),
+            ),
             EntityUnfrozenEvent {
                 entity,
                 unfrozen_by: admin,
@@ -1490,7 +1509,11 @@ impl ReputationContract {
 
         if pruned_count > 0 {
             env.events().publish(
-                (symbol_short!("reput"), symbol_short!("pruned"), entity.clone()),
+                (
+                    symbol_short!("reput"),
+                    symbol_short!("pruned"),
+                    entity.clone(),
+                ),
                 EntityHistoryPrunedEvent {
                     entity,
                     pruned_count,
@@ -1528,7 +1551,11 @@ impl ReputationContract {
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
         env.events().publish(
-            (symbol_short!("reput"), soroban_sdk::Symbol::new(&env, "admin_prop"), new_admin.clone()),
+            (
+                symbol_short!("reput"),
+                soroban_sdk::Symbol::new(&env, "admin_prop"),
+                new_admin.clone(),
+            ),
             AdminProposedEvent {
                 current_admin,
                 new_admin,
@@ -1552,7 +1579,11 @@ impl ReputationContract {
         env.storage().instance().set(&DataKey::Admin, &caller);
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("admin_acc"), caller.clone()),
+            (
+                symbol_short!("reput"),
+                symbol_short!("admin_acc"),
+                caller.clone(),
+            ),
             AdminAcceptedEvent { new_admin: caller },
         );
         Ok(())
@@ -1628,11 +1659,7 @@ impl ReputationContract {
                 PERSISTENT_BUMP_THRESHOLD,
                 PERSISTENT_BUMP_AMOUNT,
             );
-            if let Some(history) = env
-                .storage()
-                .persistent()
-                .get::<_, Vec<u64>>(&hist_key)
-            {
+            if let Some(history) = env.storage().persistent().get::<_, Vec<u64>>(&hist_key) {
                 let len = history.len();
                 let start = len.saturating_sub(SCORE_WINDOW);
                 let mut i = start;
@@ -2071,7 +2098,11 @@ impl ReputationContract {
         );
 
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("score_dec"), entity.clone()),
+            (
+                symbol_short!("reput"),
+                symbol_short!("score_dec"),
+                entity.clone(),
+            ),
             decomposition,
         );
         env.events().publish(

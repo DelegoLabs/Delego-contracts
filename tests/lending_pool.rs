@@ -61,7 +61,10 @@ fn escrow_delegates_yield_to_lending_pool() {
 
     let view = escrow.get_accrued_yield(&escrow_id);
     assert_eq!(view.accrued, 1_000i128, "pool-reported yield must win");
-    assert_eq!(view.apy_bps, 500, "apy_bps reflects the escrow config, not the pool");
+    assert_eq!(
+        view.apy_bps, 500,
+        "apy_bps reflects the escrow config, not the pool"
+    );
     assert_eq!(view.held_seconds, 31_536_000);
 }
 

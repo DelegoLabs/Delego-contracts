@@ -394,7 +394,6 @@ pub struct HierarchyMetadata {
     pub depth_level: u32,
 }
 
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(missing_docs)]
@@ -1380,9 +1379,10 @@ impl PermissionsContract {
         required: u32,
     ) -> Result<(), PermissionError> {
         Self::require_admin(&env, &admin)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::VerificationPolicy, &VerificationPolicy { required });
+        env.storage().instance().set(
+            &DataKey::VerificationPolicy,
+            &VerificationPolicy { required },
+        );
         Ok(())
     }
 
@@ -1448,10 +1448,7 @@ impl PermissionsContract {
     }
 
     /// Returns the stored verification state for a merchant, if any.
-    pub fn get_merchant_verification(
-        env: Env,
-        merchant_id: u64,
-    ) -> Option<MerchantVerification> {
+    pub fn get_merchant_verification(env: Env, merchant_id: u64) -> Option<MerchantVerification> {
         env.storage()
             .persistent()
             .get(&DataKey::MerchantVerification(merchant_id))
@@ -1473,10 +1470,7 @@ impl PermissionsContract {
     ///   below the required threshold but still within the grace period.
     /// - [`PermissionError::VerificationBelowPolicy`] when the merchant is
     ///   below the required threshold and the grace period has elapsed.
-    pub fn revalidate_merchant_status(
-        env: Env,
-        merchant_id: u64,
-    ) -> Result<bool, PermissionError> {
+    pub fn revalidate_merchant_status(env: Env, merchant_id: u64) -> Result<bool, PermissionError> {
         let policy = Self::get_active_verification_policy(&env);
         let verifications = Self::get_merchant_verifications_count(&env, merchant_id);
 
@@ -1765,10 +1759,7 @@ impl PermissionsContract {
                 current_epoch: 0,
                 epoch_started_ledger: env.ledger().sequence(),
             });
-        env.storage().persistent().set(
-            &epoch_key,
-            &epoch_config,
-        );
+        env.storage().persistent().set(&epoch_key, &epoch_config);
 
         // Issue #369: a `None` scope clears any scope a previous grant
         // carried, so `re_grant` can never leave a stale, unenforced scope
@@ -1793,7 +1784,11 @@ impl PermissionsContract {
         let remaining_delta = limit_total - old_remaining;
 
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("granted"), delegate.clone()),
+            (
+                symbol_short!("perm"),
+                symbol_short!("granted"),
+                delegate.clone(),
+            ),
             PermissionGrantedEvent {
                 owner: owner.clone(),
                 delegate: delegate.clone(),
@@ -1807,7 +1802,11 @@ impl PermissionsContract {
         );
 
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("merc_list"), delegate.clone()),
+            (
+                symbol_short!("perm"),
+                symbol_short!("merc_list"),
+                delegate.clone(),
+            ),
             MerchantWhitelistChangedEvent {
                 owner: owner.clone(),
                 delegate: delegate.clone(),
@@ -1925,18 +1924,13 @@ impl PermissionsContract {
         // Enforce the maximum delegation hierarchy depth. A child's depth is
         // one greater than its parent's; reject before any state is written
         // so a chain can never exceed `MAX_HIERARCHY_DEPTH` levels.
-        let parent_depth = Self::hierarchy_depth(
-            &env,
-            &parent_owner,
-            &parent_delegate,
-        );
+        let parent_depth = Self::hierarchy_depth(&env, &parent_owner, &parent_delegate);
         let child_depth = parent_depth
             .checked_add(1)
             .ok_or(PermissionError::MaxHierarchyDepthExceeded)?;
         if child_depth >= MAX_HIERARCHY_DEPTH {
             return Err(PermissionError::MaxHierarchyDepthExceeded);
         }
-
 
         let requested_expiry = Self::grant_expiry_ledger(&env, ttl_ledgers)?;
         let expires_at_ledger = requested_expiry.min(parent_record.expires_at_ledger);
@@ -1983,7 +1977,6 @@ impl PermissionsContract {
             },
         );
 
-
         let children_key = DataKey::Children(parent_owner, parent_delegate.clone());
         let mut children: Vec<Address> = env
             .storage()
@@ -1996,7 +1989,11 @@ impl PermissionsContract {
         }
 
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("granted"), child_delegate.clone()),
+            (
+                symbol_short!("perm"),
+                symbol_short!("granted"),
+                child_delegate.clone(),
+            ),
             PermissionGrantedEvent {
                 owner: parent_delegate,
                 delegate: child_delegate,
@@ -2044,7 +2041,11 @@ impl PermissionsContract {
                 .remove(&DataKey::PendingDecrement(owner.clone(), delegate.clone()));
 
             env.events().publish(
-                (symbol_short!("perm"), symbol_short!("revoked"), delegate.clone()),
+                (
+                    symbol_short!("perm"),
+                    symbol_short!("revoked"),
+                    delegate.clone(),
+                ),
                 PermissionRevokedEvent {
                     owner: owner.clone(),
                     delegate: delegate.clone(),
@@ -2066,10 +2067,7 @@ impl PermissionsContract {
     fn hierarchy_depth(env: &Env, owner: &Address, delegate: &Address) -> u32 {
         env.storage()
             .persistent()
-            .get::<DataKey, HierarchyMetadata>(&DataKey::Hierarchy(
-                owner.clone(),
-                delegate.clone(),
-            ))
+            .get::<DataKey, HierarchyMetadata>(&DataKey::Hierarchy(owner.clone(), delegate.clone()))
             .map(|m| m.depth_level)
             .unwrap_or(0)
     }
@@ -2079,10 +2077,7 @@ impl PermissionsContract {
     fn hierarchy_root_owner(env: &Env, owner: &Address, delegate: &Address) -> Address {
         env.storage()
             .persistent()
-            .get::<DataKey, HierarchyMetadata>(&DataKey::Hierarchy(
-                owner.clone(),
-                delegate.clone(),
-            ))
+            .get::<DataKey, HierarchyMetadata>(&DataKey::Hierarchy(owner.clone(), delegate.clone()))
             .map(|m| m.root_owner)
             .unwrap_or_else(|| owner.clone())
     }
@@ -2097,7 +2092,6 @@ impl PermissionsContract {
             .persistent()
             .get(&DataKey::Hierarchy(owner, delegate))
     }
-
 
     /// Transfer a permission from one delegate to another, preserving spending limits and history.
     ///
@@ -2235,7 +2229,11 @@ impl PermissionsContract {
 
         // Emit transfer event
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("transf"), new_delegate.clone()),
+            (
+                symbol_short!("perm"),
+                symbol_short!("transf"),
+                new_delegate.clone(),
+            ),
             PermissionTransferredEvent {
                 owner: owner.clone(),
                 old_delegate,
@@ -2291,7 +2289,11 @@ impl PermissionsContract {
                 Some(new_expiry) => new_expiry,
                 None => {
                     env.events().publish(
-                        (symbol_short!("perm"), symbol_short!("exp_cap"), delegate.clone()),
+                        (
+                            symbol_short!("perm"),
+                            symbol_short!("exp_cap"),
+                            delegate.clone(),
+                        ),
                         PermissionExpiryCappedEvent {
                             owner: owner.clone(),
                             delegate: delegate.clone(),
@@ -2307,7 +2309,11 @@ impl PermissionsContract {
 
             // Publish renewal event
             env.events().publish(
-                (symbol_short!("perm"), symbol_short!("renewed"), delegate.clone()),
+                (
+                    symbol_short!("perm"),
+                    symbol_short!("renewed"),
+                    delegate.clone(),
+                ),
                 (
                     owner.clone(),
                     delegate.clone(),
@@ -2370,7 +2376,11 @@ impl PermissionsContract {
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("exp_upd"), delegate.clone()),
+            (
+                symbol_short!("perm"),
+                symbol_short!("exp_upd"),
+                delegate.clone(),
+            ),
             PermissionExpiryUpdatedEvent {
                 owner: owner.clone(),
                 delegate: delegate.clone(),
@@ -2500,7 +2510,11 @@ impl PermissionsContract {
                     child_record.status = PermissionStatus::Revoked;
                     env.storage().persistent().set(&child_key, &child_record);
                     env.events().publish(
-                        (symbol_short!("perm"), symbol_short!("revoked"), child_delegate.clone()),
+                        (
+                            symbol_short!("perm"),
+                            symbol_short!("revoked"),
+                            child_delegate.clone(),
+                        ),
                         PermissionRevokedEvent {
                             owner: delegate.clone(),
                             delegate: child_delegate.clone(),
@@ -2711,10 +2725,7 @@ impl PermissionsContract {
     /// bounded spending grants). Rejects spends before `not_before_ledger`
     /// with `GrantNotYetActive` and after `not_after_ledger` with `Expired`.
     /// A `not_before_ledger`/`not_after_ledger` of `0` means "unbounded".
-    fn check_active_window(
-        env: &Env,
-        record: &PermissionRecord,
-    ) -> Result<(), PermissionError> {
+    fn check_active_window(env: &Env, record: &PermissionRecord) -> Result<(), PermissionError> {
         let current = env.ledger().sequence();
         if record.not_before_ledger != 0 && current < record.not_before_ledger {
             return Err(PermissionError::GrantNotYetActive);
@@ -2881,7 +2892,11 @@ impl PermissionsContract {
         );
 
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("allowlst"), delegate.clone()),
+            (
+                symbol_short!("perm"),
+                symbol_short!("allowlst"),
+                delegate.clone(),
+            ),
             MerchantAllowlistUpdatedEvent {
                 owner: owner.clone(),
                 delegate: delegate.clone(),
@@ -3074,14 +3089,17 @@ impl PermissionsContract {
         owner: &Address,
         delegate: &Address,
     ) -> Result<(), PermissionError> {
-        let restriction: TimeWindowRestriction = match env
-            .storage()
-            .persistent()
-            .get(&DataKey::TimeWindowRestriction(owner.clone(), delegate.clone()))
-        {
-            Some(r) => r,
-            None => return Ok(()),
-        };
+        let restriction: TimeWindowRestriction =
+            match env
+                .storage()
+                .persistent()
+                .get(&DataKey::TimeWindowRestriction(
+                    owner.clone(),
+                    delegate.clone(),
+                )) {
+                Some(r) => r,
+                None => return Ok(()),
+            };
 
         let timestamp = env.ledger().timestamp();
         let days_since_epoch = timestamp / 86_400;
@@ -3205,7 +3223,11 @@ impl PermissionsContract {
 
         // Emit after successful spend only (issue #99).
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("spent"), delegate.clone()),
+            (
+                symbol_short!("perm"),
+                symbol_short!("spent"),
+                delegate.clone(),
+            ),
             PermissionSpendEvent {
                 owner,
                 delegate,
@@ -3373,9 +3395,7 @@ impl PermissionsContract {
 
     /// Load the instance-level rolling-window configuration, if any.
     fn rolling_window_config(env: &Env) -> Option<RollingWindowLimit> {
-        env.storage()
-            .instance()
-            .get(&DataKey::RollingWindowConfig)
+        env.storage().instance().get(&DataKey::RollingWindowConfig)
     }
 
     /// Load (and lazily roll over) the rolling-window state for a pair.
@@ -3398,7 +3418,10 @@ impl PermissionsContract {
         let mut state: RollingWindowLimit = env
             .storage()
             .persistent()
-            .get(&DataKey::RollingWindowState(owner.clone(), delegate.clone()))
+            .get(&DataKey::RollingWindowState(
+                owner.clone(),
+                delegate.clone(),
+            ))
             .unwrap_or(RollingWindowLimit {
                 window_ledgers: config.window_ledgers,
                 max_spend_in_window: config.max_spend_in_window,
@@ -3408,7 +3431,10 @@ impl PermissionsContract {
         state.window_ledgers = config.window_ledgers;
         state.max_spend_in_window = config.max_spend_in_window;
         if state.window_ledgers > 0
-            && current_ledger >= state.window_start_ledger.saturating_add(state.window_ledgers)
+            && current_ledger
+                >= state
+                    .window_start_ledger
+                    .saturating_add(state.window_ledgers)
         {
             state.current_window_spend = 0;
             state.window_start_ledger = current_ledger;
@@ -3493,7 +3519,11 @@ impl PermissionsContract {
             .set(&DataKey::RelayerKey(delegate.clone()), &public_key);
 
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("relaykey"), delegate.clone()),
+            (
+                symbol_short!("perm"),
+                symbol_short!("relaykey"),
+                delegate.clone(),
+            ),
             RelayerKeyChangedEvent {
                 delegate: delegate.clone(),
                 old_key,
@@ -3532,12 +3562,7 @@ impl PermissionsContract {
     /// Returns the next nonce a channel-based relayed spend for this
     /// (owner, delegate, channel_id) triple must use (issue #367).
     /// Channels are independent lanes (0..=255), enabling parallel spends.
-    pub fn get_channel_nonce(
-        env: Env,
-        owner: Address,
-        delegate: Address,
-        channel_id: u32,
-    ) -> u64 {
+    pub fn get_channel_nonce(env: Env, owner: Address, delegate: Address, channel_id: u32) -> u64 {
         env.storage()
             .persistent()
             .get(&DataKey::ChannelNonce(owner, delegate, channel_id))
@@ -3596,7 +3621,11 @@ impl PermissionsContract {
         env.storage().persistent().set(&nonce_key, &next_nonce);
 
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("nonce_cxl"), delegate.clone()),
+            (
+                symbol_short!("perm"),
+                symbol_short!("nonce_cxl"),
+                delegate.clone(),
+            ),
             NonceCancelledEvent {
                 owner: owner.clone(),
                 delegate: delegate.clone(),
@@ -3731,8 +3760,7 @@ impl PermissionsContract {
             return Err(PermissionError::SignatureExpired);
         }
 
-        let epoch_config =
-            Self::get_execution_epoch(env.clone(), owner.clone(), delegate.clone());
+        let epoch_config = Self::get_execution_epoch(env.clone(), owner.clone(), delegate.clone());
         if epoch != epoch_config.current_epoch {
             return Err(PermissionError::StaleEpoch);
         }
@@ -3793,7 +3821,11 @@ impl PermissionsContract {
         let result = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("relayed"), delegate.clone()),
+            (
+                symbol_short!("perm"),
+                symbol_short!("relayed"),
+                delegate.clone(),
+            ),
             PermissionSpendEvent {
                 owner,
                 delegate,
@@ -3847,8 +3879,7 @@ impl PermissionsContract {
             return Err(PermissionError::SignatureExpired);
         }
 
-        let epoch_config =
-            Self::get_execution_epoch(env.clone(), owner.clone(), delegate.clone());
+        let epoch_config = Self::get_execution_epoch(env.clone(), owner.clone(), delegate.clone());
         if epoch != epoch_config.current_epoch {
             return Err(PermissionError::StaleEpoch);
         }
@@ -3858,7 +3889,8 @@ impl PermissionsContract {
             return Err(PermissionError::InvalidParam);
         }
 
-        let nonce_key = DataKey::ChannelNonce(owner.clone(), delegate.clone(), channel_sig.channel_id);
+        let nonce_key =
+            DataKey::ChannelNonce(owner.clone(), delegate.clone(), channel_sig.channel_id);
         let expected_nonce: u64 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
         if channel_sig.nonce != expected_nonce {
             return Err(PermissionError::InvalidNonce);
@@ -3905,7 +3937,10 @@ impl PermissionsContract {
 
         // Advance the nonce before mutating spend state so a replay attempt
         // within the same ledger is rejected even if apply_spend panics.
-        let next_nonce = channel_sig.nonce.checked_add(1).ok_or(PermissionError::InvalidNonce)?;
+        let next_nonce = channel_sig
+            .nonce
+            .checked_add(1)
+            .ok_or(PermissionError::InvalidNonce)?;
         env.storage().persistent().set(&nonce_key, &next_nonce);
 
         // apply_spend increments the child record, walks the full parent chain,
@@ -3914,7 +3949,11 @@ impl PermissionsContract {
         let result = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("chn_spnd"), delegate.clone()),
+            (
+                symbol_short!("perm"),
+                symbol_short!("chn_spnd"),
+                delegate.clone(),
+            ),
             PermissionSpendEvent {
                 owner,
                 delegate,
@@ -4342,9 +4381,7 @@ impl PermissionsContract {
                     PermissionError::ExceedsPerTxLimit => Symbol::new(&env, "per_tx_limit"),
                     PermissionError::ExceedsTotalLimit => Symbol::new(&env, "total_limit"),
                     PermissionError::MerchantNotAllowed => Symbol::new(&env, "bad_merchant"),
-                    PermissionError::OutsideAuthorizedWindow => {
-                        Symbol::new(&env, "outside_win")
-                    }
+                    PermissionError::OutsideAuthorizedWindow => Symbol::new(&env, "outside_win"),
                     PermissionError::UnauthorizedFunction => Symbol::new(&env, "bad_function"),
                     // Remaining variants cannot be returned by can_spend but
                     // exhaustively handled to satisfy the compiler.
@@ -4584,7 +4621,8 @@ impl PermissionsContract {
         let execution_time = env.ledger().timestamp() + 86400;
         let execution_time =
             env.ledger().timestamp() + Self::get_decrease_timelock_secs(env.clone());
-        let execution_time = env.ledger().timestamp() + Self::get_decrease_timelock_secs(env.clone());
+        let execution_time =
+            env.ledger().timestamp() + Self::get_decrease_timelock_secs(env.clone());
 
         let pending = PendingAllowanceDecrement {
             amount,
@@ -5091,7 +5129,9 @@ impl PermissionsContract {
             .ok_or(PermissionError::PermissionNotFound)?;
 
         let current_ledger = env.ledger().sequence();
-        if current_ledger.saturating_sub(record.expires_at_ledger) <= PRUNE_EXPIRATION_THRESHOLD_LEDGERS {
+        if current_ledger.saturating_sub(record.expires_at_ledger)
+            <= PRUNE_EXPIRATION_THRESHOLD_LEDGERS
+        {
             return Ok(false);
         }
 
@@ -5116,16 +5156,21 @@ impl PermissionsContract {
             .remove(&DataKey::RelayerNonce(owner.clone(), delegate.clone()));
         // Clean up all channel nonce lanes (0..=255)
         for channel_id in 0u32..=255 {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::ChannelNonce(owner.clone(), delegate.clone(), channel_id));
+            env.storage().persistent().remove(&DataKey::ChannelNonce(
+                owner.clone(),
+                delegate.clone(),
+                channel_id,
+            ));
         }
         env.storage()
             .persistent()
             .remove(&DataKey::LastSpendLedger(owner.clone(), delegate.clone()));
         env.storage()
             .persistent()
-            .remove(&DataKey::LastSpendTimestamp(owner.clone(), delegate.clone()));
+            .remove(&DataKey::LastSpendTimestamp(
+                owner.clone(),
+                delegate.clone(),
+            ));
 
         // Remove delegate from owner's user permissions index
         let user_perms_key = DataKey::UserPermissions(owner.clone());
@@ -5199,7 +5244,11 @@ impl PermissionsContract {
                         .remove(&DataKey::PendingDecrement(owner.clone(), delegate.clone()));
 
                     env.events().publish(
-                        (symbol_short!("perm"), symbol_short!("autorevk"), delegate.clone()),
+                        (
+                            symbol_short!("perm"),
+                            symbol_short!("autorevk"),
+                            delegate.clone(),
+                        ),
                         PermissionRevokedEvent {
                             owner: owner.clone(),
                             delegate: delegate.clone(),
@@ -5273,7 +5322,11 @@ impl PermissionsContract {
             .set(&DataKey::MinSpendInterval, &interval);
 
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("velset"), admin.clone()),
+            (
+                symbol_short!("perm"),
+                symbol_short!("velset"),
+                admin.clone(),
+            ),
             VelocityLimitSetEvent {
                 previous,
                 current: interval,
@@ -5317,7 +5370,11 @@ impl PermissionsContract {
             .set(&DataKey::MinSpendIntervalSecs, &secs);
 
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("velsecset"), admin.clone()),
+            (
+                symbol_short!("perm"),
+                symbol_short!("velsecset"),
+                admin.clone(),
+            ),
             VelocityLimitSecsSetEvent {
                 previous,
                 current: secs,
@@ -5393,10 +5450,7 @@ impl PermissionsContract {
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("rwset")),
             RollingWindowSetEvent {
-                previous_window_ledgers: previous
-                    .as_ref()
-                    .map(|p| p.window_ledgers)
-                    .unwrap_or(0),
+                previous_window_ledgers: previous.as_ref().map(|p| p.window_ledgers).unwrap_or(0),
                 previous_max_spend: previous
                     .as_ref()
                     .map(|p| p.max_spend_in_window)
@@ -5472,7 +5526,11 @@ impl PermissionsContract {
         }
 
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("schemreg"), admin.clone()),
+            (
+                symbol_short!("perm"),
+                symbol_short!("schemreg"),
+                admin.clone(),
+            ),
             SchemaRegisteredEvent { admin, schema },
         );
 
@@ -6067,13 +6125,13 @@ impl PermissionsContract {
 }
 
 #[cfg(test)]
-mod integration_tests;
-#[cfg(test)]
-mod test;
-#[cfg(test)]
 mod fuzz_tests;
 #[cfg(test)]
+mod integration_tests;
+#[cfg(test)]
 mod quorum_migration_tests;
+#[cfg(test)]
+mod test;
 
 #[cfg(test)]
 mod absent_key_tests {

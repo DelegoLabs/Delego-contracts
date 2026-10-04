@@ -210,7 +210,14 @@ fn test_record_transaction_cost_stays_within_thresholds() {
     let (client, admin) = setup(&env);
     let entity = Address::generate(&env);
     let counterparty = Address::generate(&env);
-    client.record_transaction(&admin, &1u64, &entity, &counterparty, &1000i128, &TransactionOutcome::Released);
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Released,
+    );
     assert_record_cost_within_thresholds(&env);
 }
 
@@ -474,7 +481,6 @@ fn test_breakdown_ordering_is_deterministic_for_equal_timestamps() {
         );
     }
 }
-
 
 #[test]
 fn test_record_transaction_extends_ttl_across_churn() {
@@ -1627,13 +1633,17 @@ fn test_event_namespace_consistency() {
     client.accept_admin(&new_admin);
     let events = env.events().all();
     let contract_id = client.address;
-    
+
     let mut contract_event_count = 0;
     for (contract, topics, _) in events.into_iter() {
         if contract == contract_id {
             contract_event_count += 1;
             let namespace: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-            assert_eq!(namespace, symbol_short!("reput"), "All reputation events must use the 'reput' namespace");
+            assert_eq!(
+                namespace,
+                symbol_short!("reput"),
+                "All reputation events must use the 'reput' namespace"
+            );
         }
     }
     assert!(contract_event_count > 0);
@@ -2099,7 +2109,6 @@ fn test_slow_activity_liveness_keeps_entity_alive_on_read() {
         assert!(ttl >= PERSISTENT_BUMP_AMOUNT);
     }
 }
-
 
 #[test]
 fn test_score_recalculates_after_feedback_submission() {

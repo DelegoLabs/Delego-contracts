@@ -626,11 +626,7 @@ impl DelegationRegistry {
 
         // Topics: (contract, action, entity_id) — entity_id is the delegation id.
         env.events().publish(
-            (
-                EVENT_TOPIC_CONTRACT,
-                symbol_short!("created"),
-                id,
-            ),
+            (EVENT_TOPIC_CONTRACT, symbol_short!("created"), id),
             DelegationCreatedEvent {
                 delegation_id: id,
                 owner,
@@ -668,11 +664,7 @@ impl DelegationRegistry {
 
         // Topics: (contract, action, entity_id) — entity_id is the delegation id.
         env.events().publish(
-            (
-                EVENT_TOPIC_CONTRACT,
-                symbol_short!("paused"),
-                delegation_id,
-            ),
+            (EVENT_TOPIC_CONTRACT, symbol_short!("paused"), delegation_id),
             DelegationPausedEvent {
                 delegation_id,
                 owner: record.owner.clone(),
@@ -1508,10 +1500,7 @@ impl DelegationRegistry {
     /// the same batch safe and gas-efficient.
     ///
     /// Returns the ids that were actually swept.
-    pub fn sweep_expired(
-        env: Env,
-        delegation_ids: Vec<u64>,
-    ) -> Result<Vec<u64>, DelegationError> {
+    pub fn sweep_expired(env: Env, delegation_ids: Vec<u64>) -> Result<Vec<u64>, DelegationError> {
         if delegation_ids.is_empty() || delegation_ids.len() > MAX_SWEEP_BATCH_SIZE {
             return Err(DelegationError::InvalidBatchSize);
         }
@@ -1534,11 +1523,7 @@ impl DelegationRegistry {
 
                     // Topics: (contract, action, entity_id) — entity_id is the delegation id.
                     env.events().publish(
-                        (
-                            EVENT_TOPIC_CONTRACT,
-                            symbol_short!("expired"),
-                            id,
-                        ),
+                        (EVENT_TOPIC_CONTRACT, symbol_short!("expired"), id),
                         DelegationExpiredEvent {
                             delegation_id: id,
                             owner: record.owner.clone(),
