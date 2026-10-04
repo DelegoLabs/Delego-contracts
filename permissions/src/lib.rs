@@ -493,6 +493,67 @@ pub struct MultiOwnerSpendEvent {
     pub signer_count: u32,
 }
 
+/// Proposal to reconfigure the quorum of a multi-owner permission without
+/// tearing the grant down (issue #371).
+///
+/// Submitted to [`PermissionsContract::migrate_quorum_threshold`], which
+/// authorizes it against the *existing* quorum before applying it.
+///
+/// # Why the record is addressed by `(primary_owner, delegate)`
+///
+/// The issue text sketched a `permission_id: u64` locator. No such
+/// identifier exists for multi-owner grants — they are keyed by
+/// `(owners[0], delegate)` — and minting one retroactively is impossible,
+/// because already-deployed `MultiOwnerPermission` records carry no id to
+/// backfill. Introducing an id today would also mean adding a field to that
+/// `#[contracttype]`, which is *not* a backwards-compatible storage change:
+/// previously written records would fail to decode and the permission would
+/// read back as missing. That is precisely the data loss this issue exists to
+/// prevent, so the proposal addresses the record the same way every other
+/// multi-owner entry point does.
+///
+/// # Why `signers` rather than raw `signatures`
+///
+/// Owner identities are Soroban `Address`es and quorum has always been
+/// enforced through `require_auth` auth frames (see
+/// [`PermissionsContract::execute_spend_multi`]); no owner public key is ever
+/// stored, so there is nothing to check an ed25519 `BytesN<64>` against.
+/// Reusing the existing mechanism keeps one quorum definition across the
+/// contract instead of two that can drift apart.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct UpdateQuorumThresholdProposal {
+    /// `owners[0]` of the existing grant — the key the record is stored under.
+    pub primary_owner: Address,
+    /// The delegate whose spend authority is being governed.
+    pub delegate: Address,
+    /// Replacement quorum size; must satisfy `1 <= new_threshold <= new_owners.len()`.
+    pub new_threshold: u32,
+    /// Replacement owner set. `new_owners[0]` must remain `primary_owner`.
+    pub new_owners: Vec<Address>,
+    /// Owners endorsing this migration. At least the *current* threshold of
+    /// distinct current owners must appear here.
+    pub signers: Vec<Address>,
+}
+
+/// Emitted when a multi-owner permission's quorum is reconfigured in place
+/// (issue #371). Only the quorum changed; the grant was never revoked, so
+/// `limit_total`, `spent` and every nonce sequence carried over untouched.
+#[contracttype]
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct QuorumThresholdMigratedEvent {
+    pub primary_owner: Address,
+    pub delegate: Address,
+    pub old_threshold: u32,
+    pub new_threshold: u32,
+    pub old_owner_count: u32,
+    pub new_owner_count: u32,
+    /// Distinct current owners that authorized the migration.
+    pub endorser_count: u32,
+}
+
 /// Emitted when an admin registers a new approved metadata schema (issue #328).
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -4100,6 +4161,141 @@ impl PermissionsContract {
             .ok_or(PermissionError::PermissionNotFound)
     }
 
+    /// Reconfigure an existing multi-owner permission's owner set and quorum
+    /// threshold in place (issue #371).
+    ///
+    /// An enterprise that needs to widen a grant from 2-of-3 to 3-of-5 used to
+    /// have to revoke and re-grant, which reset the historical `spent`
+    /// allowance and stranded every live spend nonce. This entry point mutates
+    /// only the quorum fields of the existing record, so `limit_total`,
+    /// `spent`, `limit_per_tx`, `allowed_merchants`, `status`,
+    /// `expires_at_ledger` and `created_at` all carry over. The nonce and epoch
+    /// sequences (`RelayerNonce`, `ChannelNonce`, `ExecutionEpoch`) and the
+    /// rolling-window state live under separate `(primary_owner, delegate)`
+    /// keys and are never touched here, so replay protection and velocity
+    /// accounting also survive.
+    ///
+    /// Authorization is checked against the **existing** quorum before anything
+    /// is written, so a migration can never be authorized under a weaker
+    /// threshold than the one already in force. Each distinct current owner
+    /// listed in `proposal.signers` must produce a `require_auth` frame, and at
+    /// least `record.threshold` of them must be present. Signers that are not
+    /// current owners carry no weight and are ignored; duplicates are collapsed
+    /// so a duplicate-padded list cannot manufacture quorum out of one owner.
+    ///
+    /// `proposal.new_owners[0]` must stay `proposal.primary_owner`. The
+    /// record is stored under that key, as is every nonce, epoch and
+    /// rolling-window entry for the pair, so promoting a different owner to
+    /// first position would strand all of it.
+    ///
+    /// No delegate authorization is required: the delegate is the governed
+    /// party, not a participant in its own quorum, and letting it veto
+    /// governance would leave a cooperative spester able to block a rotation
+    /// the owners have already approved.
+    ///
+    /// # Errors
+    /// - [`PermissionError::PermissionNotFound`] if no multi-owner permission
+    ///   exists for `(primary_owner, delegate)`.
+    /// - [`PermissionError::Unauthorized`] if the record has been revoked.
+    /// - [`PermissionError::InvalidParam`] if `new_owners` is empty, repeats an
+    ///   owner, does not start with `primary_owner`, or `new_threshold` falls
+    ///   outside `1..=new_owners.len()`.
+    /// - [`PermissionError::SelfDelegationNotAllowed`] if the new owner set
+    ///   admits the delegate while self-delegation is disabled.
+    /// - [`PermissionError::InsufficientSignatures`] if fewer than the current
+    ///   threshold of distinct current owners endorse the proposal.
+    pub fn migrate_quorum_threshold(
+        env: Env,
+        proposal: UpdateQuorumThresholdProposal,
+    ) -> Result<(), PermissionError> {
+        let primary_owner = proposal.primary_owner.clone();
+        let delegate = proposal.delegate.clone();
+        let key = DataKey::MultiPermission(primary_owner.clone(), delegate.clone());
+
+        let mut record: MultiOwnerPermission = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(PermissionError::PermissionNotFound)?;
+
+        if record.status == PermissionStatus::Revoked {
+            return Err(PermissionError::Unauthorized);
+        }
+
+        // ── Validate the replacement quorum ──────────────────────────────
+        if proposal.new_owners.is_empty()
+            || proposal.new_threshold == 0
+            || proposal.new_threshold > proposal.new_owners.len()
+        {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        let mut unique_new_owners: Vec<Address> = Vec::new(&env);
+        for owner in proposal.new_owners.iter() {
+            if unique_new_owners.contains(&owner) {
+                return Err(PermissionError::InvalidParam);
+            }
+            unique_new_owners.push_back(owner);
+        }
+
+        // The record and all of its derived state hang off `owners[0]`, so the
+        // primary owner has to stay put; only the tail of the set may change.
+        match unique_new_owners.get(0) {
+            Some(first) if first == primary_owner => {}
+            _ => return Err(PermissionError::InvalidParam),
+        }
+
+        // Mirror the self-delegation guard from `grant_multi_owner`: a
+        // migration must not be a back door around it.
+        let allow_self: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowSelfDelegation)
+            .unwrap_or(false);
+        if !allow_self && unique_new_owners.contains(&delegate) {
+            return Err(PermissionError::SelfDelegationNotAllowed);
+        }
+
+        // ── Verify the quorum already in force ───────────────────────────
+        let mut endorsers: Vec<Address> = Vec::new(&env);
+        for signer in proposal.signers.iter() {
+            if record.owners.contains(&signer) && !endorsers.contains(&signer) {
+                endorsers.push_back(signer);
+            }
+        }
+        if endorsers.len() < record.threshold {
+            return Err(PermissionError::InsufficientSignatures);
+        }
+        for endorser in endorsers.iter() {
+            endorser.require_auth();
+        }
+
+        // ── Apply: quorum fields only ────────────────────────────────────
+        // Everything else on `record` — above all `spent` and `limit_total` —
+        // is deliberately left as-is so the migration cannot be used to
+        // launder a drained allowance back to full.
+        let old_threshold = record.threshold;
+        let old_owner_count = record.owners.len();
+        record.threshold = proposal.new_threshold;
+        record.owners = unique_new_owners;
+        env.storage().persistent().set(&key, &record);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("mqmig")),
+            QuorumThresholdMigratedEvent {
+                primary_owner,
+                delegate,
+                old_threshold,
+                new_threshold: record.threshold,
+                old_owner_count,
+                new_owner_count: record.owners.len(),
+                endorser_count: endorsers.len(),
+            },
+        );
+
+        Ok(())
+    }
+
     /// Dry-run a spend and report whether it would succeed, without mutating state.
     ///
     /// Reuses the identical validation sequence from `can_spend`.  Because this
@@ -5876,6 +6072,8 @@ mod integration_tests;
 mod test;
 #[cfg(test)]
 mod fuzz_tests;
+#[cfg(test)]
+mod quorum_migration_tests;
 
 #[cfg(test)]
 mod absent_key_tests {
