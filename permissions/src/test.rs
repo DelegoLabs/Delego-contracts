@@ -4,8 +4,8 @@ mod test {
     use crate::{
         validate_relayer_fee, DataKey, PermissionError, PermissionRecord,
         PermissionScopeUpdatedEvent, PermissionStatus, PermissionsContract,
-        PermissionsContractClient, ScopedPermissionConfig, MAX_ABSOLUTE_RELAYER_STROOPS,
-        MAX_RELAYER_FEE_BPS,
+        PermissionsContractClient, ScopedPermissionConfig, SessionKeyConfig,
+        MAX_ABSOLUTE_RELAYER_STROOPS, MAX_RELAYER_FEE_BPS, MAX_SESSION_WINDOW_LEDGERS,
     };
     use soroban_sdk::{
         symbol_short,
@@ -30,6 +30,117 @@ mod test {
             cost.memory_bytes_cost() <= MAX_SPEND_MEMORY_BYTES,
             "spend memory budget exceeded: {}",
             cost.memory_bytes_cost()
+        );
+    }
+
+    #[test]
+    fn test_ephemeral_session_spending_expires_and_cleans_up() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_sequence_number(1_000);
+        let owner = Address::generate(&env);
+        let session_key = Address::generate(&env);
+        let merchant = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        let storage_key = DataKey::EphemeralSession(owner.clone(), session_key.clone());
+
+        client.grant_ephemeral_session(
+            &owner,
+            &SessionKeyConfig {
+                session_key: session_key.clone(),
+                max_spend_per_session: 100,
+                valid_until_ledger: 1_720,
+            },
+        );
+
+        assert!(env.as_contract(&contract_id, || {
+            env.storage().temporary().has(&storage_key)
+        }));
+        assert_eq!(
+            client.try_can_spend(&owner, &session_key, &60, &merchant),
+            Ok(Ok(()))
+        );
+        client.execute_spend(&owner, &session_key, &60, &merchant);
+        assert_cost_within_thresholds(&env);
+
+        env.ledger().set_sequence_number(1_720);
+        assert_eq!(
+            client.try_can_spend(&owner, &session_key, &40, &merchant),
+            Ok(Ok(()))
+        );
+        client.execute_spend(&owner, &session_key, &40, &merchant);
+        assert_eq!(
+            client.try_can_spend(&owner, &session_key, &1, &merchant),
+            Err(Ok(PermissionError::ExceedsTotalLimit))
+        );
+        assert_eq!(
+            client.try_execute_spend(&owner, &session_key, &1, &merchant),
+            Err(Ok(PermissionError::ExceedsTotalLimit))
+        );
+
+        env.ledger().set_sequence_number(1_721);
+        assert_eq!(
+            client.try_can_spend(&owner, &session_key, &1, &merchant),
+            Err(Ok(PermissionError::Expired))
+        );
+        assert_eq!(
+            client.try_execute_spend(&owner, &session_key, &1, &merchant),
+            Err(Ok(PermissionError::Expired))
+        );
+
+        env.ledger().set_sequence_number(1_722);
+        assert!(!env.as_contract(&contract_id, || {
+            env.storage().temporary().has(&storage_key)
+        }));
+        assert_eq!(
+            client.try_can_spend(&owner, &session_key, &1, &merchant),
+            Err(Ok(PermissionError::PermissionNotFound))
+        );
+    }
+
+    #[test]
+    fn test_ephemeral_session_grant_rejects_invalid_window_and_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_sequence_number(100);
+        let owner = Address::generate(&env);
+        let session_key = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        assert_eq!(
+            client.try_grant_ephemeral_session(
+                &owner,
+                &SessionKeyConfig {
+                    session_key: session_key.clone(),
+                    max_spend_per_session: 1,
+                    valid_until_ledger: 99,
+                },
+            ),
+            Err(Ok(PermissionError::Expired))
+        );
+        assert_eq!(
+            client.try_grant_ephemeral_session(
+                &owner,
+                &SessionKeyConfig {
+                    session_key: session_key.clone(),
+                    max_spend_per_session: 1,
+                    valid_until_ledger: 100 + MAX_SESSION_WINDOW_LEDGERS + 1,
+                },
+            ),
+            Err(Ok(PermissionError::InvalidParam))
+        );
+        assert_eq!(
+            client.try_grant_ephemeral_session(
+                &owner,
+                &SessionKeyConfig {
+                    session_key,
+                    max_spend_per_session: 0,
+                    valid_until_ledger: 100,
+                },
+            ),
+            Err(Ok(PermissionError::InvalidParam))
         );
     }
 

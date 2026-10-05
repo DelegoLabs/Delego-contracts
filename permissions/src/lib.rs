@@ -96,6 +96,8 @@ pub const MAX_VELOCITY_INTERVAL_SECS: u64 = 31_536_000;
 /// Upper bound on the rolling spend window, in ledgers (~one year), mirroring
 /// `MAX_VELOCITY_INTERVAL` (issue #368).
 pub const MAX_ROLLING_WINDOW_LEDGERS: u32 = 6_307_200;
+/// Maximum lifetime for an ephemeral session key (about one hour at five seconds per ledger).
+pub const MAX_SESSION_WINDOW_LEDGERS: u32 = 720;
 /// Default allowance-decrease timelock in seconds (24 hours).
 pub const DEFAULT_DECREASE_TIMELOCK_SECS: u64 = 86_400;
 /// Maximum configurable allowance-decrease timelock (30 days).
@@ -385,6 +387,23 @@ pub enum PermissionStatus {
 pub struct ActiveWindow {
     pub not_before_ledger: u32,
     pub not_after_ledger: u32,
+}
+
+/// Spend limit and inclusive ledger expiry for an ephemeral delegated session key.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct SessionKeyConfig {
+    pub session_key: Address,
+    pub max_spend_per_session: i128,
+    pub valid_until_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EphemeralSessionState {
+    config: SessionKeyConfig,
+    spent: i128,
 }
 
 #[contracttype]
@@ -1247,6 +1266,8 @@ pub struct ChildPermission {
 #[contracttype]
 pub enum DataKey {
     Permission(Address, Address),
+    /// Temporary session-key authorization and spend state for an owner/key pair.
+    EphemeralSession(Address, Address),
     PendingDecrement(Address, Address),
     PauseMetadata(Address, Address),
     Admin,
@@ -1377,6 +1398,72 @@ impl PermissionsContract {
             false,
             None,
         )
+    }
+
+    /// Grants a session key a temporary, aggregate spend allowance.
+    ///
+    /// The record is stored only in temporary storage and expires after the
+    /// configured inclusive ledger boundary. Lifetimes are capped at
+    /// [`MAX_SESSION_WINDOW_LEDGERS`].
+    pub fn grant_ephemeral_session(
+        env: Env,
+        owner: Address,
+        config: SessionKeyConfig,
+    ) -> Result<(), PermissionError> {
+        owner.require_auth();
+
+        if owner == config.session_key || config.max_spend_per_session <= 0 {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        if config.valid_until_ledger < current_ledger {
+            return Err(PermissionError::Expired);
+        }
+        let duration = config.valid_until_ledger - current_ledger;
+        if duration > MAX_SESSION_WINDOW_LEDGERS {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        if let Some(state) = env
+            .storage()
+            .instance()
+            .get::<DataKey, PermissionPauseState>(&DataKey::GrantPauseState)
+        {
+            if state.grants_paused {
+                return Err(PermissionError::GrantsPaused);
+            }
+        }
+
+        let key = DataKey::EphemeralSession(owner.clone(), config.session_key.clone());
+        if env.storage().persistent().has(&DataKey::Permission(
+            owner.clone(),
+            config.session_key.clone(),
+        ))
+            || env.storage().temporary().has(&key)
+        {
+            return Err(PermissionError::AlreadyGranted);
+        }
+
+        let ttl_ledgers = duration
+            .checked_add(1)
+            .ok_or(PermissionError::InvalidExpiry)?;
+        current_ledger
+            .checked_add(ttl_ledgers)
+            .ok_or(PermissionError::InvalidExpiry)?;
+
+        env.storage().temporary().set(
+            &key,
+            &EphemeralSessionState {
+                config,
+                spent: 0,
+            },
+        );
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, ttl_ledgers, ttl_ledgers);
+
+        Ok(())
     }
 
     /// Returns the number of attestations currently recorded for `merchant_id`.
@@ -1694,6 +1781,14 @@ impl PermissionsContract {
         scope: Option<ScopedPermissionConfig>,
     ) -> Result<(), PermissionError> {
         owner.require_auth();
+
+        if env
+            .storage()
+            .temporary()
+            .has(&DataKey::EphemeralSession(owner.clone(), delegate.clone()))
+        {
+            return Err(PermissionError::AlreadyGranted);
+        }
 
         // Issue #186: block new grants when globally paused
         if let Some(state) = env
@@ -2698,6 +2793,29 @@ impl PermissionsContract {
         target_contract: Option<Address>,
         invoked_function: Option<Symbol>,
     ) -> Result<(), PermissionError> {
+        let session_key = DataKey::EphemeralSession(owner.clone(), delegate.clone());
+        if let Some(session) = env
+            .storage()
+            .temporary()
+            .get::<_, EphemeralSessionState>(&session_key)
+        {
+            let current_ledger = env.ledger().sequence();
+            if current_ledger > session.config.valid_until_ledger {
+                return Err(PermissionError::Expired);
+            }
+            if amount <= 0 {
+                return Err(PermissionError::InvalidParam);
+            }
+            let next_spent = session
+                .spent
+                .checked_add(amount)
+                .ok_or(PermissionError::ExceedsTotalLimit)?;
+            if next_spent > session.config.max_spend_per_session {
+                return Err(PermissionError::ExceedsTotalLimit);
+            }
+            return Ok(());
+        }
+
         let key = DataKey::Permission(owner.clone(), delegate.clone());
         let record: PermissionRecord = match env.storage().persistent().get(&key) {
             Some(r) => r,
@@ -3246,15 +3364,20 @@ impl PermissionsContract {
             invoked_function,
         )?;
 
-        // #54: Velocity check — reject if min_spend_interval has not yet elapsed
-        // since the last recorded spend ledger for this (owner, delegate) pair.
-        Self::check_velocity(&env, &owner, &delegate)?;
+        let result = match Self::apply_ephemeral_session_spend(&env, &owner, &delegate, amount)? {
+            Some(result) => result,
+            None => {
+                // #54: Velocity check — reject if min_spend_interval has not yet elapsed
+                // since the last recorded spend ledger for this (owner, delegate) pair.
+                Self::check_velocity(&env, &owner, &delegate)?;
 
-        // #368: Rolling-window cap — reject if this spend would push the
-        // pair's cumulative spend within the current window past the cap.
-        Self::check_rolling_window(&env, &owner, &delegate, amount)?;
+                // #368: Rolling-window cap — reject if this spend would push the
+                // pair's cumulative spend within the current window past the cap.
+                Self::check_rolling_window(&env, &owner, &delegate, amount)?;
 
-        let result = Self::apply_spend(&env, &owner, &delegate, amount)?;
+                Self::apply_spend(&env, &owner, &delegate, amount)?
+            }
+        };
 
         // Emit after successful spend only (issue #99).
         env.events().publish(
@@ -3269,6 +3392,46 @@ impl PermissionsContract {
         );
 
         Ok(())
+    }
+
+    /// Applies session spending without creating persistent accounting state.
+    fn apply_ephemeral_session_spend(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+        amount: i128,
+    ) -> Result<Option<SpendExecutionResult>, PermissionError> {
+        let key = DataKey::EphemeralSession(owner.clone(), delegate.clone());
+        let Some(mut session) = env
+            .storage()
+            .temporary()
+            .get::<_, EphemeralSessionState>(&key)
+        else {
+            return Ok(None);
+        };
+
+        let current_ledger = env.ledger().sequence();
+        if current_ledger > session.config.valid_until_ledger {
+            return Err(PermissionError::Expired);
+        }
+        if amount <= 0 {
+            return Err(PermissionError::InvalidParam);
+        }
+        let next_spent = session
+            .spent
+            .checked_add(amount)
+            .ok_or(PermissionError::ExceedsTotalLimit)?;
+        if next_spent > session.config.max_spend_per_session {
+            return Err(PermissionError::ExceedsTotalLimit);
+        }
+
+        session.spent = next_spent;
+        env.storage().temporary().set(&key, &session);
+
+        Ok(Some(SpendExecutionResult {
+            remaining_allowance: session.config.max_spend_per_session - next_spent,
+            new_spend_ledger: current_ledger,
+        }))
     }
 
     /// Shared helper that applies a validated spend to the child permission
