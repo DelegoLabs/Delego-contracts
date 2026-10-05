@@ -100,6 +100,32 @@ will reject the change.
 ### Unreleased
 
 - Add `invalidate_nonce_range` entrypoint to bulk-invalidate all relayer nonces up to and including a given nonce for a compromised agent key recovery flow (issue #335). Owner-authorized; emits `NonceBatchInvalidatedEvent` and writes an audit log entry.
+- Added an asynchronous multi-signature spend approval queue (issue #377).
+  `execute_spend_multi` requires every co-signer to sign in one transaction, so
+  an enterprise approval that takes hours is impossible to submit. The new
+  `propose_spend` / `approve_spend_proposal` pair splits the same quorum across
+  time instead: the delegate queues a `PendingSpendProposal`, each registered
+  owner co-signs in a transaction of its own, and the spend settles
+  automatically inside the approval that reaches the grant's `threshold` —
+  no separate execution step, and the existing `MultiOwnerSpendEvent` is
+  emitted so indexers need no new path. The co-signing window is the new
+  `SPEND_PROPOSAL_TTL_LEDGERS` (17,280 ledgers, ~24 hours), and each delegate
+  may hold at most `MAX_PENDING_SPEND_PROPOSALS` (5) live proposals. The grant
+  is re-validated at every co-signature, so a proposal queued before the grant
+  was paused, expired, re-whitelisted or partly drained by other spends cannot
+  settle through it, and `approvals` only ever holds distinct registered owners
+  so no co-signer can sign twice to manufacture a quorum. `approve_spend_proposal`
+  takes the co-signer as an explicit argument and requires its auth, because
+  `soroban-sdk` exposes no invoker to read the signer from.
+  `cancel_spend_proposal` (delegate or any grant owner) withdraws an unsettled
+  proposal, and `get_spend_proposal` / `get_spend_proposals` expose the queue.
+  New errors: `ProposalNotFound` (2418), `ProposalAlreadyExecuted` (2419),
+  `ProposalExpired` (2420), `ProposalAlreadyApproved` (2421),
+  `NoMultiOwnerGrant` (2422), `AmbiguousMultiOwnerGrant` (2423) and
+  `TooManyPendingProposals` (2424). The queue stores proposals under new
+  `DataKey` slots, so existing grant records are unchanged; the new
+  `("perm", "mgrant")` bookkeeping only adds a delegate→owner index used to
+  resolve which grant a queued spend draws on.
 - Added function-restricted permission grants (issue #369). A new
   `ScopedPermissionConfig { target_contract, allowed_function_symbols }` limits
   a delegation to one contract and an explicit list of entrypoints, so an owner
