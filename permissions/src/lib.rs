@@ -236,6 +236,8 @@ pub enum PermissionError {
     AmbiguousMultiOwnerGrant = 2423,
     /// The delegate already has `MAX_PENDING_SPEND_PROPOSALS` queued spends
     TooManyPendingProposals = 2424,
+    /// Ephemeral session keys cannot use relayer-based spend entrypoints.
+    EphemeralRelayerUnsupported = 2425,
     VerificationGracePeriod = 2421,
 }
 
@@ -297,6 +299,7 @@ mod error_code_tests {
         PermissionError::NoMultiOwnerGrant as u32,
         PermissionError::AmbiguousMultiOwnerGrant as u32,
         PermissionError::TooManyPendingProposals as u32,
+        PermissionError::EphemeralRelayerUnsupported as u32,
     ];
 
     #[test]
@@ -3434,6 +3437,27 @@ impl PermissionsContract {
         }))
     }
 
+    /// Keeps relayer entrypoints from applying persistent-grant accounting to
+    /// an ephemeral session, while still enforcing its ledger expiry.
+    fn reject_ephemeral_relayer_spend(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+    ) -> Result<(), PermissionError> {
+        let key = DataKey::EphemeralSession(owner.clone(), delegate.clone());
+        if let Some(session) = env
+            .storage()
+            .temporary()
+            .get::<_, EphemeralSessionState>(&key)
+        {
+            if env.ledger().sequence() > session.config.valid_until_ledger {
+                return Err(PermissionError::Expired);
+            }
+            return Err(PermissionError::EphemeralRelayerUnsupported);
+        }
+        Ok(())
+    }
+
     /// Shared helper that applies a validated spend to the child permission
     /// record and then walks the parent chain, decrementing each ancestor's
     /// allowance by the same `amount` (issue #55 / #332).
@@ -3943,6 +3967,8 @@ impl PermissionsContract {
     ) -> Result<(), PermissionError> {
         relayer.require_auth();
 
+        Self::reject_ephemeral_relayer_spend(&env, &owner, &delegate)?;
+
         if env.ledger().sequence() >= expiration_ledger {
             return Err(PermissionError::SignatureExpired);
         }
@@ -4058,6 +4084,8 @@ impl PermissionsContract {
         epoch: u32,
     ) -> Result<(), PermissionError> {
         relayer.require_auth();
+
+        Self::reject_ephemeral_relayer_spend(&env, &owner, &delegate)?;
 
         if env.ledger().sequence() >= expiration_ledger {
             return Err(PermissionError::SignatureExpired);

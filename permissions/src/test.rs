@@ -64,6 +64,23 @@ mod test {
         client.execute_spend(&owner, &session_key, &60, &merchant);
         assert_cost_within_thresholds(&env);
 
+        let relayer = Address::generate(&env);
+        let signature = BytesN::<64>::from_array(&env, &[0; 64]);
+        assert_eq!(
+            client.try_execute_spend_via_relayer(
+                &relayer,
+                &owner,
+                &session_key,
+                &1,
+                &merchant,
+                &0,
+                &1_100,
+                &0,
+                &signature,
+            ),
+            Err(Ok(PermissionError::EphemeralRelayerUnsupported))
+        );
+
         env.ledger().set_sequence_number(1_720);
         assert_eq!(
             client.try_can_spend(&owner, &session_key, &40, &merchant),
@@ -86,6 +103,20 @@ mod test {
         );
         assert_eq!(
             client.try_execute_spend(&owner, &session_key, &1, &merchant),
+            Err(Ok(PermissionError::Expired))
+        );
+        assert_eq!(
+            client.try_execute_spend_via_relayer(
+                &relayer,
+                &owner,
+                &session_key,
+                &1,
+                &merchant,
+                &0,
+                &1_100,
+                &0,
+                &signature,
+            ),
             Err(Ok(PermissionError::Expired))
         );
 
