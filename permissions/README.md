@@ -12,6 +12,7 @@ pause/resume, and permission transfers.
 | Function | Auth required | Description |
 |---|---|---|
 | `grant` | owner | Grant spending permission to a delegate |
+| `grant_ephemeral_session` | owner | Grant a session key an aggregate spend limit and bounded ledger lifetime |
 | `grant_child` | owner | Grant a nested permission derived from an existing grant |
 | `revoke` | owner | Revoke a delegate's permission |
 | `transfer_permission` | owner | Transfer a permission to another account |
@@ -39,6 +40,15 @@ pause/resume, and permission transfers.
 | `get_audit_log_page` | — | Read up to 20 retained audit entries using a zero-based cursor |
 | `recheck_merchant_verification` | — | Dynamic check whether a merchant meets the current verification policy |
 | `revalidate_merchant_status` | any | Re-evaluate a merchant against the current policy, applying the grace period |
+
+## Ephemeral delegated sessions
+
+`grant_ephemeral_session(owner, SessionKeyConfig)` authorizes `session_key` to
+spend up to `max_spend_per_session` while the current ledger sequence is less
+than or equal to `valid_until_ledger`. The configured window can span at most
+720 ledger advances. The session configuration and aggregate spend counter use
+temporary storage; Soroban removes them automatically after the expiry window,
+without a persistent cleanup record or explicit revocation.
 
 ## Events
 

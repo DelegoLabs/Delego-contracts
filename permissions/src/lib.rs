@@ -96,6 +96,8 @@ pub const MAX_VELOCITY_INTERVAL_SECS: u64 = 31_536_000;
 /// Upper bound on the rolling spend window, in ledgers (~one year), mirroring
 /// `MAX_VELOCITY_INTERVAL` (issue #368).
 pub const MAX_ROLLING_WINDOW_LEDGERS: u32 = 6_307_200;
+/// Maximum lifetime for an ephemeral session key (about one hour at five seconds per ledger).
+pub const MAX_SESSION_WINDOW_LEDGERS: u32 = 720;
 /// Default allowance-decrease timelock in seconds (24 hours).
 pub const DEFAULT_DECREASE_TIMELOCK_SECS: u64 = 86_400;
 /// Maximum configurable allowance-decrease timelock (30 days).
@@ -111,6 +113,15 @@ pub const PRUNE_EXPIRATION_THRESHOLD_LEDGERS: u32 = 100_000;
 /// Maximum depth of a parent-delegation hierarchy. A child permission's
 /// `depth_level` must be strictly less than this value to be created.
 pub const MAX_HIERARCHY_DEPTH: u32 = 3;
+
+/// Window, in ledgers, granted to a multi-owner grant's co-signers to approve a
+/// queued spend: 17,280 ledgers is ~24 hours at a 5 s average close time
+/// (issue #377).
+pub const SPEND_PROPOSAL_TTL_LEDGERS: u32 = 17_280;
+/// Maximum number of queued spend proposals a single delegate may keep open at
+/// once (issue #377). Bounds the per-delegate queue index and stops a delegate
+/// from parking a backlog it has no way to settle.
+pub const MAX_PENDING_SPEND_PROPOSALS: u32 = 5;
 
 /// Default grace period (in seconds) granted to merchants verified under an
 /// older verification policy when the required attestation count increases.
@@ -209,6 +220,24 @@ pub enum PermissionError {
     VerificationBelowPolicy = 2420,
     /// Merchant's verification is below the currently required policy
     /// threshold but still within the grace period.
+    VerificationGracePeriod = 2415,
+    /// No queued spend proposal exists for the supplied proposal id (issue #377)
+    ProposalNotFound = 2418,
+    /// The queued spend proposal already settled and cannot be acted on again
+    ProposalAlreadyExecuted = 2419,
+    /// The queued spend proposal's 24-hour co-signing window has closed
+    ProposalExpired = 2420,
+    /// This owner has already co-signed the queued spend proposal
+    ProposalAlreadyApproved = 2421,
+    /// The delegate holds no multi-owner (quorum) grant to queue a spend against
+    NoMultiOwnerGrant = 2422,
+    /// The delegate holds more than one multi-owner grant, so a queued spend
+    /// could not be attributed to a single quorum
+    AmbiguousMultiOwnerGrant = 2423,
+    /// The delegate already has `MAX_PENDING_SPEND_PROPOSALS` queued spends
+    TooManyPendingProposals = 2424,
+    /// Ephemeral session keys cannot use relayer-based spend entrypoints.
+    EphemeralRelayerUnsupported = 2425,
     VerificationGracePeriod = 2421,
 }
 
@@ -263,6 +292,14 @@ mod error_code_tests {
         PermissionError::MaxHierarchyDepthExceeded as u32,
         PermissionError::VerificationBelowPolicy as u32,
         PermissionError::VerificationGracePeriod as u32,
+        PermissionError::ProposalNotFound as u32,
+        PermissionError::ProposalAlreadyExecuted as u32,
+        PermissionError::ProposalExpired as u32,
+        PermissionError::ProposalAlreadyApproved as u32,
+        PermissionError::NoMultiOwnerGrant as u32,
+        PermissionError::AmbiguousMultiOwnerGrant as u32,
+        PermissionError::TooManyPendingProposals as u32,
+        PermissionError::EphemeralRelayerUnsupported as u32,
     ];
 
     #[test]
@@ -350,6 +387,23 @@ pub enum PermissionStatus {
 pub struct ActiveWindow {
     pub not_before_ledger: u32,
     pub not_after_ledger: u32,
+}
+
+/// Spend limit and inclusive ledger expiry for an ephemeral delegated session key.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct SessionKeyConfig {
+    pub session_key: Address,
+    pub max_spend_per_session: i128,
+    pub valid_until_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EphemeralSessionState {
+    config: SessionKeyConfig,
+    spent: i128,
 }
 
 #[contracttype]
@@ -551,6 +605,76 @@ pub struct QuorumThresholdMigratedEvent {
     pub new_owner_count: u32,
     /// Distinct current owners that authorized the migration.
     pub endorser_count: u32,
+}
+
+/// A spend queued by a delegate for asynchronous co-signing by the owners of a
+/// multi-owner (quorum) grant (issue #377).
+///
+/// Enterprise co-signers are rarely online at the same time, so `propose_spend`
+/// parks the spend for `SPEND_PROPOSAL_TTL_LEDGERS` (~24 hours) and each
+/// co-signer adds one approval in a transaction of its own. The spend settles
+/// automatically inside the approval that reaches the grant's `threshold`,
+/// provided that happens before `expires_at_ledger`.
+///
+/// `approvals` only ever holds distinct registered owners, so a co-signer can
+/// neither sign twice nor pad a transaction with repeats to reach quorum.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct PendingSpendProposal {
+    pub proposal_id: u64,
+    pub recipient: Address,
+    pub amount: i128,
+    pub approvals: Vec<Address>,
+    pub expires_at_ledger: u32,
+    pub is_executed: bool,
+    /// Primary owner (`owners[0]`) of the grant this spend draws on.
+    pub primary_owner: Address,
+    /// The delegate that queued the spend.
+    pub delegate: Address,
+    /// Owner signatures required before the spend settles (the grant's
+    /// `threshold`).
+    pub threshold: u32,
+    /// Ledger timestamp at which the spend was queued.
+    pub proposed_at: u64,
+}
+
+/// Emitted when a delegate queues a spend for asynchronous co-signing
+/// (issue #377).
+#[contracttype]
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct SpendProposedEvent {
+    pub proposal_id: u64,
+    pub delegate: Address,
+    pub primary_owner: Address,
+    pub recipient: Address,
+    pub amount: i128,
+    pub threshold: u32,
+    pub expires_at_ledger: u32,
+}
+
+/// Emitted when an owner co-signs a queued spend, including the approval that
+/// carries the proposal over the quorum and settles it (issue #377).
+#[contracttype]
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct SpendProposalApprovedEvent {
+    pub proposal_id: u64,
+    pub approver: Address,
+    pub approval_count: u32,
+    pub threshold: u32,
+    pub executed: bool,
+}
+
+/// Emitted when a queued spend is withdrawn before it reaches quorum
+/// (issue #377).
+#[contracttype]
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct SpendProposalCancelledEvent {
+    pub proposal_id: u64,
+    pub cancelled_by: Address,
 }
 
 /// Emitted when an admin registers a new approved metadata schema (issue #328).
@@ -1202,6 +1326,8 @@ pub struct ChildPermission {
 #[contracttype]
 pub enum DataKey {
     Permission(Address, Address),
+    /// Temporary session-key authorization and spend state for an owner/key pair.
+    EphemeralSession(Address, Address),
     PendingDecrement(Address, Address),
     PauseMetadata(Address, Address),
     Admin,
@@ -1220,6 +1346,15 @@ pub enum DataKey {
     UsageStats(Address, Address),
     /// Multi-owner permission, keyed by (owners[0], delegate).
     MultiPermission(Address, Address),
+    /// Index of primary owners that co-signed a multi-owner grant for a given
+    /// delegate, keyed by that delegate (issue #377).
+    DelegateMultiGrants(Address),
+    /// Monotonic id source for queued spend proposals (issue #377).
+    SpendProposalCounter,
+    /// A queued spend awaiting asynchronous co-signing (issue #377).
+    SpendProposal(u64),
+    /// Queued spend proposal ids for one delegate, oldest first (issue #377).
+    DelegateSpendProposals(Address),
     /// Instance-level list of approved `PermissionMetadata.schema` identifiers.
     SchemaRegistry,
     /// List of child delegates granted under a (owner, delegate) pair via `grant_child`.
@@ -1323,6 +1458,72 @@ impl PermissionsContract {
             false,
             None,
         )
+    }
+
+    /// Grants a session key a temporary, aggregate spend allowance.
+    ///
+    /// The record is stored only in temporary storage and expires after the
+    /// configured inclusive ledger boundary. Lifetimes are capped at
+    /// [`MAX_SESSION_WINDOW_LEDGERS`].
+    pub fn grant_ephemeral_session(
+        env: Env,
+        owner: Address,
+        config: SessionKeyConfig,
+    ) -> Result<(), PermissionError> {
+        owner.require_auth();
+
+        if owner == config.session_key || config.max_spend_per_session <= 0 {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        if config.valid_until_ledger < current_ledger {
+            return Err(PermissionError::Expired);
+        }
+        let duration = config.valid_until_ledger - current_ledger;
+        if duration > MAX_SESSION_WINDOW_LEDGERS {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        if let Some(state) = env
+            .storage()
+            .instance()
+            .get::<DataKey, PermissionPauseState>(&DataKey::GrantPauseState)
+        {
+            if state.grants_paused {
+                return Err(PermissionError::GrantsPaused);
+            }
+        }
+
+        let key = DataKey::EphemeralSession(owner.clone(), config.session_key.clone());
+        if env.storage().persistent().has(&DataKey::Permission(
+            owner.clone(),
+            config.session_key.clone(),
+        ))
+            || env.storage().temporary().has(&key)
+        {
+            return Err(PermissionError::AlreadyGranted);
+        }
+
+        let ttl_ledgers = duration
+            .checked_add(1)
+            .ok_or(PermissionError::InvalidExpiry)?;
+        current_ledger
+            .checked_add(ttl_ledgers)
+            .ok_or(PermissionError::InvalidExpiry)?;
+
+        env.storage().temporary().set(
+            &key,
+            &EphemeralSessionState {
+                config,
+                spent: 0,
+            },
+        );
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, ttl_ledgers, ttl_ledgers);
+
+        Ok(())
     }
 
     /// Returns the number of attestations currently recorded for `merchant_id`.
@@ -1635,6 +1836,14 @@ impl PermissionsContract {
         scope: Option<ScopedPermissionConfig>,
     ) -> Result<(), PermissionError> {
         owner.require_auth();
+
+        if env
+            .storage()
+            .temporary()
+            .has(&DataKey::EphemeralSession(owner.clone(), delegate.clone()))
+        {
+            return Err(PermissionError::AlreadyGranted);
+        }
 
         // Issue #186: block new grants when globally paused
         if let Some(state) = env
@@ -2659,6 +2868,29 @@ impl PermissionsContract {
         target_contract: Option<Address>,
         invoked_function: Option<Symbol>,
     ) -> Result<(), PermissionError> {
+        let session_key = DataKey::EphemeralSession(owner.clone(), delegate.clone());
+        if let Some(session) = env
+            .storage()
+            .temporary()
+            .get::<_, EphemeralSessionState>(&session_key)
+        {
+            let current_ledger = env.ledger().sequence();
+            if current_ledger > session.config.valid_until_ledger {
+                return Err(PermissionError::Expired);
+            }
+            if amount <= 0 {
+                return Err(PermissionError::InvalidParam);
+            }
+            let next_spent = session
+                .spent
+                .checked_add(amount)
+                .ok_or(PermissionError::ExceedsTotalLimit)?;
+            if next_spent > session.config.max_spend_per_session {
+                return Err(PermissionError::ExceedsTotalLimit);
+            }
+            return Ok(());
+        }
+
         let key = DataKey::Permission(owner.clone(), delegate.clone());
         let record: PermissionRecord = match env.storage().persistent().get(&key) {
             Some(r) => r,
@@ -3211,15 +3443,20 @@ impl PermissionsContract {
             invoked_function,
         )?;
 
-        // #54: Velocity check — reject if min_spend_interval has not yet elapsed
-        // since the last recorded spend ledger for this (owner, delegate) pair.
-        Self::check_velocity(&env, &owner, &delegate)?;
+        let result = match Self::apply_ephemeral_session_spend(&env, &owner, &delegate, amount)? {
+            Some(result) => result,
+            None => {
+                // #54: Velocity check — reject if min_spend_interval has not yet elapsed
+                // since the last recorded spend ledger for this (owner, delegate) pair.
+                Self::check_velocity(&env, &owner, &delegate)?;
 
-        // #368: Rolling-window cap — reject if this spend would push the
-        // pair's cumulative spend within the current window past the cap.
-        Self::check_rolling_window(&env, &owner, &delegate, amount)?;
+                // #368: Rolling-window cap — reject if this spend would push the
+                // pair's cumulative spend within the current window past the cap.
+                Self::check_rolling_window(&env, &owner, &delegate, amount)?;
 
-        let result = Self::apply_spend(&env, &owner, &delegate, amount)?;
+                Self::apply_spend(&env, &owner, &delegate, amount)?
+            }
+        };
 
         // Emit after successful spend only (issue #99).
         env.events().publish(
@@ -3237,6 +3474,67 @@ impl PermissionsContract {
             },
         );
 
+        Ok(())
+    }
+
+    /// Applies session spending without creating persistent accounting state.
+    fn apply_ephemeral_session_spend(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+        amount: i128,
+    ) -> Result<Option<SpendExecutionResult>, PermissionError> {
+        let key = DataKey::EphemeralSession(owner.clone(), delegate.clone());
+        let Some(mut session) = env
+            .storage()
+            .temporary()
+            .get::<_, EphemeralSessionState>(&key)
+        else {
+            return Ok(None);
+        };
+
+        let current_ledger = env.ledger().sequence();
+        if current_ledger > session.config.valid_until_ledger {
+            return Err(PermissionError::Expired);
+        }
+        if amount <= 0 {
+            return Err(PermissionError::InvalidParam);
+        }
+        let next_spent = session
+            .spent
+            .checked_add(amount)
+            .ok_or(PermissionError::ExceedsTotalLimit)?;
+        if next_spent > session.config.max_spend_per_session {
+            return Err(PermissionError::ExceedsTotalLimit);
+        }
+
+        session.spent = next_spent;
+        env.storage().temporary().set(&key, &session);
+
+        Ok(Some(SpendExecutionResult {
+            remaining_allowance: session.config.max_spend_per_session - next_spent,
+            new_spend_ledger: current_ledger,
+        }))
+    }
+
+    /// Keeps relayer entrypoints from applying persistent-grant accounting to
+    /// an ephemeral session, while still enforcing its ledger expiry.
+    fn reject_ephemeral_relayer_spend(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+    ) -> Result<(), PermissionError> {
+        let key = DataKey::EphemeralSession(owner.clone(), delegate.clone());
+        if let Some(session) = env
+            .storage()
+            .temporary()
+            .get::<_, EphemeralSessionState>(&key)
+        {
+            if env.ledger().sequence() > session.config.valid_until_ledger {
+                return Err(PermissionError::Expired);
+            }
+            return Err(PermissionError::EphemeralRelayerUnsupported);
+        }
         Ok(())
     }
 
@@ -3756,6 +4054,8 @@ impl PermissionsContract {
     ) -> Result<(), PermissionError> {
         relayer.require_auth();
 
+        Self::reject_ephemeral_relayer_spend(&env, &owner, &delegate)?;
+
         if env.ledger().sequence() >= expiration_ledger {
             return Err(PermissionError::SignatureExpired);
         }
@@ -3874,6 +4174,8 @@ impl PermissionsContract {
         epoch: u32,
     ) -> Result<(), PermissionError> {
         relayer.require_auth();
+
+        Self::reject_ephemeral_relayer_spend(&env, &owner, &delegate)?;
 
         if env.ledger().sequence() >= expiration_ledger {
             return Err(PermissionError::SignatureExpired);
@@ -4041,6 +4343,14 @@ impl PermissionsContract {
             &record,
         );
 
+        // Index the grant by delegate so a queued spend can resolve the one
+        // grant — and therefore the one quorum — it draws on (issue #377).
+        Self::add_to_address_index(
+            &env,
+            &DataKey::DelegateMultiGrants(delegate.clone()),
+            &primary_owner,
+        );
+
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("mgrant")),
             MultiOwnerGrantedEvent {
@@ -4186,6 +4496,487 @@ impl PermissionsContract {
         );
 
         Ok(())
+    }
+
+    /// Queues `amount` for `recipient` against the delegate's multi-owner
+    /// (quorum) grant and returns the new proposal id (issue #377).
+    ///
+    /// Enterprise co-signers cannot always sign at the same moment, so the
+    /// spend is parked for `SPEND_PROPOSAL_TTL_LEDGERS` (~24 hours) and settled
+    /// automatically by `approve_spend_proposal` once `threshold` owners have
+    /// co-signed. The delegate authenticates here but contributes no approval:
+    /// self-delegation is refused by `grant_multi_owner`, so the delegate is
+    /// never one of the grant's owners.
+    ///
+    /// The grant must authorize the spend exactly as a synchronous multi-owner
+    /// spend would — the whitelist is enforced against `recipient`, which is
+    /// the spend's merchant — and the same rolling-window cap is applied as a
+    /// pre-flight so a proposal that could not settle now is rejected early.
+    ///
+    /// # Errors
+    /// - [`PermissionError::InvalidParam`] when `amount` is not positive.
+    /// - [`PermissionError::NoMultiOwnerGrant`] when the delegate holds no
+    ///   multi-owner grant.
+    /// - [`PermissionError::AmbiguousMultiOwnerGrant`] when the delegate holds
+    ///   more than one multi-owner grant, so the quorum to apply is unclear.
+    /// - [`PermissionError::PermissionNotFound`], `PermissionPaused`,
+    ///   `Expired`, `ExceedsPerTxLimit`, `ExceedsTotalLimit` or
+    ///   `MerchantNotAllowed` when the grant would not authorize this spend.
+    /// - [`PermissionError::VelocityLimitExceeded`] when the rolling-window cap
+    ///   would already be exceeded.
+    /// - [`PermissionError::TooManyPendingProposals`] when the delegate already
+    ///   has `MAX_PENDING_SPEND_PROPOSALS` live queued spends.
+    pub fn propose_spend(
+        env: Env,
+        delegate: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<u64, PermissionError> {
+        delegate.require_auth();
+        if amount <= 0 {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        let grant = Self::resolve_multi_owner_grant(&env, &delegate)?;
+        let primary_owner = grant.owners.get(0).unwrap();
+        Self::check_multi_owner_spend(&env, &grant, amount, &recipient)?;
+        Self::check_rolling_window(&env, &primary_owner, &delegate, amount)?;
+
+        // Drop whatever is no longer co-signable before counting, so an
+        // expired or settled proposal never consumes a slot.
+        let mut queued = Self::reap_spend_proposals(&env, &delegate);
+        if queued.len() >= MAX_PENDING_SPEND_PROPOSALS {
+            return Err(PermissionError::TooManyPendingProposals);
+        }
+
+        let proposal_id = env
+            .storage()
+            .instance()
+            .get(&DataKey::SpendProposalCounter)
+            .unwrap_or(0u64)
+            .checked_add(1)
+            .ok_or(PermissionError::InvalidParam)?;
+        let proposal = PendingSpendProposal {
+            proposal_id,
+            recipient: recipient.clone(),
+            amount,
+            approvals: Vec::new(&env),
+            expires_at_ledger: compute_expiry_ledger(
+                env.ledger().sequence(),
+                SPEND_PROPOSAL_TTL_LEDGERS,
+            )?,
+            is_executed: false,
+            primary_owner: primary_owner.clone(),
+            delegate: delegate.clone(),
+            threshold: grant.threshold,
+            proposed_at: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SpendProposal(proposal_id), &proposal);
+        queued.push_back(proposal_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegateSpendProposals(delegate.clone()), &queued);
+        env.storage()
+            .instance()
+            .set(&DataKey::SpendProposalCounter, &proposal_id);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("sprop"), proposal_id),
+            SpendProposedEvent {
+                proposal_id,
+                delegate,
+                primary_owner,
+                recipient,
+                amount,
+                threshold: grant.threshold,
+                expires_at_ledger: proposal.expires_at_ledger,
+            },
+        );
+
+        Ok(proposal_id)
+    }
+
+    /// Records `owner`'s co-signature on a queued spend and settles it as soon
+    /// as the grant's quorum is reached (issue #377).
+    ///
+    /// `owner` must be one of the grant's registered owners and must
+    /// authenticate this invocation. The SDK exposes no invoker to read the
+    /// signer from, so — like every other entry point in this contract — the
+    /// co-signer is passed explicitly and its authorization is required here.
+    /// A duplicate signature is rejected rather than counted twice, so
+    /// re-submitting one owner can never make up a quorum.
+    ///
+    /// The spend settles inside the approval that reaches `threshold`: the
+    /// grant's allowance is debited and [`MultiOwnerSpendEvent`] is emitted. A
+    /// proposal can sit in the queue for a full day, so the grant is
+    /// re-validated against its *current* state first — a spend queued before
+    /// the grant was paused, revoked, expired, whitelisted differently, or
+    /// partly drained by other spends cannot settle through it.
+    ///
+    /// # Errors
+    /// - [`PermissionError::ProposalNotFound`] for an unknown `proposal_id`.
+    /// - [`PermissionError::ProposalAlreadyExecuted`] once it has settled.
+    /// - [`PermissionError::ProposalExpired`] once the 24-hour window closed.
+    /// - [`PermissionError::PermissionNotFound`] if the backing grant is gone.
+    /// - [`PermissionError::Unauthorized`] if `owner` is not a grant owner.
+    /// - [`PermissionError::ProposalAlreadyApproved`] on a second signature.
+    /// - the grant policy errors listed on `propose_spend` when the queued spend
+    ///   no longer fits the grant, in which case no approval is recorded.
+    pub fn approve_spend_proposal(
+        env: Env,
+        proposal_id: u64,
+        owner: Address,
+    ) -> Result<(), PermissionError> {
+        owner.require_auth();
+
+        let proposal_key = DataKey::SpendProposal(proposal_id);
+        let mut proposal: PendingSpendProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .ok_or(PermissionError::ProposalNotFound)?;
+        if proposal.is_executed {
+            return Err(PermissionError::ProposalAlreadyExecuted);
+        }
+        if env.ledger().sequence() >= proposal.expires_at_ledger {
+            return Err(PermissionError::ProposalExpired);
+        }
+
+        let grant_key =
+            DataKey::MultiPermission(proposal.primary_owner.clone(), proposal.delegate.clone());
+        let grant: MultiOwnerPermission = env
+            .storage()
+            .persistent()
+            .get(&grant_key)
+            .ok_or(PermissionError::PermissionNotFound)?;
+        if !grant.owners.contains(&owner) {
+            return Err(PermissionError::Unauthorized);
+        }
+        if proposal.approvals.contains(&owner) {
+            return Err(PermissionError::ProposalAlreadyApproved);
+        }
+
+        // Validate before recording anything: an approval that cannot settle
+        // must not be stored, or the queue would accumulate signatures on a
+        // spend that can never execute.
+        Self::check_multi_owner_spend(&env, &grant, proposal.amount, &proposal.recipient)?;
+        Self::check_rolling_window(
+            &env,
+            &proposal.primary_owner,
+            &proposal.delegate,
+            proposal.amount,
+        )?;
+
+        proposal.approvals.push_back(owner.clone());
+        let approval_count = proposal.approvals.len();
+        let reached_quorum = approval_count >= proposal.threshold;
+
+        if reached_quorum {
+            Self::settle_spend_proposal(&env, &grant_key, &mut proposal)?;
+        }
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("sappr"), proposal_id),
+            SpendProposalApprovedEvent {
+                proposal_id,
+                approver: owner,
+                approval_count,
+                threshold: proposal.threshold,
+                executed: reached_quorum,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Withdraws a queued spend before it reaches quorum (issue #377).
+    ///
+    /// Callable by the delegate that queued it, or by any of the grant's
+    /// registered owners so a co-signer can drop a proposal the delegate queued
+    /// in error. The record is deleted rather than flagged, so a cancelled
+    /// spend can never be co-signed afterwards and its storage is released. A
+    /// settled proposal cannot be cancelled.
+    ///
+    /// # Errors
+    /// - [`PermissionError::ProposalNotFound`] for an unknown `proposal_id` —
+    ///   including one already cancelled.
+    /// - [`PermissionError::ProposalAlreadyExecuted`] once it has settled.
+    /// - [`PermissionError::PermissionNotFound`] if the backing grant is gone.
+    /// - [`PermissionError::Unauthorized`] if `caller` is neither the delegate
+    ///   nor a grant owner.
+    pub fn cancel_spend_proposal(
+        env: Env,
+        proposal_id: u64,
+        caller: Address,
+    ) -> Result<(), PermissionError> {
+        caller.require_auth();
+
+        let proposal_key = DataKey::SpendProposal(proposal_id);
+        let proposal: PendingSpendProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .ok_or(PermissionError::ProposalNotFound)?;
+        if proposal.is_executed {
+            return Err(PermissionError::ProposalAlreadyExecuted);
+        }
+
+        if caller != proposal.delegate {
+            let grant: MultiOwnerPermission = env
+                .storage()
+                .persistent()
+                .get(&DataKey::MultiPermission(
+                    proposal.primary_owner.clone(),
+                    proposal.delegate.clone(),
+                ))
+                .ok_or(PermissionError::PermissionNotFound)?;
+            if !grant.owners.contains(&caller) {
+                return Err(PermissionError::Unauthorized);
+            }
+        }
+
+        env.storage().persistent().remove(&proposal_key);
+        Self::deindex_spend_proposal(&env, &proposal.delegate, proposal_id);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("spcncl"), proposal_id),
+            SpendProposalCancelledEvent {
+                proposal_id,
+                cancelled_by: caller,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Read-only getter for one queued spend proposal.
+    ///
+    /// Settled proposals stay queryable for audit; cancelled ones are deleted
+    /// and read back as [`PermissionError::ProposalNotFound`].
+    pub fn get_spend_proposal(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<PendingSpendProposal, PermissionError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SpendProposal(proposal_id))
+            .ok_or(PermissionError::ProposalNotFound)
+    }
+
+    /// Read-only getter listing the spends `delegate` currently has queued for
+    /// co-signing, oldest first. Settled and expired proposals are skipped, so
+    /// the queue only ever reports spends that can still be approved.
+    pub fn get_spend_proposals(
+        env: Env,
+        delegate: Address,
+    ) -> soroban_sdk::Vec<PendingSpendProposal> {
+        let mut proposals = soroban_sdk::Vec::new(&env);
+        for id in Self::live_spend_proposal_ids(&env, &delegate).iter() {
+            if let Some(proposal) = env.storage().persistent().get(&DataKey::SpendProposal(id)) {
+                proposals.push_back(proposal);
+            }
+        }
+        proposals
+    }
+
+    /// Resolves the single multi-owner grant a queued spend draws on.
+    ///
+    /// A proposal inherits the grant's co-signing roster, owner set and
+    /// threshold, so it is only unambiguous when the delegate holds exactly
+    /// one multi-owner grant. Several grants are refused rather than guessed
+    /// at: settling against the wrong one would apply a quorum the delegate
+    /// never agreed to.
+    fn resolve_multi_owner_grant(
+        env: &Env,
+        delegate: &Address,
+    ) -> Result<MultiOwnerPermission, PermissionError> {
+        let primary_owners: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegateMultiGrants(delegate.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        let mut grant: Option<MultiOwnerPermission> = None;
+        for primary_owner in primary_owners.iter() {
+            let key = DataKey::MultiPermission(primary_owner, delegate.clone());
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, MultiOwnerPermission>(&key)
+            {
+                if grant.is_some() {
+                    return Err(PermissionError::AmbiguousMultiOwnerGrant);
+                }
+                grant = Some(record);
+            }
+        }
+
+        grant.ok_or(PermissionError::NoMultiOwnerGrant)
+    }
+
+    /// Validates a queued spend against the grant's live state: the grant must
+    /// be active and unexpired, and the spend must fit the per-transaction and
+    /// total limits and target an approved merchant.
+    ///
+    /// Mirrors the policy half of `can_spend_multi`; the signature count is
+    /// deliberately excluded because the queue accumulates it over time, and
+    /// every call re-reads the grant so a day-old proposal is checked against
+    /// today's limits.
+    fn check_multi_owner_spend(
+        env: &Env,
+        grant: &MultiOwnerPermission,
+        amount: i128,
+        merchant: &Address,
+    ) -> Result<(), PermissionError> {
+        match grant.status {
+            PermissionStatus::Active => {}
+            PermissionStatus::Paused => return Err(PermissionError::PermissionPaused),
+            PermissionStatus::Expired => return Err(PermissionError::Expired),
+            PermissionStatus::Revoked => return Err(PermissionError::Unauthorized),
+        }
+        if env.ledger().sequence() >= grant.expires_at_ledger {
+            return Err(PermissionError::Expired);
+        }
+        if amount > grant.limit_per_tx {
+            return Err(PermissionError::ExceedsPerTxLimit);
+        }
+        if amount > grant.limit_total - grant.spent {
+            return Err(PermissionError::ExceedsTotalLimit);
+        }
+        if !grant.allowed_merchants.is_empty() && !grant.allowed_merchants.contains(merchant) {
+            return Err(PermissionError::MerchantNotAllowed);
+        }
+        Ok(())
+    }
+
+    /// Debits a settled queued spend from its grant's allowance and marks the
+    /// proposal executed.
+    ///
+    /// Called only from the approval that reaches quorum, after
+    /// `check_multi_owner_spend` has re-validated the grant, and emits the same
+    /// `MultiOwnerSpendEvent` as a synchronous multi-owner spend so indexers
+    /// need no separate path for queued spends.
+    fn settle_spend_proposal(
+        env: &Env,
+        grant_key: &DataKey,
+        proposal: &mut PendingSpendProposal,
+    ) -> Result<(), PermissionError> {
+        let mut grant: MultiOwnerPermission = env
+            .storage()
+            .persistent()
+            .get(grant_key)
+            .ok_or(PermissionError::PermissionNotFound)?;
+        grant.spent = grant
+            .spent
+            .checked_add(proposal.amount)
+            .filter(|spent| *spent <= grant.limit_total)
+            .ok_or(PermissionError::ExceedsAllowance)?;
+        env.storage().persistent().set(grant_key, &grant);
+
+        Self::record_rolling_window_spend(
+            env,
+            &proposal.primary_owner,
+            &proposal.delegate,
+            proposal.amount,
+        )?;
+
+        proposal.is_executed = true;
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("mspent")),
+            MultiOwnerSpendEvent {
+                primary_owner: proposal.primary_owner.clone(),
+                delegate: proposal.delegate.clone(),
+                merchant: proposal.recipient.clone(),
+                amount: proposal.amount,
+                remaining: grant.limit_total - grant.spent,
+                signer_count: proposal.approvals.len(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Ids of `delegate`'s queued proposals that are neither settled nor past
+    /// their expiry, in queue order.
+    fn live_spend_proposal_ids(env: &Env, delegate: &Address) -> soroban_sdk::Vec<u64> {
+        let queued: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegateSpendProposals(delegate.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        let now = env.ledger().sequence();
+        let mut live = Vec::new(env);
+        for id in queued.iter() {
+            let is_co_signable = env
+                .storage()
+                .persistent()
+                .get::<DataKey, PendingSpendProposal>(&DataKey::SpendProposal(id))
+                .map(|proposal| !proposal.is_executed && now < proposal.expires_at_ledger)
+                .unwrap_or(false);
+            if is_co_signable {
+                live.push_back(id);
+            }
+        }
+        live
+    }
+
+    /// Drops the index entries that can no longer be co-signed and returns the
+    /// live id list.
+    ///
+    /// Settled proposals keep their record so they stay auditable, but an
+    /// expired one can never settle, so its record and rent are released. Both
+    /// stop counting against `MAX_PENDING_SPEND_PROPOSALS`.
+    fn reap_spend_proposals(env: &Env, delegate: &Address) -> soroban_sdk::Vec<u64> {
+        let index_key = DataKey::DelegateSpendProposals(delegate.clone());
+        let queued: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&index_key)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let now = env.ledger().sequence();
+        let mut live = Vec::new(env);
+        for id in queued.iter() {
+            let proposal_key = DataKey::SpendProposal(id);
+            match env
+                .storage()
+                .persistent()
+                .get::<DataKey, PendingSpendProposal>(&proposal_key)
+            {
+                Some(proposal) if !proposal.is_executed && now < proposal.expires_at_ledger => {
+                    live.push_back(id);
+                }
+                Some(proposal) => {
+                    if !proposal.is_executed {
+                        env.storage().persistent().remove(&proposal_key);
+                    }
+                }
+                None => {}
+            }
+        }
+        env.storage().persistent().set(&index_key, &live);
+
+        live
+    }
+
+    /// Removes `proposal_id` from `delegate`'s queue index.
+    fn deindex_spend_proposal(env: &Env, delegate: &Address, proposal_id: u64) {
+        let index_key = DataKey::DelegateSpendProposals(delegate.clone());
+        let mut queued: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&index_key)
+            .unwrap_or_else(|| Vec::new(env));
+        if let Some(index) = queued.first_index_of(&proposal_id) {
+            queued.remove(index);
+            env.storage().persistent().set(&index_key, &queued);
+        }
     }
 
     /// Read-only getter for a multi-owner permission record.
