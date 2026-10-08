@@ -27,6 +27,7 @@ pause/resume, and permission transfers.
 | `execute_spend_via_relayer` | relayer signature | Gasless spend using a relayer signature + nonce |
 | `grant_multi_owner` | owners | Multi-owner grant (quorum-based authorization) |
 | `can_spend_multi` / `execute_spend_multi` | owners | Quorum checks and spend for multi-owner grants |
+| `migrate_quorum_threshold` | current owners | Reconfigure a multi-owner grant's owners/threshold without resetting spend state |
 | `get_multi_permission` / `preview_spend` | — | Read-only grant and spend previews |
 | `get_permission` / `get_remaining_allowance` / `get_allowance_detail` | — | Read-only allowance and grant views |
 | `increase_allowance` / `decrease_allowance` | owner | Adjust a grant's allowance |
@@ -64,6 +65,50 @@ Events are emitted with the topic prefix `("perm", …)`:
 | `"allowinc"` / `"allowdec"` | — | `increase_allowance` / `decrease_allowance` |
 | `"paused"` / `"resumed"` / `"gpaused"` | `PermissionPausedEvent` / `PermissionResumedEvent` | `pause` / `resume` / `pause_grants` |
 | `"scope"` | `PermissionScopeUpdatedEvent` | `grant_scoped` / `re_grant_scoped` / `set_permission_scope` / `transfer_permission` |
+| `"mqmig"` | `QuorumThresholdMigratedEvent` | `migrate_quorum_threshold` |
+
+## Quorum threshold migration
+
+An enterprise grant that needs to move from, say, 2-of-3 to 3-of-5 used to have
+to revoke and re-grant, which reset the historical `spent` counter and stranded
+every live spend nonce. `migrate_quorum_threshold` reconfigures the quorum in
+place instead:
+
+```rust
+client.migrate_quorum_threshold(&UpdateQuorumThresholdProposal {
+    primary_owner,           // owners[0] of the existing grant
+    delegate,
+    new_threshold: 3,
+    new_owners,              // owners[0] must stay `primary_owner`
+    signers,                 // endorsers; >= the *current* threshold of owners
+});
+```
+
+Guarantees:
+
+- **Spend state is preserved.** Only `owners` and `threshold` are written.
+  `limit_total`, `spent`, `limit_per_tx`, `allowed_merchants`, `status`,
+  `expires_at_ledger` and `created_at` carry over, so the migration cannot be
+  used to launder a drained allowance back to full. The `RelayerNonce`,
+  `ChannelNonce` and `ExecutionEpoch` sequences and the rolling-window state
+  live under separate `(primary_owner, delegate)` keys and are never touched.
+- **The existing quorum gates the change.** At least the threshold *currently
+  in force* must endorse, each via a `require_auth` frame, so a grant cannot be
+  downgraded by fewer owners than it takes to spend from it. Signers that are
+  not current owners are ignored, and duplicates are collapsed so a padded list
+  cannot manufacture quorum out of one owner.
+- **The record never moves.** `new_owners[0]` must remain `primary_owner`; the
+  record and every derived entry are keyed by that pair, so promoting a
+  different owner to first position would strand them.
+- **No delegate authorization.** The delegate is the governed party, not a
+  participant in its own quorum.
+
+The record is addressed by `(primary_owner, delegate)` rather than a numeric
+`permission_id`: multi-owner grants carry no such identifier, and minting one
+retroactively is impossible because already-deployed records have no id to
+backfill. Owner identity is a Soroban `Address` and quorum has always been
+enforced through `require_auth` frames, so the proposal carries `signers`
+rather than raw ed25519 signatures — no owner public key is ever stored.
 
 ## Function-scoped permissions
 

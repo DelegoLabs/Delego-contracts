@@ -141,13 +141,14 @@ mod fuzz_tests {
                             "a non-positive spend must never be accepted (op={:?})",
                             op
                         );
-                        expected_spent = expected_spent.checked_add(spend_amount).unwrap_or_else(
-                            || panic!(
-                                "an accepted spend must never overflow i128 given a bounded \
+                        expected_spent =
+                            expected_spent.checked_add(spend_amount).unwrap_or_else(|| {
+                                panic!(
+                                    "an accepted spend must never overflow i128 given a bounded \
                                  initial_limit (op={:?})",
-                                op
-                            ),
-                        );
+                                    op
+                                )
+                            });
                     }
                     Ok(Err(_)) => {
                         // Cleanly rejected via a typed PermissionError:

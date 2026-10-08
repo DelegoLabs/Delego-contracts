@@ -7,12 +7,12 @@ mod test {
         PermissionsContractClient, ScopedPermissionConfig, SessionKeyConfig,
         MAX_ABSOLUTE_RELAYER_STROOPS, MAX_RELAYER_FEE_BPS, MAX_SESSION_WINDOW_LEDGERS,
     };
+    use soroban_sdk::testutils::LedgerInfo;
     use soroban_sdk::{
         symbol_short,
         testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
         Address, Env, IntoVal, Symbol, TryIntoVal, Vec,
     };
-    use soroban_sdk::testutils::LedgerInfo;
 
     const MAX_SPEND_CPU_INSTRUCTIONS: u64 = 2_000_000;
     const MAX_SPEND_MEMORY_BYTES: u64 = 2_000_000;
@@ -190,15 +190,7 @@ mod test {
 
         let merchants = Vec::<Address>::new(&env);
         // Grant activates at ledger 100, expires at ledger 200.
-        client.grant_bounded(
-            &owner,
-            &delegate,
-            &1000,
-            &100,
-            &merchants,
-            &100,
-            &200,
-        );
+        client.grant_bounded(&owner, &delegate, &1000, &100, &merchants, &100, &200);
 
         // Current ledger is 0, before not_before_ledger.
         assert_eq!(
@@ -223,15 +215,7 @@ mod test {
         let client = PermissionsContractClient::new(&env, &contract_id);
 
         let merchants = Vec::<Address>::new(&env);
-        client.grant_bounded(
-            &owner,
-            &delegate,
-            &1000,
-            &100,
-            &merchants,
-            &100,
-            &200,
-        );
+        client.grant_bounded(&owner, &delegate, &1000, &100, &merchants, &100, &200);
 
         env.ledger().set_sequence_number(150);
         assert_eq!(
@@ -252,15 +236,7 @@ mod test {
         let client = PermissionsContractClient::new(&env, &contract_id);
 
         let merchants = Vec::<Address>::new(&env);
-        client.grant_bounded(
-            &owner,
-            &delegate,
-            &1000,
-            &100,
-            &merchants,
-            &100,
-            &200,
-        );
+        client.grant_bounded(&owner, &delegate, &1000, &100, &merchants, &100, &200);
 
         env.ledger().set_sequence_number(201);
         assert_eq!(
@@ -3570,22 +3546,10 @@ mod test {
 
     #[test]
     fn test_cancel_pending_decrease_requires_owner_auth() {
-    // --- Inactivity pruning and rent reclamation tests (issue #374) ---
-
-    #[test]
-    fn test_prune_expired_permission_success() {
         let env = Env::default();
         env.mock_all_auths();
         let owner = Address::generate(&env);
         let delegate = Address::generate(&env);
-        let keeper = Address::generate(&env);
-    // --- Issue: Handle Verification Policy Threshold Increases ---
-
-    #[test]
-    fn test_recheck_merchant_verification_under_old_policy() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let merchant_id: u64 = 1;
 
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
@@ -3598,6 +3562,133 @@ mod test {
         assert_eq!(
             client.try_cancel_pending_decrease(&owner, &delegate),
             Ok(Ok(()))
+        );
+    }
+
+    #[test]
+    fn test_cancel_pending_decrease_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+
+        // No pending decrease queued yet.
+        assert_eq!(
+            client.try_cancel_pending_decrease(&owner, &delegate),
+            Err(Ok(PermissionError::NotFound))
+        );
+    }
+    // ---------------------------------------------------------------------
+
+    // --- Inactivity pruning and rent reclamation tests (issue #374) ---
+
+    #[test]
+    fn test_prune_expired_permission_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let keeper = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10);
+
+        // Keep instance and record alive across the ledger jump
+        env.as_contract(&contract_id, || {
+            env.storage().instance().extend_ttl(1_000_000, 1_000_000);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Permission(owner.clone(), delegate.clone()),
+                1_000_000,
+                1_000_000,
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::UserPermissions(owner.clone()),
+                1_000_000,
+                1_000_000,
+            );
+        });
+
+        // Advance ledger to 100_011 (> 10 + 100_000)
+        env.ledger().set_sequence_number(100_011);
+
+        let pruned = client.prune_expired_permission(&owner, &delegate, &keeper);
+        assert_eq!(pruned, true);
+
+        // Verify PermissionPrunedEvent was emitted
+        let events = env.events().all();
+        let mut found_event = false;
+        for event in events.iter() {
+            let (contract, topics, value) = event;
+            if contract != contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == soroban_sdk::symbol_short!("perm")
+                && t1 == soroban_sdk::symbol_short!("pruned")
+            {
+                let evt: crate::PermissionPrunedEvent = value.try_into_val(&env).unwrap();
+                assert_eq!(evt.owner, owner);
+                assert_eq!(evt.delegate, delegate);
+                assert_eq!(evt.keeper, keeper);
+                assert_eq!(evt.pruned_at_ledger, 100_011);
+                found_event = true;
+            }
+        }
+        assert!(
+            found_event,
+            "PermissionPrunedEvent not found in emitted events"
+        );
+
+        // Verify storage deletion
+        assert_eq!(client.is_active(&owner, &delegate), false);
+        let get_res = client.try_get_permission(&owner, &delegate);
+        assert_eq!(get_res, Err(Ok(PermissionError::PermissionNotFound)));
+    }
+
+    // --- Issue: Handle Verification Policy Threshold Increases ---
+
+    #[test]
+    fn test_recheck_merchant_verification_under_old_policy() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let merchant_id: u64 = 1;
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        // Merchant verified under a policy requiring 1 verification.
+        let old_policy = crate::VerificationPolicy { required: 1 };
+        client.set_merchant_verifications(&merchant_id, &1);
+        assert!(client.recheck_merchant_verification(&merchant_id, &old_policy));
+    }
+
+    #[test]
+    fn test_recheck_merchant_verification_after_policy_increase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let merchant_id: u64 = 2;
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        // Merchant verified under old policy (1 verification).
+        client.set_merchant_verifications(&merchant_id, &1);
+
+        // Governance raises the required verifications to 2.
+        let new_policy = crate::VerificationPolicy { required: 2 };
+        assert!(
+            !client.recheck_merchant_verification(&merchant_id, &new_policy),
+            "merchant must not be considered verified once policy threshold increases"
         );
     }
     // ---------------------------------------------------------------------
@@ -4080,37 +4171,6 @@ mod test {
     }
 
     #[test]
-    fn test_cancel_pending_decrease_not_found() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let owner = Address::generate(&env);
-        let delegate = Address::generate(&env);
-        // Merchant verified under a policy requiring 1 verification.
-        let old_policy = crate::VerificationPolicy { required: 1 };
-        client.set_merchant_verifications(&merchant_id, &1);
-        assert!(client.recheck_merchant_verification(&merchant_id, &old_policy));
-    }
-
-    #[test]
-    fn test_recheck_merchant_verification_after_policy_increase() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let merchant_id: u64 = 2;
-
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-
-        let merchants = Vec::<Address>::new(&env);
-        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
-
-        // No pending decrease queued yet.
-        assert_eq!(
-            client.try_cancel_pending_decrease(&owner, &delegate),
-            Err(Ok(PermissionError::NotFound))
-        );
-    }
-
-    #[test]
     fn test_delegate_cannot_cancel_pending_decrease() {
         let env = Env::default();
         let owner = Address::generate(&env);
@@ -4520,7 +4580,9 @@ mod test {
             }
             let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
             let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
-            if t0 == soroban_sdk::symbol_short!("perm") && t1 == soroban_sdk::symbol_short!("pruned") {
+            if t0 == soroban_sdk::symbol_short!("perm")
+                && t1 == soroban_sdk::symbol_short!("pruned")
+            {
                 let evt: crate::PermissionPrunedEvent = value.try_into_val(&env).unwrap();
                 assert_eq!(evt.owner, owner);
                 assert_eq!(evt.delegate, delegate);
@@ -4529,7 +4591,10 @@ mod test {
                 found_event = true;
             }
         }
-        assert!(found_event, "PermissionPrunedEvent not found in emitted events");
+        assert!(
+            found_event,
+            "PermissionPrunedEvent not found in emitted events"
+        );
 
         // Verify storage deletion
         assert_eq!(client.is_active(&owner, &delegate), false);
@@ -4571,7 +4636,9 @@ mod test {
             }
             let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
             let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
-            if t0 == soroban_sdk::symbol_short!("perm") && t1 == soroban_sdk::symbol_short!("pruned") {
+            if t0 == soroban_sdk::symbol_short!("perm")
+                && t1 == soroban_sdk::symbol_short!("pruned")
+            {
                 panic!("PermissionPrunedEvent should not be emitted for active permission");
             }
         }
@@ -4609,17 +4676,26 @@ mod test {
 
         // At ledger 100: just reached expiry (0 ledgers expired) -> reject
         env.ledger().set_sequence_number(100);
-        assert_eq!(client.prune_expired_permission(&owner, &delegate, &keeper), false);
+        assert_eq!(
+            client.prune_expired_permission(&owner, &delegate, &keeper),
+            false
+        );
         assert!(client.try_get_permission(&owner, &delegate).is_ok());
 
         // At ledger 100_100: expired by exactly 100,000 ledgers (not > 100,000) -> reject
         env.ledger().set_sequence_number(100_100);
-        assert_eq!(client.prune_expired_permission(&owner, &delegate, &keeper), false);
+        assert_eq!(
+            client.prune_expired_permission(&owner, &delegate, &keeper),
+            false
+        );
         assert!(client.try_get_permission(&owner, &delegate).is_ok());
 
         // At ledger 100_101: expired by 100,001 ledgers (> 100,000) -> succeeds!
         env.ledger().set_sequence_number(100_101);
-        assert_eq!(client.prune_expired_permission(&owner, &delegate, &keeper), true);
+        assert_eq!(
+            client.prune_expired_permission(&owner, &delegate, &keeper),
+            true
+        );
         assert_eq!(
             client.try_get_permission(&owner, &delegate),
             Err(Ok(PermissionError::PermissionNotFound))
@@ -4671,6 +4747,8 @@ mod test {
                 &delegate,
                 &Some(scope_for(&env, &escrow, &["fund"]))
             ),
+            Err(Ok(PermissionError::PermissionNotFound))
+        );
     }
 
     #[test]
@@ -4708,7 +4786,10 @@ mod test {
         env.ledger().set_sequence_number(60);
         let swept = client.sweep_expired(&owner, &delegate, &caller);
         assert_eq!(swept, true);
-        assert_eq!(client.get_permission(&owner, &delegate).status, PermissionStatus::Expired);
+        assert_eq!(
+            client.get_permission(&owner, &delegate).status,
+            PermissionStatus::Expired
+        );
 
         // Keep instance and record alive across the ledger jump
         env.as_contract(&contract_id, || {
@@ -4823,14 +4904,6 @@ mod test {
         env.mock_all_auths();
         let owner = Address::generate(&env);
         let delegate = Address::generate(&env);
-    #[test]
-    fn test_prune_cleans_up_user_permissions_index() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let owner = Address::generate(&env);
-        let delegate1 = Address::generate(&env);
-        let delegate2 = Address::generate(&env);
-        let keeper = Address::generate(&env);
 
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
@@ -4848,6 +4921,57 @@ mod test {
             10,
             "nonce must advance to up_to_nonce + 1"
         );
+    }
+
+    #[test]
+    fn test_prune_cleans_up_user_permissions_index() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate1 = Address::generate(&env);
+        let delegate2 = Address::generate(&env);
+        let keeper = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate1, &1000, &100, &merchants, &10);
+        client.grant(&owner, &delegate2, &2000, &200, &merchants, &200_000);
+
+        assert_eq!(client.get_permissions_by_owner(&owner).len(), 2);
+
+        // Keep instance and records alive across the ledger jump
+        env.as_contract(&contract_id, || {
+            env.storage().instance().extend_ttl(1_000_000, 1_000_000);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Permission(owner.clone(), delegate1.clone()),
+                1_000_000,
+                1_000_000,
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::Permission(owner.clone(), delegate2.clone()),
+                1_000_000,
+                1_000_000,
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::UserPermissions(owner.clone()),
+                1_000_000,
+                1_000_000,
+            );
+        });
+
+        // Advance to prune delegate1
+        env.ledger().set_sequence_number(100_011);
+        assert_eq!(
+            client.prune_expired_permission(&owner, &delegate1, &keeper),
+            true
+        );
+
+        // delegate1 is removed, delegate2 remains
+        let remaining = client.get_permissions_by_owner(&owner);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining.get(0).unwrap().delegate, delegate2);
     }
 
     #[test]
@@ -4917,7 +5041,10 @@ mod test {
         use crate::NonceBatchInvalidatedEvent;
         let events = env.events().all();
         let found = events.iter().any(|ev| {
-            if let Ok(payload) = ev.2.clone().try_into_val::<_, NonceBatchInvalidatedEvent>(&env) {
+            if let Ok(payload) =
+                ev.2.clone()
+                    .try_into_val::<_, NonceBatchInvalidatedEvent>(&env)
+            {
                 payload.owner == owner
                     && payload.delegate == delegate
                     && payload.up_to_nonce == 7
@@ -5037,6 +5164,8 @@ mod test {
             symbol_short!("nonce_inv"),
             "last audit entry should be nonce_inv"
         );
+    }
+
     // --- Issue #368: rolling-window velocity caps ---
 
     #[test]
@@ -5167,7 +5296,10 @@ mod test {
 
         // Advance to prune delegate1
         env.ledger().set_sequence_number(100_011);
-        assert_eq!(client.prune_expired_permission(&owner, &delegate1, &keeper), true);
+        assert_eq!(
+            client.prune_expired_permission(&owner, &delegate1, &keeper),
+            true
+        );
 
         // delegate1 is removed, delegate2 remains
         let remaining = client.get_permissions_by_owner(&owner);
@@ -5219,14 +5351,6 @@ mod expiry_and_allowance_sweep_tests {
         assert_eq!(
             compute_expiry_ledger(u32::MAX, u32::MAX),
             Err(PermissionError::InvalidExpiry)
-        // Merchant verified under old policy (1 verification).
-        client.set_merchant_verifications(&merchant_id, &1);
-
-        // Governance raises the required verifications to 2.
-        let new_policy = crate::VerificationPolicy { required: 2 };
-        assert!(
-            !client.recheck_merchant_verification(&merchant_id, &new_policy),
-            "merchant must not be considered verified once policy threshold increases"
         );
     }
 
@@ -5316,7 +5440,14 @@ mod expiry_and_allowance_sweep_tests {
         let (client, owner, delegate, _) = setup(&env);
         env.ledger().set_sequence_number(1_000);
 
-        client.grant(&owner, &delegate, &1_000, &100, &Vec::new(&env), &(u32::MAX - 1_000));
+        client.grant(
+            &owner,
+            &delegate,
+            &1_000,
+            &100,
+            &Vec::new(&env),
+            &(u32::MAX - 1_000),
+        );
 
         assert_eq!(
             client.get_permission(&owner, &delegate).expires_at_ledger,
@@ -5328,7 +5459,13 @@ mod expiry_and_allowance_sweep_tests {
 
     fn setup_with_allowance(
         env: &Env,
-    ) -> (PermissionsContractClient<'_>, Address, Address, Address, Address) {
+    ) -> (
+        PermissionsContractClient<'_>,
+        Address,
+        Address,
+        Address,
+        Address,
+    ) {
         let (client, owner, delegate, contract_id) = setup(env);
         let token = env
             .register_stellar_asset_contract_v2(Address::generate(env))
@@ -5348,7 +5485,10 @@ mod expiry_and_allowance_sweep_tests {
 
         client.sweep_expired_allowance(&owner, &delegate, &token);
 
-        assert_eq!(TokenClient::new(&env, &token).allowance(&owner, &delegate), 0);
+        assert_eq!(
+            TokenClient::new(&env, &token).allowance(&owner, &delegate),
+            0
+        );
         let (contract, topics, data) = env.events().all().last().unwrap();
         assert_eq!(contract, contract_id);
         let t1: Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
@@ -5370,7 +5510,10 @@ mod expiry_and_allowance_sweep_tests {
             client.try_sweep_expired_allowance(&owner, &delegate, &token),
             Err(Ok(PermissionError::DelegationNotExpired))
         );
-        assert_eq!(TokenClient::new(&env, &token).allowance(&owner, &delegate), 500);
+        assert_eq!(
+            TokenClient::new(&env, &token).allowance(&owner, &delegate),
+            500
+        );
     }
 
     #[test]
@@ -5417,16 +5560,19 @@ mod expiry_and_allowance_sweep_tests {
         let child_delegate = Address::generate(&env);
         let grandchild_delegate = Address::generate(&env);
         let merchants = Vec::<Address>::new(&env);
-    fn test_revalidate_merchant_status_meets_new_policy() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let merchant_id: u64 = 5;
 
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
 
         // Depth 0: root grant.
-        client.grant(&root_owner, &parent_delegate, &10_000, &1000, &merchants, &10000);
+        client.grant(
+            &root_owner,
+            &parent_delegate,
+            &10_000,
+            &1000,
+            &merchants,
+            &10000,
+        );
 
         // Depth 1: child of root grant.
         assert_eq!(
@@ -5467,13 +5613,42 @@ mod expiry_and_allowance_sweep_tests {
         let d3 = Address::generate(&env);
         let d4 = Address::generate(&env);
         let merchants = Vec::<Address>::new(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        // Depth 0.
+        client.grant(&root_owner, &d1, &10_000, &1000, &merchants, &10000);
+        // Depth 1.
+        client.grant_child(&root_owner, &d1, &d2, &5000, &500, &merchants, &10000);
+        // Depth 2.
+        client.grant_child(&root_owner, &d2, &d3, &2500, &250, &merchants, &10000);
+        // Depth 3 would exceed MAX_HIERARCHY_DEPTH (3) and must be rejected.
+        assert_eq!(
+            client.try_grant_child(&root_owner, &d3, &d4, &1250, &125, &merchants, &10000,),
+            Err(Ok(PermissionError::MaxHierarchyDepthExceeded))
+        );
+    }
+
+    #[test]
+    fn test_revalidate_merchant_status_meets_new_policy() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let merchant_id: u64 = 5;
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
         // Merchant acquires the additional attestation.
         client.set_merchant_verifications(&merchant_id, &2);
         let new_policy = crate::VerificationPolicy { required: 2 };
         client.set_verification_policy(&new_policy);
 
         let status = client.revalidate_merchant_status(&merchant_id);
-        assert!(status.valid, "merchant meeting the new policy must be valid");
+        assert!(
+            status.valid,
+            "merchant meeting the new policy must be valid"
+        );
         assert!(
             !status.grace_period_active,
             "no grace period needed when policy is met"
@@ -5499,15 +5674,7 @@ mod expiry_and_allowance_sweep_tests {
         client.grant_child(&root_owner, &d2, &d3, &2500, &250, &merchants, &10000);
         // Depth 3 would exceed MAX_HIERARCHY_DEPTH (3) and must be rejected.
         assert_eq!(
-            client.try_grant_child(
-                &root_owner,
-                &d3,
-                &d4,
-                &1250,
-                &125,
-                &merchants,
-                &10000,
-            ),
+            client.try_grant_child(&root_owner, &d3, &d4, &1250, &125, &merchants, &10000,),
             Err(Ok(PermissionError::MaxHierarchyDepthExceeded))
         );
         let new_policy = crate::VerificationPolicy { required: 1 };

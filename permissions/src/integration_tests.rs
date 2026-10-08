@@ -1,19 +1,18 @@
 #![cfg(test)]
 
 use crate::{
-    MerchantAllowlist, MultiOwnerSpendEvent, PermissionError, PermissionStatus,
-    PermissionsContract, PermissionsContractClient, RelayedSpendMessage, ScopedPermissionConfig,
-    SpendProposalApprovedEvent, MAX_PENDING_SPEND_PROPOSALS, SPEND_PROPOSAL_TTL_LEDGERS,
     ChannelRelayedSpendMessage, ChannelSpendSignature, MerchantAllowlist,
-    PermissionError, PermissionStatus, PermissionsContract,
-    PermissionsContractClient, RelayedSpendMessage, ScopedPermissionConfig,
+    MultiOwnerSpendEvent, PermissionError, PermissionStatus,
+    PermissionsContract, PermissionsContractClient, RelayedSpendMessage,
+    ScopedPermissionConfig, SpendProposalApprovedEvent,
+    MAX_PENDING_SPEND_PROPOSALS, SPEND_PROPOSAL_TTL_LEDGERS,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
+    symbol_short,
     testutils::{Address as _, Events, Ledger},
     xdr::ToXdr,
     Address, BytesN, Env, Symbol, TryFromVal, TryIntoVal, Vec,
-    Address, BytesN, Env, Symbol, TryIntoVal, Vec, symbol_short,
 };
 
 /// Deterministic test keypair plus its raw ed25519 public key bytes.
@@ -730,7 +729,7 @@ fn test_execute_spend_via_relayer_enforces_velocity_limit() {
             &t.seller,
             &1u64,
             &expiration_ledger,
-        &0u32,
+            &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::VelocityLimitExceeded))
@@ -813,7 +812,7 @@ fn test_execute_spend_via_relayer_rejects_replayed_nonce() {
             &t.seller,
             &0u64,
             &expiration_ledger,
-        &0u32,
+            &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::InvalidNonce))
@@ -941,7 +940,7 @@ fn test_execute_spend_via_relayer_rejects_expired_signature() {
             &t.seller,
             &0u64,
             &expiration_ledger,
-        &0u32,
+            &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::SignatureExpired))
@@ -980,7 +979,7 @@ fn test_execute_spend_via_relayer_without_registered_key_fails() {
             &t.seller,
             &0u64,
             &expiration_ledger,
-        &0u32,
+            &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::RelayerKeyNotSet))
@@ -1021,7 +1020,7 @@ fn test_execute_spend_via_relayer_enforces_per_tx_limit() {
             &t.seller,
             &0u64,
             &expiration_ledger,
-        &0u32,
+            &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::ExceedsPerTxLimit))
@@ -1260,7 +1259,10 @@ fn test_versioned_domain_separator_differs_across_versions() {
         &t.permissions_contract_id,
         &symbol_short!("PERM_V2"),
     );
-    assert_ne!(v1, v2, "domain separators must differ across semver versions");
+    assert_ne!(
+        v1, v2,
+        "domain separators must differ across semver versions"
+    );
 }
 
 #[test]
@@ -1273,7 +1275,10 @@ fn test_versioned_domain_separator_differs_across_addresses() {
         &symbol_short!("PERM_V2"),
     );
     let b = compute_versioned_domain_separator(&t.env, &other, &symbol_short!("PERM_V2"));
-    assert_ne!(a, b, "domain separators must differ across contract addresses");
+    assert_ne!(
+        a, b,
+        "domain separators must differ across contract addresses"
+    );
 }
 
 #[test]
@@ -1333,8 +1338,7 @@ fn test_signature_bound_to_v1_fails_on_v2() {
         &t.permissions_contract_id,
         &symbol_short!("PERM_V2"),
     );
-    let v2_signature =
-        sign_relayed_spend_with_domain(&t.env, &signing_key, message, &v2_domain);
+    let v2_signature = sign_relayed_spend_with_domain(&t.env, &signing_key, message, &v2_domain);
     client.execute_spend_via_relayer(
         &relayer,
         &t.buyer,
@@ -1524,7 +1528,7 @@ fn test_relayed_spend_respects_parent_budget_cap() {
             &t.seller,
             &0u64,
             &expiration_ledger,
-        &0u32,
+            &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::ExceedsTotalLimit))
@@ -1664,7 +1668,7 @@ fn test_merchant_allowlist_enforced_on_relayed_spend() {
             &rogue,
             &0u64,
             &expiration_ledger,
-        &0u32,
+            &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::MerchantNotAllowed))
@@ -1755,7 +1759,7 @@ fn test_cancel_nonce_unblocks_subsequent_relayed_spends() {
             &t.seller,
             &1u64,
             &expiration_ledger,
-        &0u32,
+            &0u32,
             &next,
         ),
         Err(Ok(PermissionError::InvalidNonce))
@@ -1774,7 +1778,7 @@ fn test_cancel_nonce_unblocks_subsequent_relayed_spends() {
             &t.seller,
             &0u64,
             &expiration_ledger,
-        &0u32,
+            &0u32,
             &stalled,
         ),
         Err(Ok(PermissionError::InvalidNonce))
@@ -2670,7 +2674,11 @@ fn test_execute_spend_via_channel_independent_lanes() {
         &t.agent,
         &10,
         &t.seller,
-        &ChannelSpendSignature { channel_id: 0, nonce: 0, signature: sig0 },
+        &ChannelSpendSignature {
+            channel_id: 0,
+            nonce: 0,
+            signature: sig0,
+        },
         &expiration_ledger,
         &0u32,
     );
@@ -2693,7 +2701,11 @@ fn test_execute_spend_via_channel_independent_lanes() {
         &t.agent,
         &20,
         &t.seller,
-        &ChannelSpendSignature { channel_id: 1, nonce: 0, signature: sig1 },
+        &ChannelSpendSignature {
+            channel_id: 1,
+            nonce: 0,
+            signature: sig1,
+        },
         &expiration_ledger,
         &0u32,
     );
@@ -2720,7 +2732,11 @@ fn test_execute_spend_via_channel_independent_lanes() {
         &t.agent,
         &10,
         &t.seller,
-        &ChannelSpendSignature { channel_id: 0, nonce: 1, signature: sig0b },
+        &ChannelSpendSignature {
+            channel_id: 0,
+            nonce: 1,
+            signature: sig0b,
+        },
         &expiration_ledger,
         &0u32,
     );

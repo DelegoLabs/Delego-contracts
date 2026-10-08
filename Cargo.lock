@@ -459,6 +459,7 @@ dependencies = [
 name = "delego-permissions"
 version = "0.0.1"
 dependencies = [
+ "arbitrary",
  "ed25519-dalek",
  "soroban-sdk",
 ]

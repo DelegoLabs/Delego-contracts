@@ -99,6 +99,34 @@ will reject the change.
 
 ### Unreleased
 
+- Add `migrate_quorum_threshold` so a multi-owner grant's owner set and
+  signature threshold can be reconfigured without revoking and re-granting it
+  (issue #371). Widening an enterprise grant from 2-of-3 to 3-of-5 previously
+  reset the historical `spent` allowance and stranded every live spend nonce.
+  The new `migrate_quorum_threshold` entrypoint takes an
+  `UpdateQuorumThresholdProposal` and writes only `owners` and `threshold`, so
+  `limit_total`, `spent`, `limit_per_tx`, `allowed_merchants`, `status`,
+  `expires_at_ledger` and `created_at` all carry over; the `RelayerNonce`,
+  `ChannelNonce` and `ExecutionEpoch` sequences and the rolling-window state
+  live under separate `(primary_owner, delegate)` keys and are left untouched.
+  Authorization is checked against the quorum **already in force** — each
+  distinct current owner listed in `signers` must produce a `require_auth`
+  frame, and at least the current threshold must be present — so a grant cannot
+  be reconfigured, or downgraded, by fewer owners than it takes to spend from
+  it. Duplicate signers are collapsed so a padded list cannot manufacture
+  quorum, `new_owners[0]` must remain the primary owner so the record and its
+  derived state are never relocated, and the self-delegation guard from
+  `grant_multi_owner` is mirrored so a migration cannot become a back door
+  around it. Emits `QuorumThresholdMigratedEvent`. Adds no new error codes.
+- Fix pre-existing build breakage: remove the `delego-identity` and
+  `delego-merchant` path dependencies from `tests/Cargo.toml` (neither crate
+  exists, so the workspace manifest failed to load and nothing compiled),
+  restore the `get_permission` getter that commit d1557b3 dropped (it is still
+  called from the permission and cross-contract suites and documented in
+  `permissions/README.md` and `docs/architecture/contracts.md`), and collapse
+  four mutually contradictory `PERMISSION_ERROR_CODES.len()` assertions in
+  `error_code_tests` to the actual count of 38.
+
 - Add `invalidate_nonce_range` entrypoint to bulk-invalidate all relayer nonces up to and including a given nonce for a compromised agent key recovery flow (issue #335). Owner-authorized; emits `NonceBatchInvalidatedEvent` and writes an audit log entry.
 - Added an asynchronous multi-signature spend approval queue (issue #377).
   `execute_spend_multi` requires every co-signer to sign in one transaction, so
