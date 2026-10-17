@@ -4,8 +4,8 @@
 #![cfg_attr(not(test), no_std)]
 #![warn(missing_docs)]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short,
+    token::Client as TokenClient, Address, BytesN, Env, Symbol, Vec,
 };
 
 /// Persistent entries are bumped when they approach expiry and kept alive
@@ -13,6 +13,33 @@ use soroban_sdk::{
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400;
 pub const MAX_SWEEP_BATCH_SIZE: u32 = 50;
+
+/// Keeper heartbeat bounty window (issue #399).
+///
+/// An active delegation qualifies for the keeper bounty once fewer than this
+/// many ledgers remain until its `expires_at_ledger`. Delegations inside the
+/// window are the ones whose read traffic dries up — `is_authorized` is about
+/// to start failing — so their persistent entries stop being bumped on read
+/// and decay toward archival while the delegation is still semantically live.
+/// Keepers are paid to keep those entries alive.
+pub const KEEPER_BOUNTY_TTL_THRESHOLD: u32 = 50_000;
+
+/// Minimum number of ledgers between two bounty payouts for the same
+/// delegation (issue #399). Mirrors `PERSISTENT_BUMP_THRESHOLD` (one day of
+/// ledgers) so a single delegation can earn at most one bounty per heartbeat
+/// cycle, bounding the drain on the maintenance reserve.
+pub const KEEPER_BOUNTY_COOLDOWN_LEDGERS: u32 = 17_280;
+
+/// Upper bound a maintainer can configure for the per-bump keeper reward,
+/// in stroops (10 XLM). Guards the maintenance reserve against a fat-fingered
+/// `configure_keeper_bounty` call that would otherwise drain it in one bump.
+pub const MAX_KEEPER_BOUNTY_STROOPS: i128 = 100_000_000;
+
+/// Documented default per-bump keeper reward, in stroops (0.01 XLM). The
+/// actual reward is admin-configured via
+/// [`configure_keeper_bounty`](DelegationRegistry::configure_keeper_bounty);
+/// this constant records the protocol's intended "small XLM reward" scale.
+pub const KEEPER_BOUNTY_REWARD_STROOPS: i128 = 100_000;
 
 /// Represents the lifecycle status of a delegation.
 /// Contract version information for deployment scripts and runtime compatibility checks.
@@ -170,6 +197,28 @@ pub struct DelegationPage {
     pub next_offset: Option<u32>,
 }
 
+/// Keeper heartbeat bounty status for a delegation (issue #399).
+///
+/// Reports whether a delegation is inside its bounty window and how much a
+/// keeper would be paid — or was just paid, when returned from
+/// [`bump_delegation_ttl_with_reward`](DelegationRegistry::bump_delegation_ttl_with_reward)
+/// — for one heartbeat bump.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeeperBountyStatus {
+    /// Unique delegation identifier.
+    pub delegation_id: u64,
+    /// Ledgers remaining until the delegation's `expires_at_ledger`.
+    pub remaining_ledgers: u32,
+    /// Whether a keeper heartbeat bump on this delegation earns the bounty
+    /// right now: the delegation is `Active`, unexpired, inside the bounty
+    /// window, past its payout cooldown, and the maintenance reserve covers
+    /// the configured reward.
+    pub is_eligible_for_bounty: bool,
+    /// Reward in stroops paid for this bump (`0` when not eligible).
+    pub bounty_amount_stroops: i128,
+}
+
 // ── Events ────────────────────────────────────────────────────────────────────
 
 /// Emitted when a new delegation is created.
@@ -271,6 +320,36 @@ pub struct AdminProposedEvent {
     pub timestamp: u64,
 }
 
+/// Emitted when a keeper earns a heartbeat bounty (issue #399).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct KeeperBountyPaidEvent {
+    /// Unique delegation identifier whose storage was kept alive.
+    pub delegation_id: u64,
+    /// Address of the keeper that performed the heartbeat bump.
+    pub keeper: Address,
+    /// Reward transferred to the keeper, in stroops.
+    pub reward_stroops: i128,
+    /// Ledgers remaining until the delegation's `expires_at_ledger`.
+    pub remaining_ledgers: u32,
+    /// Ledger timestamp of the event.
+    pub timestamp: u64,
+}
+
+/// Emitted when the maintenance reserve is topped up (issue #399).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MaintenanceReserveFundedEvent {
+    /// Address that contributed funds to the reserve.
+    pub contributor: Address,
+    /// Amount contributed, in stroops.
+    pub amount_stroops: i128,
+    /// Reserve balance after the contribution, in stroops.
+    pub new_reserve_stroops: i128,
+    /// Ledger timestamp of the event.
+    pub timestamp: u64,
+}
+
 /// Emitted when a proposed admin accepts the role and the transfer completes.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -309,6 +388,13 @@ pub enum DataKey {
     SnapshotSchemaVersion(u64),
     /// Admin address proposed to take over, pending acceptance.
     ProposedAdmin,
+    /// Token contract backing the protocol maintenance reserve (issue #399).
+    MaintenanceToken,
+    /// Per-bump keeper reward, in stroops (issue #399).
+    KeeperReward,
+    /// Ledger sequence of the last keeper bounty payout for a delegation
+    /// (issue #399).
+    KeeperBountyAt(u64),
 }
 
 /// Errors for delegation registry operations.
@@ -323,7 +409,7 @@ pub enum DataKey {
 /// | `ReputationError`   | 3_000..=3_999   |
 /// | `DelegationError`   | 4_000..=4_999   |
 /// | `MarketplaceError`  | 5_000..=5_999   |
-/// `DelegationError` currently occupies codes 4_001..=4_016.
+/// `DelegationError` currently occupies codes 4_001..=4_019.
 /// New variants must use the next unused code within 4_000..=4_999.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -361,6 +447,12 @@ pub enum DelegationError {
     InvalidPermissionFlag = 4015,
     /// The sweep batch is empty or exceeds the maximum supported size.
     InvalidBatchSize = 4016,
+    /// The keeper bounty has not been configured yet (issue #399).
+    BountyNotConfigured = 4017,
+    /// The keeper reward is zero or above the protocol cap (issue #399).
+    InvalidBountyAmount = 4018,
+    /// The maintenance reserve funding amount is zero or negative (issue #399).
+    InvalidFundingAmount = 4019,
 }
 
 /// The delegation registry contract.
@@ -1571,6 +1663,299 @@ impl DelegationRegistry {
         }
         expired
     }
+
+    // ── Keeper heartbeat bounty (issue #399) ─────────────────────────────────
+
+    /// Configures the keeper heartbeat bounty (issue #399).
+    ///
+    /// `token` is the Stellar Asset Contract the maintenance reserve is held
+    /// in — the native XLM SAC address on live networks — and `reward_stroops`
+    /// is the per-bump reward paid to keepers. Admin-only: `caller` must
+    /// authorize the call and match the configured admin, mirroring
+    /// [`admin_revoke`](Self::admin_revoke)'s authorization pattern.
+    ///
+    /// The reward must be positive and at most
+    /// [`MAX_KEEPER_BOUNTY_STROOPS`], so a misconfigured call can never
+    /// authorize draining the whole reserve in a single bump.
+    pub fn configure_keeper_bounty(
+        env: Env,
+        caller: Address,
+        token: Address,
+        reward_stroops: i128,
+    ) -> Result<bool, DelegationError> {
+        caller.require_auth();
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(DelegationError::NotInitialized)?;
+
+        if caller != admin {
+            return Err(DelegationError::NotAuthorized);
+        }
+
+        if reward_stroops <= 0 || reward_stroops > MAX_KEEPER_BOUNTY_STROOPS {
+            return Err(DelegationError::InvalidBountyAmount);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceToken, &token);
+        env.storage()
+            .instance()
+            .set(&DataKey::KeeperReward, &reward_stroops);
+
+        Ok(true)
+    }
+
+    /// Tops up the protocol maintenance reserve (issue #399).
+    ///
+    /// Pulls `amount` of the configured maintenance token from `contributor`
+    /// (who must authorize) into the contract. The contract's token balance
+    /// *is* the reserve: bounty payouts draw it down and every contribution
+    /// tops it back up, so there is no separate internal ledger to drift out
+    /// of sync. Returns the reserve balance after the contribution.
+    ///
+    /// Returns [`DelegationError::BountyNotConfigured`] when no maintenance
+    /// token has been configured and
+    /// [`DelegationError::InvalidFundingAmount`] when `amount` is not
+    /// positive.
+    pub fn fund_maintenance_reserve(
+        env: Env,
+        contributor: Address,
+        amount: i128,
+    ) -> Result<i128, DelegationError> {
+        contributor.require_auth();
+
+        if amount <= 0 {
+            return Err(DelegationError::InvalidFundingAmount);
+        }
+
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaintenanceToken)
+            .ok_or(DelegationError::BountyNotConfigured)?;
+
+        let token_client = TokenClient::new(&env, &token);
+        token_client.transfer(&contributor, &env.current_contract_address(), &amount);
+
+        let new_reserve = token_client.balance(&env.current_contract_address());
+
+        // Topics: (contract, action, entity_id) — entity_id is the contributor.
+        env.events().publish(
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("k_fund"),
+                contributor.clone(),
+            ),
+            MaintenanceReserveFundedEvent {
+                contributor,
+                amount_stroops: amount,
+                new_reserve_stroops: new_reserve,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(new_reserve)
+    }
+
+    /// Returns the current maintenance reserve balance, in stroops (issue #399).
+    ///
+    /// Returns [`DelegationError::BountyNotConfigured`] when no maintenance
+    /// token has been configured.
+    pub fn get_maintenance_reserve(env: Env) -> Result<i128, DelegationError> {
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaintenanceToken)
+            .ok_or(DelegationError::BountyNotConfigured)?;
+
+        Ok(TokenClient::new(&env, &token).balance(&env.current_contract_address()))
+    }
+
+    /// Returns the configured per-bump keeper reward, in stroops (issue #399).
+    ///
+    /// Returns `0` when the bounty has not been configured yet.
+    pub fn get_keeper_reward(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::KeeperReward)
+            .unwrap_or(0)
+    }
+
+    /// Returns the keeper bounty status for a delegation (issue #399).
+    ///
+    /// Read-only: reports how many ledgers remain until the delegation's
+    /// `expires_at_ledger` and whether a keeper heartbeat bump on it would
+    /// earn the bounty right now, so keepers can scan for payable
+    /// delegations before spending gas.
+    pub fn get_keeper_bounty_status(
+        env: Env,
+        delegation_id: u64,
+    ) -> Result<KeeperBountyStatus, DelegationError> {
+        let record: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+            .ok_or(DelegationError::NotFound)?;
+
+        Ok(Self::keeper_bounty_status(&env, delegation_id, &record))
+    }
+
+    /// Extends a delegation's storage TTL and pays the keeper a bounty
+    /// (issue #399).
+    ///
+    /// Third-party keepers call this as a heartbeat for active delegations
+    /// whose read traffic has dried up: it extends the TTL of the delegation
+    /// record and its owner-index keys (the same bump every read path
+    /// applies), protecting long-lived delegations from accidental archival
+    /// in Soroban persistent storage while they are still active.
+    ///
+    /// A bounty is paid only when the delegation is `Active`, unexpired,
+    /// within [`KEEPER_BOUNTY_TTL_THRESHOLD`] ledgers of its
+    /// `expires_at_ledger`, past its [`KEEPER_BOUNTY_COOLDOWN_LEDGERS`]
+    /// payout cooldown, and the maintenance reserve covers the configured
+    /// reward; the reward is then transferred from the reserve to `keeper`.
+    /// The returned [`KeeperBountyStatus`] reports exactly what was paid.
+    ///
+    /// `keeper` must authorize the call — it is the address receiving funds.
+    /// The bump itself is always performed (even when no bounty is due), so
+    /// the call also serves as a plain liveness heartbeat.
+    pub fn bump_delegation_ttl_with_reward(
+        env: Env,
+        delegation_id: u64,
+        keeper: Address,
+    ) -> Result<KeeperBountyStatus, DelegationError> {
+        keeper.require_auth();
+
+        let record: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+            .ok_or(DelegationError::NotFound)?;
+
+        // Fail fast: only live delegations are worth keeping alive, and no
+        // state is touched when the call errors.
+        if record.status != DelegationStatus::Active {
+            return Err(DelegationError::NotActive);
+        }
+        if env.ledger().sequence() >= record.expires_at_ledger {
+            return Err(DelegationError::Expired);
+        }
+
+        // The heartbeat itself: extend the delegation record and its
+        // owner-index keys, exactly like the read paths do.
+        Self::bump_delegation(&env, delegation_id, &record.owner);
+
+        let status = Self::keeper_bounty_status(&env, delegation_id, &record);
+        if status.is_eligible_for_bounty {
+            let token: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::MaintenanceToken)
+                .expect("eligibility implies a configured maintenance token");
+            let reward = status.bounty_amount_stroops;
+
+            TokenClient::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &keeper,
+                &reward,
+            );
+
+            // Record the payout ledger and keep the marker alive alongside
+            // the delegation it throttles.
+            env.storage().persistent().set(
+                &DataKey::KeeperBountyAt(delegation_id),
+                &env.ledger().sequence(),
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::KeeperBountyAt(delegation_id),
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+            // Topics: (contract, action, entity_id) — entity_id is the
+            // delegation id.
+            env.events().publish(
+                (EVENT_TOPIC_CONTRACT, symbol_short!("k_bpay"), delegation_id),
+                KeeperBountyPaidEvent {
+                    delegation_id,
+                    keeper,
+                    reward_stroops: reward,
+                    remaining_ledgers: status.remaining_ledgers,
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+        }
+
+        Ok(status)
+    }
+
+    /// Computes the keeper bounty status for a delegation from current state
+    /// (issue #399): remaining lifetime, payout eligibility and the amount a
+    /// bump would pay.
+    fn keeper_bounty_status(
+        env: &Env,
+        delegation_id: u64,
+        record: &DelegationRecord,
+    ) -> KeeperBountyStatus {
+        let current_ledger = env.ledger().sequence();
+        let remaining_ledgers = record.expires_at_ledger.saturating_sub(current_ledger);
+
+        let is_eligible_for_bounty = record.status == DelegationStatus::Active
+            && current_ledger < record.expires_at_ledger
+            && remaining_ledgers < KEEPER_BOUNTY_TTL_THRESHOLD
+            && Self::bounty_cooldown_elapsed(env, delegation_id, current_ledger)
+            && Self::reserve_covers_reward(env);
+
+        let bounty_amount_stroops = if is_eligible_for_bounty {
+            env.storage()
+                .instance()
+                .get(&DataKey::KeeperReward)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        KeeperBountyStatus {
+            delegation_id,
+            remaining_ledgers,
+            is_eligible_for_bounty,
+            bounty_amount_stroops,
+        }
+    }
+
+    /// Returns `true` when the delegation's last bounty payout is older than
+    /// [`KEEPER_BOUNTY_COOLDOWN_LEDGERS`] (or it has never been paid).
+    fn bounty_cooldown_elapsed(env: &Env, delegation_id: u64, current_ledger: u32) -> bool {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::KeeperBountyAt(delegation_id))
+        {
+            Some(last_paid) => {
+                current_ledger.saturating_sub(last_paid) >= KEEPER_BOUNTY_COOLDOWN_LEDGERS
+            }
+            None => true,
+        }
+    }
+
+    /// Returns `true` when the bounty is configured and the maintenance
+    /// reserve balance covers the configured reward.
+    fn reserve_covers_reward(env: &Env) -> bool {
+        let token: Option<Address> = env.storage().instance().get(&DataKey::MaintenanceToken);
+        let reward: Option<i128> = env.storage().instance().get(&DataKey::KeeperReward);
+
+        match (token, reward) {
+            (Some(token), Some(reward)) => {
+                TokenClient::new(env, &token).balance(&env.current_contract_address()) >= reward
+            }
+            _ => false,
+        }
+    }
+
     /// Extends the TTL on the delegation record and its owner-index key,
     /// keeping them alive in persistent storage. Called from read paths
     /// (`get_delegation`, `get_delegations_by_owner`, `is_authorized`) so
@@ -1703,6 +2088,9 @@ mod error_code_uniqueness_tests {
             (DelegationError::NotAuthorized, 4014u32),
             (DelegationError::InvalidPermissionFlag, 4015u32),
             (DelegationError::InvalidBatchSize, 4016u32),
+            (DelegationError::BountyNotConfigured, 4017u32),
+            (DelegationError::InvalidBountyAmount, 4018u32),
+            (DelegationError::InvalidFundingAmount, 4019u32),
         ];
 
         for (variant, expected) in codes {
@@ -1726,6 +2114,9 @@ mod error_code_uniqueness_tests {
             DelegationError::NotAuthorized as u32,
             DelegationError::InvalidPermissionFlag as u32,
             DelegationError::InvalidBatchSize as u32,
+            DelegationError::BountyNotConfigured as u32,
+            DelegationError::InvalidBountyAmount as u32,
+            DelegationError::InvalidFundingAmount as u32,
         ];
         seen.sort_unstable();
         for pair in seen.windows(2) {

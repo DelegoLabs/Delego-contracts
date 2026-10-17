@@ -200,6 +200,21 @@ will reject the change.
 
 ### Unreleased
 
+- Added the automated delegation keeper heartbeat incentive bounty (issue #399):
+  a protocol maintenance reserve that pays third-party keepers to extend the
+  persistent-storage TTL of active delegations approaching expiration, so
+  long-lived delegations are not accidentally archived while still live.
+  New `KeeperBountyStatus` view plus `configure_keeper_bounty`,
+  `fund_maintenance_reserve`, `get_maintenance_reserve`, `get_keeper_reward`,
+  `get_keeper_bounty_status` and `bump_delegation_ttl_with_reward` entry
+  points. The bounty window is `KEEPER_BOUNTY_TTL_THRESHOLD` (50,000 ledgers
+  before `expires_at_ledger`), payouts are throttled by
+  `KEEPER_BOUNTY_COOLDOWN_LEDGERS` (17,280) and capped per bump by
+  `MAX_KEEPER_BOUNTY_STROOPS` (10 XLM), and the reserve is the contract's live
+  token balance, funded via `fund_maintenance_reserve`. New
+  `DelegationError::BountyNotConfigured` (4017), `InvalidBountyAmount` (4018)
+  and `InvalidFundingAmount` (4019) codes.
+
 - Packed a delegation's four capabilities (spend, refund, dispute, delegate) into
   a single `u32` `PermissionBitmask` instead of storing them as individual
   booleans (issue #322). A delegation entry shrinks by ~72 B and reading or

@@ -5,6 +5,7 @@ use super::*;
 use soroban_sdk::{
     symbol_short,
     testutils::{storage::Persistent, Address as _, Events, Ledger},
+    token::{Client as TokenClient, StellarAssetClient},
     Address, BytesN, Env, Symbol, TryFromVal,
 };
 
@@ -2206,4 +2207,457 @@ fn test_get_delegations_by_agent_bumps_ttl() {
         env.storage().persistent().get_ttl(&del_key)
     });
     assert!(refreshed_ttl > 17_280);
+}
+
+// ── Keeper heartbeat bounty (issue #399) ─────────────────────────────────────
+
+/// Per-bump reward used by the keeper bounty tests, in stroops (0.01 XLM).
+const TEST_KEEPER_REWARD: i128 = 100_000;
+
+/// Registers a SAC token, configures the keeper bounty with `reward`, mints
+/// `funding` for a fresh contributor and funds the maintenance reserve.
+/// Returns the token address so tests can assert on balances.
+fn setup_funded_keeper_bounty(
+    env: &Env,
+    client: &DelegationRegistryClient<'_>,
+    admin: &Address,
+    reward: i128,
+    funding: i128,
+) -> Address {
+    let token_admin = Address::generate(env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    assert!(client.configure_keeper_bounty(admin, &token, &reward));
+
+    let funder = Address::generate(env);
+    StellarAssetClient::new(env, &token).mint(&funder, &funding);
+    assert_eq!(client.fund_maintenance_reserve(&funder, &funding), funding);
+
+    token
+}
+
+/// Creates an active delegation with `ttl_ledgers` remaining lifetime and
+/// returns its id.
+fn create_delegation_with_ttl(
+    client: &DelegationRegistryClient<'_>,
+    owner: &Address,
+    agent_id: &BytesN<32>,
+    permissions_contract: &Address,
+    ttl_ledgers: u32,
+) -> u64 {
+    let label = Symbol::new(&client.env, "Keeper_Del");
+    client.create_delegation(owner, agent_id, permissions_contract, &label, &ttl_ledgers)
+}
+
+#[test]
+fn test_keeper_bounty_pays_eligible_keeper() {
+    let (env, client, admin, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let token = setup_funded_keeper_bounty(&env, &client, &admin, TEST_KEEPER_REWARD, 1_000_000);
+    let token_client = TokenClient::new(&env, &token);
+
+    let keeper = Address::generate(&env);
+    // 49_000 remaining ledgers: inside the 50_000-ledger bounty window.
+    let id = create_delegation_with_ttl(&client, &owner, &agent_id, &permissions_contract, 49_000);
+    assert_eq!(token_client.balance(&keeper), 0);
+
+    let status = client.bump_delegation_ttl_with_reward(&id, &keeper);
+    assert_eq!(
+        status,
+        KeeperBountyStatus {
+            delegation_id: id,
+            remaining_ledgers: 49_000,
+            is_eligible_for_bounty: true,
+            bounty_amount_stroops: TEST_KEEPER_REWARD,
+        }
+    );
+
+    // The reward moved from the maintenance reserve to the keeper.
+    assert_eq!(token_client.balance(&keeper), TEST_KEEPER_REWARD);
+    assert_eq!(
+        client.get_maintenance_reserve(),
+        1_000_000 - TEST_KEEPER_REWARD
+    );
+}
+
+#[test]
+fn test_keeper_bounty_paid_event_emitted() {
+    let (env, client, admin, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let _token = setup_funded_keeper_bounty(&env, &client, &admin, TEST_KEEPER_REWARD, 1_000_000);
+
+    let keeper = Address::generate(&env);
+    let id = create_delegation_with_ttl(&client, &owner, &agent_id, &permissions_contract, 49_000);
+    let _ = client.bump_delegation_ttl_with_reward(&id, &keeper);
+
+    let events = env.events().all();
+    let found = events.iter().any(|(_, topics, _)| {
+        let t: soroban_sdk::Vec<soroban_sdk::Val> = topics;
+        t.len() >= 2
+            && Symbol::try_from_val(&env, &t.get(0).unwrap()).ok() == Some(symbol_short!("deleg"))
+            && Symbol::try_from_val(&env, &t.get(1).unwrap()).ok() == Some(symbol_short!("k_bpay"))
+    });
+    assert!(found, "KeeperBountyPaid event not emitted");
+}
+
+#[test]
+fn test_keeper_bounty_not_eligible_when_far_from_expiry() {
+    let (env, client, admin, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let token = setup_funded_keeper_bounty(&env, &client, &admin, TEST_KEEPER_REWARD, 1_000_000);
+    let token_client = TokenClient::new(&env, &token);
+
+    let keeper = Address::generate(&env);
+    // 100_000 remaining ledgers: still outside the 50_000-ledger bounty window.
+    let id = create_delegation_with_ttl(&client, &owner, &agent_id, &permissions_contract, 100_000);
+
+    let status = client.bump_delegation_ttl_with_reward(&id, &keeper);
+    assert_eq!(
+        status,
+        KeeperBountyStatus {
+            delegation_id: id,
+            remaining_ledgers: 100_000,
+            is_eligible_for_bounty: false,
+            bounty_amount_stroops: 0,
+        }
+    );
+
+    // No payout, no reserve movement, but the heartbeat bump itself happened.
+    assert_eq!(token_client.balance(&keeper), 0);
+    assert_eq!(client.get_maintenance_reserve(), 1_000_000);
+}
+
+#[test]
+fn test_keeper_bounty_cooldown_blocks_repeat_payout() {
+    let (env, client, admin, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let token = setup_funded_keeper_bounty(&env, &client, &admin, TEST_KEEPER_REWARD, 1_000_000);
+    let token_client = TokenClient::new(&env, &token);
+
+    let keeper = Address::generate(&env);
+    let id = create_delegation_with_ttl(&client, &owner, &agent_id, &permissions_contract, 49_000);
+
+    // First bump pays out.
+    let first = client.bump_delegation_ttl_with_reward(&id, &keeper);
+    assert!(first.is_eligible_for_bounty);
+    assert_eq!(token_client.balance(&keeper), TEST_KEEPER_REWARD);
+
+    // An immediate second bump is heartbeat-only: the cooldown has not elapsed.
+    let second = client.bump_delegation_ttl_with_reward(&id, &keeper);
+    assert!(!second.is_eligible_for_bounty);
+    assert_eq!(second.bounty_amount_stroops, 0);
+    assert_eq!(token_client.balance(&keeper), TEST_KEEPER_REWARD);
+
+    // After the cooldown elapses (and while still inside the bounty window)
+    // the next bump pays again.
+    let advanced = 49_000 - (KEEPER_BOUNTY_COOLDOWN_LEDGERS + 1);
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + KEEPER_BOUNTY_COOLDOWN_LEDGERS + 1);
+    let third = client.bump_delegation_ttl_with_reward(&id, &keeper);
+    assert!(third.is_eligible_for_bounty);
+    assert_eq!(third.remaining_ledgers, advanced);
+    assert_eq!(token_client.balance(&keeper), 2 * TEST_KEEPER_REWARD);
+}
+
+#[test]
+fn test_keeper_bounty_unconfigured_returns_no_reward() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    // No configure_keeper_bounty call: the bounty is not configured, so an
+    // otherwise-eligible delegation pays nothing but still gets its heartbeat.
+    let keeper = Address::generate(&env);
+    let id = create_delegation_with_ttl(&client, &owner, &agent_id, &permissions_contract, 49_000);
+
+    let status = client.bump_delegation_ttl_with_reward(&id, &keeper);
+    assert!(!status.is_eligible_for_bounty);
+    assert_eq!(status.bounty_amount_stroops, 0);
+
+    let queried = client.get_keeper_bounty_status(&id);
+    assert_eq!(queried, status);
+
+    // Reads reflect the unconfigured state.
+    assert_eq!(client.get_keeper_reward(), 0);
+    assert_eq!(
+        client.try_get_maintenance_reserve(),
+        Err(Ok(DelegationError::BountyNotConfigured))
+    );
+}
+
+#[test]
+fn test_keeper_bounty_reserve_too_small_skips_payout() {
+    let (env, client, admin, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    // Reward exceeds the funded reserve: no payout, but no error either —
+    // the heartbeat bump itself must not depend on reserve funding.
+    let token = setup_funded_keeper_bounty(&env, &client, &admin, 1_000_000, 500_000);
+    let token_client = TokenClient::new(&env, &token);
+
+    let keeper = Address::generate(&env);
+    let id = create_delegation_with_ttl(&client, &owner, &agent_id, &permissions_contract, 49_000);
+
+    let status = client.bump_delegation_ttl_with_reward(&id, &keeper);
+    assert!(!status.is_eligible_for_bounty);
+    assert_eq!(status.bounty_amount_stroops, 0);
+    assert_eq!(token_client.balance(&keeper), 0);
+    assert_eq!(client.get_maintenance_reserve(), 500_000);
+}
+
+#[test]
+fn test_bump_ttl_with_reward_requires_keeper_auth() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+
+    // Create the delegation with the owner's authorization mocked, then
+    // disable auth mocking so the keeper's missing authorization fails the
+    // call instead of paying an unauthenticated keeper.
+    env.mock_all_auths();
+    let id = create_delegation_with_ttl(&client, &owner, &agent_id, &permissions_contract, 49_000);
+
+    env.mock_auths(&[]);
+    let keeper = Address::generate(&env);
+    let result = client.try_bump_delegation_ttl_with_reward(&id, &keeper);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_bump_ttl_with_reward_rejects_missing_delegation() {
+    let (env, client, _, _, _, _) = setup();
+    env.mock_all_auths();
+
+    let keeper = Address::generate(&env);
+    let result = client.try_bump_delegation_ttl_with_reward(&999, &keeper);
+    assert_eq!(result, Err(Ok(DelegationError::NotFound)));
+}
+
+#[test]
+fn test_bump_ttl_with_reward_rejects_not_active() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let keeper = Address::generate(&env);
+    let paused_id =
+        create_delegation_with_ttl(&client, &owner, &agent_id, &permissions_contract, 49_000);
+    client.pause_delegation(&paused_id);
+    assert_eq!(
+        client.try_bump_delegation_ttl_with_reward(&paused_id, &keeper),
+        Err(Ok(DelegationError::NotActive))
+    );
+
+    let revoked_id =
+        create_delegation_with_ttl(&client, &owner, &agent_id, &permissions_contract, 49_000);
+    client.revoke_delegation(&revoked_id);
+    assert_eq!(
+        client.try_bump_delegation_ttl_with_reward(&revoked_id, &keeper),
+        Err(Ok(DelegationError::NotActive))
+    );
+}
+
+#[test]
+fn test_bump_ttl_with_reward_rejects_semantically_expired() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let id = create_delegation_with_ttl(&client, &owner, &agent_id, &permissions_contract, 100);
+
+    // Advance past expires_at_ledger (100 + 100 = 200).
+    env.ledger().set_sequence_number(200);
+    let keeper = Address::generate(&env);
+    assert_eq!(
+        client.try_bump_delegation_ttl_with_reward(&id, &keeper),
+        Err(Ok(DelegationError::Expired))
+    );
+}
+
+#[test]
+fn test_bump_delegation_ttl_with_reward_bumps_ttl() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "TTL_Keeper");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &LARGE_TTL);
+    let keeper = Address::generate(&env);
+
+    let delegation_key = DataKey::Delegation(id);
+    let user_dels_key = DataKey::UserDelegations(owner.clone());
+
+    let initial_delegation_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&delegation_key)
+    });
+    assert!(initial_delegation_ttl > 17_280);
+
+    // Advance to the point where the entries are about to drop below the
+    // bump threshold; the keeper heartbeat must refresh both keys.
+    env.ledger()
+        .set_sequence_number(initial_delegation_ttl - 17_280 + 1);
+    let _ = client.bump_delegation_ttl_with_reward(&id, &keeper);
+
+    let refreshed_delegation_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&delegation_key)
+    });
+    assert!(refreshed_delegation_ttl > 17_280);
+
+    let refreshed_user_dels_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&user_dels_key)
+    });
+    assert!(refreshed_user_dels_ttl > 17_280);
+}
+
+#[test]
+fn test_configure_keeper_bounty_requires_admin() {
+    let (env, client, admin, _, _, _) = setup();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    // A non-admin caller cannot configure the bounty.
+    let intruder = Address::generate(&env);
+    assert_eq!(
+        client.try_configure_keeper_bounty(&intruder, &token, &TEST_KEEPER_REWARD),
+        Err(Ok(DelegationError::NotAuthorized))
+    );
+
+    // Only the admin may configure it.
+    assert!(client.configure_keeper_bounty(&admin, &token, &TEST_KEEPER_REWARD));
+    assert_eq!(client.get_keeper_reward(), TEST_KEEPER_REWARD);
+
+    // Zero and above-cap rewards are rejected.
+    assert_eq!(
+        client.try_configure_keeper_bounty(&admin, &token, &0),
+        Err(Ok(DelegationError::InvalidBountyAmount))
+    );
+    assert_eq!(
+        client.try_configure_keeper_bounty(&admin, &token, &(MAX_KEEPER_BOUNTY_STROOPS + 1)),
+        Err(Ok(DelegationError::InvalidBountyAmount))
+    );
+}
+
+#[test]
+fn test_configure_keeper_bounty_requires_auth() {
+    // Without mock_all_auths the admin's authorization is missing.
+    let (env, client, admin, _, _, _) = setup();
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let result = client.try_configure_keeper_bounty(&admin, &token, &TEST_KEEPER_REWARD);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_fund_maintenance_reserve_moves_funds() {
+    let (env, client, admin, _, _, _) = setup();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let token_client = TokenClient::new(&env, &token);
+
+    // Funding before configuration fails.
+    let contributor = Address::generate(&env);
+    StellarAssetClient::new(&env, &token).mint(&contributor, &1_000_000);
+    assert_eq!(
+        client.try_fund_maintenance_reserve(&contributor, &1_000),
+        Err(Ok(DelegationError::BountyNotConfigured))
+    );
+
+    assert!(client.configure_keeper_bounty(&admin, &token, &TEST_KEEPER_REWARD));
+
+    // Funding pulls tokens from the contributor into the contract's reserve.
+    assert_eq!(client.fund_maintenance_reserve(&contributor, &1_000), 1_000);
+
+    // The funding event is emitted with the contributor as entity id.
+    // (Checked immediately after the call: the test env only retains events
+    // from the most recent contract invocation.)
+    let events = env.events().all();
+    let found = events.iter().any(|(_, topics, _)| {
+        let t: soroban_sdk::Vec<soroban_sdk::Val> = topics;
+        t.len() >= 2
+            && Symbol::try_from_val(&env, &t.get(0).unwrap()).ok() == Some(symbol_short!("deleg"))
+            && Symbol::try_from_val(&env, &t.get(1).unwrap()).ok() == Some(symbol_short!("k_fund"))
+    });
+    assert!(found, "MaintenanceReserveFunded event not emitted");
+
+    assert_eq!(token_client.balance(&contributor), 999_000);
+    assert_eq!(client.get_maintenance_reserve(), 1_000);
+
+    // Non-positive funding amounts are rejected.
+    assert_eq!(
+        client.try_fund_maintenance_reserve(&contributor, &0),
+        Err(Ok(DelegationError::InvalidFundingAmount))
+    );
+}
+
+#[test]
+fn test_fund_maintenance_reserve_requires_auth() {
+    let (env, client, admin, _, _, _) = setup();
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    // Configure with the admin's authorization mocked, then disable auth
+    // mocking so the contributor's missing authorization fails the call.
+    env.mock_all_auths();
+    assert!(client.configure_keeper_bounty(&admin, &token, &TEST_KEEPER_REWARD));
+
+    env.mock_auths(&[]);
+    let contributor = Address::generate(&env);
+    let result = client.try_fund_maintenance_reserve(&contributor, &1_000);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_get_keeper_bounty_status_reports_window() {
+    let (env, client, admin, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    setup_funded_keeper_bounty(&env, &client, &admin, TEST_KEEPER_REWARD, 1_000_000);
+
+    // Outside the window: not eligible.
+    let far_id =
+        create_delegation_with_ttl(&client, &owner, &agent_id, &permissions_contract, 100_000);
+    assert_eq!(
+        client.get_keeper_bounty_status(&far_id),
+        KeeperBountyStatus {
+            delegation_id: far_id,
+            remaining_ledgers: 100_000,
+            is_eligible_for_bounty: false,
+            bounty_amount_stroops: 0,
+        }
+    );
+
+    // Inside the window: eligible, with the configured reward reported.
+    let near_id =
+        create_delegation_with_ttl(&client, &owner, &agent_id, &permissions_contract, 49_000);
+    assert_eq!(
+        client.get_keeper_bounty_status(&near_id),
+        KeeperBountyStatus {
+            delegation_id: near_id,
+            remaining_ledgers: 49_000,
+            is_eligible_for_bounty: true,
+            bounty_amount_stroops: TEST_KEEPER_REWARD,
+        }
+    );
+
+    // Unknown delegations fail closed.
+    assert_eq!(
+        client.try_get_keeper_bounty_status(&999),
+        Err(Ok(DelegationError::NotFound))
+    );
 }
