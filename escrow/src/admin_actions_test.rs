@@ -81,8 +81,10 @@ fn fee_recipient_waits_for_both_exact_boundaries_and_cannot_replay() {
     assert_eq!(
         client.get_fee_config(),
         FeeConfig {
-            fee_bps: 300,
-            treasury
+            basis_points: 300,
+            treasury,
+            min_fee_floor_stroops: DEFAULT_MIN_FEE_STROOPS,
+            max_fee_ceiling_stroops: 0,
         }
     );
     assert_eq!(client.get_admin_action(&id), None);

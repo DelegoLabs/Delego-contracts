@@ -299,9 +299,19 @@ impl EscrowContract {
             AdminAction::FeeConfig(fee_bps, treasury) => {
                 admin.require_auth();
                 consume(&env, proposal.action)?;
+                // Preserve the existing floor/ceiling when only updating fee_bps + treasury.
+                let existing: Option<FeeConfig> = env.storage().instance().get(&DataKey::FeeConfig);
+                let (min_floor, max_ceil) = existing
+                    .map(|c| (c.min_fee_floor_stroops, c.max_fee_ceiling_stroops))
+                    .unwrap_or((DEFAULT_MIN_FEE_STROOPS, 0));
                 env.storage()
                     .instance()
-                    .set(&DataKey::FeeConfig, &FeeConfig { fee_bps, treasury });
+                    .set(&DataKey::FeeConfig, &FeeConfig {
+                        basis_points: fee_bps,
+                        treasury,
+                        min_fee_floor_stroops: min_floor,
+                        max_fee_ceiling_stroops: max_ceil,
+                    });
                 // Remove obsolete pre-upgrade scheduling state, never auto-apply it.
                 env.storage()
                     .instance()

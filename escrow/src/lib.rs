@@ -61,6 +61,9 @@ pub mod invariants;
 mod admin_actions;
 #[cfg(test)]
 mod admin_actions_test;
+/// Unit-test sub-modules for the escrow contract (issue #540).
+#[cfg(test)]
+mod tests;
 pub use admin_actions::{
     AdminAction, PendingAdminAction, QueuedAdminAction, ADMIN_ACTION_DELAY_LEDGERS,
     ADMIN_ACTION_DELAY_SECONDS,
@@ -1192,6 +1195,18 @@ pub struct FeeConfig {
     pub fee_bps: u32,
     /// Address that receives the fee
     pub treasury: Address,
+    /// Minimum fee floor in the token's smallest unit (stroops).
+    ///
+    /// Enforces a non-zero platform fee even when `amount * fee_bps / 10_000`
+    /// truncates to zero due to integer division on micro-transactions. Set to
+    /// `0` to disable the floor and use pure pro-rata behaviour. The floor is
+    /// always clamped to the released amount so a settlement is never over-charged.
+    pub min_fee_floor_stroops: i128,
+    /// Maximum fee ceiling in the token's smallest unit (stroops).
+    ///
+    /// Caps the platform fee so that very large orders do not pay a
+    /// disproportionate fee. Set to `0` to disable the ceiling.
+    pub max_fee_ceiling_stroops: i128,
 }
 
 /// Complete escrow configuration including admin and fee parameters.
@@ -1206,6 +1221,12 @@ pub struct EscrowConfig {
     pub treasury: Address,
     pub min_amount: i128,
     pub max_amount: i128,
+    /// Minimum fee floor in stroops baked into [`FeeConfig`] (issue #540).
+    /// Defaults to [`DEFAULT_MIN_FEE_STROOPS`] when not provided (zero maps to the default).
+    pub min_fee_floor_stroops: i128,
+    /// Maximum fee ceiling in stroops baked into [`FeeConfig`] (issue #540).
+    /// Defaults to `0` (disabled) when not provided.
+    pub max_fee_ceiling_stroops: i128,
 }
 
 /// One treasury's share of the release fee, used by [`FeeConfig`]'s
@@ -3018,6 +3039,8 @@ fn update_merchant_volume_and_tier(env: &Env, merchant: &Address, amount: i128) 
             );
         }
     }
+}
+
 /// Verify the actual net token delta received by the contract after a deposit
 /// transfer.
 ///
@@ -3103,6 +3126,12 @@ impl EscrowContract {
             &FeeConfig {
                 fee_bps: config.fee_bps,
                 treasury: config.treasury.clone(),
+                min_fee_floor_stroops: if config.min_fee_floor_stroops == 0 {
+                    DEFAULT_MIN_FEE_STROOPS
+                } else {
+                    config.min_fee_floor_stroops
+                },
+                max_fee_ceiling_stroops: config.max_fee_ceiling_stroops,
             },
         );
         env.storage().instance().set(
@@ -3147,7 +3176,12 @@ impl EscrowContract {
         env.storage().instance().set(&DataKey::LastEscrowId, &0u64);
         env.storage()
             .instance()
-            .set(&DataKey::FeeConfig, &FeeConfig { fee_bps, treasury });
+            .set(&DataKey::FeeConfig, &FeeConfig {
+                fee_bps,
+                treasury,
+                min_fee_floor_stroops: DEFAULT_MIN_FEE_STROOPS,
+                max_fee_ceiling_stroops: 0,
+            });
         env.storage().instance().set(
             &DataKey::AmountLimits,
             &EscrowAmountLimits {
@@ -3936,38 +3970,20 @@ impl EscrowContract {
             update_merchant_volume_and_tier(&env, &record.seller, record.amount);
             record.status = EscrowStatus::Released;
             Self::try_mint_purchase_receipt(&env, &mut record);
-        let payout = if release_to_seller {
-            Some(Self::compute_payout(&env, record.amount)?)
-        } else {
-            None
-        };
-        record.status = if release_to_seller {
-            EscrowStatus::Released
-        } else {
-            EscrowStatus::Refunded
-        };
-        record.updated_at = env.ledger().timestamp();
-        env.storage().persistent().set(&key, &record);
-        env.storage().persistent().remove(&votes_key);
-        env.storage()
-            .persistent()
-            .remove(&DataKey::TimeoutExtensionVotes(escrow_id));
-
-        if release_to_seller {
-            let payout = payout.unwrap();
-            Self::distribute_fee(&env, &token_client, payout.fee)?;
-            token_client.transfer(
-                &env.current_contract_address(),
-                &record.seller,
-                &payout.seller_net,
-            );
         } else {
             token_client.transfer(
                 &env.current_contract_address(),
                 &record.buyer,
                 &record.amount,
             );
+            record.status = EscrowStatus::Refunded;
         }
+        record.updated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().remove(&votes_key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TimeoutExtensionVotes(escrow_id));
 
         env.events().publish(
             (
@@ -4749,10 +4765,10 @@ impl EscrowContract {
         merchant: &Address,
         amount: i128,
     ) -> Result<i128, EscrowError> {
-    /// The total is floored at the configured minimum fee (issue #362) so that
-    /// integer truncation can never make the fee of a small release zero.
-    fn compute_fee_amount(env: &Env, amount: i128) -> Result<i128, EscrowError> {
-        let min_fee = Self::get_min_fee_stroops(env.clone());
+        let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
+        let min_fee = fee_config.min_fee_floor_stroops;
+        let max_fee = fee_config.max_fee_ceiling_stroops;
+
         let shares: soroban_sdk::Vec<TreasuryShare> = env
             .storage()
             .instance()
@@ -4763,25 +4779,28 @@ impl EscrowContract {
             let mut total_fee: i128 = 0;
             let mut total_bps: u32 = 0;
             for share in shares.iter() {
-                let fee = calculate_fee_and_yield(amount, share.bps)?;
                 total_fee = total_fee
-                    .checked_add(fee)
+                    .checked_add(bps_fee(amount, share.bps))
                     .ok_or(EscrowError::MathOverflow)?;
-                total_fee += bps_fee(amount, share.bps);
                 total_bps += share.bps;
             }
             (total_fee, total_bps)
         } else {
-            let fee_bps = effective_fee_bps(env, merchant)? as i128;
-            Ok((amount / 10_000i128) * fee_bps + ((amount % 10_000i128) * fee_bps) / 10_000i128)
-            let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
-            calculate_fee_and_yield(amount, fee_config.fee_bps)
-        }
-            let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
-            (bps_fee(amount, fee_config.fee_bps), fee_config.fee_bps)
+            let bps = effective_fee_bps(env, merchant)?;
+            (bps_fee(amount, bps), bps)
         };
 
-        Ok(apply_fee_floor(amount, total_bps, pro_rata_fee, min_fee))
+        // Apply floor: ensure fee is never zero due to integer truncation (issue #540).
+        let floored = apply_fee_floor(amount, total_bps, pro_rata_fee, min_fee);
+
+        // Apply ceiling: cap the fee when max_fee_ceiling_stroops is configured (non-zero).
+        let final_fee = if max_fee > 0 && floored > max_fee {
+            max_fee
+        } else {
+            floored
+        };
+
+        Ok(final_fee)
     }
 
     /// Computes the net seller payout and platform fee for `amount` (issue #27).
@@ -6821,9 +6840,6 @@ impl EscrowContract {
             return Err(EscrowError::ZeroAmount);
         }
 
-        let remaining = record.amount - record.released_amount - record.refunded_amount;
-        let total_drawn = release_amount + pre_deducted;
-        if total_drawn > remaining {
         let remaining = record
             .amount
             .checked_sub(record.released_amount)
@@ -8836,6 +8852,9 @@ impl EscrowContract {
         caller: Address,
     ) -> Result<bool, EscrowError> {
         caller.require_auth();
+        Err(EscrowError::InvalidStatus)
+    }
+
     /// Register the line items that make up a multi-item escrow (issue #363).
     ///
     /// Buyer or admin only, while the escrow is not terminal and no funds have
@@ -9065,19 +9084,9 @@ impl EscrowContract {
         env.events().publish(
             (
                 symbol_short!("escrow"),
-                symbol_short!("insp_auto"),
+                symbol_short!("subres"),
                 escrow_id,
             ),
-            EscrowInspectionAutoReleasedEvent {
-                escrow_id,
-                released_by: caller,
-            },
-        );
-
-        Ok(true)
-    }
-
-            (symbol_short!("escrow"), symbol_short!("subres"), escrow_id),
             SubItemResolvedEvent {
                 escrow_id,
                 item_id: stored.item_id.clone(),
@@ -9087,6 +9096,7 @@ impl EscrowContract {
                 resolved_by: caller,
             },
         );
+
         Ok(true)
     }
 
@@ -11368,7 +11378,9 @@ mod cancel_guard_tests {
             treasury: Address::generate(env),
             min_amount: 100,
             max_amount: 1_000_000,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract);
         StellarAssetClient::new(env, &token).mint(&buyer, &10_000);
@@ -12000,7 +12012,9 @@ mod escrow_feature_tests {
             treasury,
             min_amount: 100,
             max_amount: 1_000_000,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract_id);
         StellarAssetClient::new(env, &token).mint(&buyer, &10_000);
@@ -12309,7 +12323,9 @@ mod fee_distribution_tests {
             treasury: treasury.clone(),
             min_amount: 100i128,
             max_amount: 1_000_000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract_id);
         env.mock_all_auths();
@@ -12419,7 +12435,9 @@ mod fee_tier_tests {
             treasury,
             min_amount: 100,
             max_amount: 1_000_000,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract_id);
         StellarAssetClient::new(env, &token).mint(&buyer, &1_000_000);
@@ -12705,7 +12723,9 @@ mod batch_flow_tests {
             treasury: treasury.clone(),
             min_amount: 100i128,
             max_amount: 1_000_000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(&env, &contract_id);
 
@@ -12742,7 +12762,9 @@ mod metadata_tests {
             treasury: treasury.clone(),
             min_amount: 100i128,
             max_amount: 1_000_000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract_id);
         (client, admin, contract_id)
@@ -13134,7 +13156,9 @@ mod multi_oracle_tests {
                 treasury: treasury.clone(),
                 min_amount: 100,
                 max_amount: 1_000_000,
-            },),
+                            min_fee_floor_stroops: 0,
+                max_fee_ceiling_stroops: 0,
+},),
         );
         let client = EscrowContractClient::new(env, &contract_id);
         for token in [&source, &middle, &dest] {
@@ -13572,6 +13596,7 @@ mod multi_oracle_tests {
             f.client
                 .try_execute_path_payment(&second_id, &f.buyer, &f.router, &route),
             Err(Ok(EscrowError::SlippageExceeded))
+        );
         let token = env
             .register_stellar_asset_contract_v2(Address::generate(env))
             .address();
@@ -13581,7 +13606,9 @@ mod multi_oracle_tests {
             treasury,
             min_amount: 1,
             max_amount: 1_000_000_000,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract_id);
         StellarAssetClient::new(env, &token).mint(&buyer, &1_000_000);
@@ -13781,6 +13808,7 @@ mod multi_oracle_tests {
         assert_eq!(
             client.try_resolve_sub_item_dispute(&escrow_id, &admin, &resolution),
             Err(Ok(EscrowError::SubItemAlreadyResolved))
+        );
         let order_id = BytesN::from_array(env, &[51; 32]);
         let escrow_id = client.deposit(
             &buyer, &seller, &token, &1_000, &order_id, &1_000, &None, &None,
@@ -14245,6 +14273,9 @@ mod multi_oracle_tests {
         assert_eq!(record.released_amount, 0);
         assert_eq!(record.refunded_amount, 400);
         assert_eq!(record.status, EscrowStatus::Funded);
+    }
+
+    #[test]
     fn only_admin_can_resolve_items() {
         let env = Env::default();
         let (client, _admin, buyer, _seller, _token, escrow_id) = disputed_escrow(&env);
@@ -14260,6 +14291,10 @@ mod multi_oracle_tests {
                 },
             ),
             Err(Ok(EscrowError::Unauthorized))
+        );
+    }
+
+    #[test]
     fn invalid_configurations_are_rejected() {
         let env = Env::default();
         let (client, admin, _buyer, _seller, _token, escrow_id, oracles) = base(&env);
@@ -14341,7 +14376,9 @@ mod dual_control_timeout_tests {
             treasury,
             min_amount: 100,
             max_amount: 1_000_000,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract_id);
         StellarAssetClient::new(env, &token).mint(&buyer, &100_000);
@@ -14820,7 +14857,9 @@ mod quorum_cleanup_tests {
             treasury: treasury.clone(),
             min_amount: 1i128,
             max_amount: 1000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(&env, &contract_id);
         admin_actions_test::approve(&env, &client, &admin, AdminAction::AddToken(token.clone()));
@@ -14870,7 +14909,9 @@ mod reentrancy_tests {
             treasury: Address::generate(env),
             min_amount: 1i128,
             max_amount: 1_000_000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         env.register(EscrowContract, (config,))
     }
 
@@ -15004,7 +15045,9 @@ mod archival_tests {
             treasury,
             min_amount: 1i128,
             max_amount: 1_000_000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract_id);
         client.add_token(&admin, &token);
@@ -15426,7 +15469,9 @@ mod error_code_allocation_tests {
             treasury: treasury.clone(),
             min_amount: 1i128,
             max_amount: 1000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(&env, &contract_id);
         client.add_token(&admin, &token);
@@ -15472,7 +15517,9 @@ mod error_code_allocation_tests {
             treasury: treasury.clone(),
             min_amount: 1i128,
             max_amount: 1000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(&env, &contract_id);
         client.add_token(&admin, &token);
@@ -15520,7 +15567,9 @@ mod error_code_allocation_tests {
             treasury: treasury.clone(),
             min_amount: 1i128,
             max_amount: 1000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(&env, &contract_id);
         client.add_token(&admin, &token);
@@ -15571,7 +15620,9 @@ mod error_code_allocation_tests {
             treasury: treasury.clone(),
             min_amount: 1i128,
             max_amount: 1000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(&env, &contract_id);
         client.add_token(&admin, &token);
@@ -15625,7 +15676,9 @@ mod error_code_allocation_tests {
             treasury: treasury.clone(),
             min_amount: 1i128,
             max_amount: 1000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(&env, &contract_id);
         client.add_token(&admin, &token);
@@ -15681,7 +15734,9 @@ mod error_code_allocation_tests {
             treasury: treasury.clone(),
             min_amount: 1i128,
             max_amount: 1000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(&env, &contract_id);
         client.add_token(&admin, &token);
@@ -15748,7 +15803,9 @@ mod error_code_allocation_tests {
             treasury: treasury.clone(),
             min_amount: 1i128,
             max_amount: 1000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(&env, &contract_id);
         client.add_token(&admin, &token);
@@ -15808,7 +15865,9 @@ mod error_code_allocation_tests {
             treasury: treasury.clone(),
             min_amount: 1i128,
             max_amount: 1000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(&env, &contract_id);
         client.add_token(&admin, &token);
@@ -15852,7 +15911,9 @@ mod error_code_allocation_tests {
             treasury: treasury.clone(),
             min_amount: 1i128,
             max_amount: 1000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(&env, &contract_id);
         client.add_token(&admin, &token);
@@ -15875,9 +15936,6 @@ mod error_code_allocation_tests {
         // Non-admin cannot approve
         let result = client.try_approve_emergency_rescue(&escrow_id, &not_admin);
         assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
-            EscrowError::MathOverflow as u32,
-            EscrowError::ReentrancyDetected as u32,
-        ]
     }
 
     #[test]
@@ -15986,7 +16044,9 @@ mod order_metadata_digest_tests {
             treasury,
             min_amount: 1i128,
             max_amount: 1_000_000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract_id);
         (client, admin)
@@ -16139,7 +16199,9 @@ mod purchase_receipt_tests {
             treasury,
             min_amount: 1i128,
             max_amount: 1_000_000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let client_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &client_id);
 
@@ -16253,7 +16315,9 @@ mod min_fee_floor_tests {
             treasury: treasury.clone(),
             min_amount: 1i128,
             max_amount: 1_000_000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract_id);
         client.add_token(&admin, &token);
@@ -16323,6 +16387,10 @@ mod min_fee_floor_tests {
         assert_eq!(
             client.try_get_purchase_receipt_token_id(&999u64),
             Err(Ok(EscrowError::NotFound))
+        );
+    }
+
+    #[test]
     fn pro_rata_fee_above_the_floor_is_unchanged() {
         assert_eq!(
             calculate_fee_with_minimum(1_000_000, FEE_BPS, DEFAULT_MIN_FEE_STROOPS),
@@ -16378,7 +16446,9 @@ mod lending_pool_delegation_tests {
             treasury: treasury.clone(),
             min_amount: 1i128,
             max_amount: 100_000i128,
-        };
+                    min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+};
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract_id);
         (client, admin, contract_id)
