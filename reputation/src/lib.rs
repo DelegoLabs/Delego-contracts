@@ -518,10 +518,6 @@ pub struct ContractVersion {
 #[repr(u32)]
 pub enum ReputationError {
     /// Reserved for API/ABI compatibility with issue #18's error contract.
-    /// Unreachable in normal operation: initialization now happens via
-    /// `__constructor` (see [`ReputationContract::__constructor`]), which
-    /// the host guarantees can run at most once, atomically with
-    /// deployment — there is no second call for this to guard against.
     AlreadyInitialized = 3001,
     NotInitialized = 3002,
     Unauthorized = 3003,
@@ -539,32 +535,26 @@ pub enum ReputationError {
     NoActiveFlag = 3010,
     /// Reporter did not flag the entity.
     NotFlagReporter = 3011,
-    /// `submit_verified_review`'s `VerifiedReviewProof` did not check out:
-    /// the referenced escrow could not be read from `escrow_contract`, is
-    /// not in `Released` status, its `order_id` did not match
-    /// `order_hash`, or `rater`/`entity` are not its buyer/seller pair
-    /// (issue #286).
+    /// `submit_verified_review`'s `VerifiedReviewProof` did not check out.
     UnverifiedOrder = 3012,
-    /// Reporter did not flag the entity.
-    NotFlagReporter = 3011,
     /// Review commitment already exists for this escrow_id.
-    DuplicateReviewCommitment = 3012,
+    DuplicateReviewCommitment = 3021,
     /// Caller is not the buyer for this escrow.
-    NotBuyer = 3013,
+    NotBuyer = 3022,
     /// Escrow is not in settled state.
-    EscrowNotSettled = 3014,
+    EscrowNotSettled = 3023,
     /// Quorum threshold not reached for dispute verdict.
-    QuorumNotReached = 3015,
+    QuorumNotReached = 3024,
     /// Invalid dispute verdict symbol.
-    InvalidVerdictSymbol = 3016,
-    /// Merchant is not eligible for rehabilitation (not previously penalised/frozen).
-    NotEligibleForRehabilitation = 3012,
+    InvalidVerdictSymbol = 3025,
+    /// Merchant is not eligible for rehabilitation.
+    NotEligibleForRehabilitation = 3026,
     /// Rehabilitation program not found for merchant.
-    RehabilitationNotFound = 3013,
+    RehabilitationNotFound = 3027,
     /// Probation orders requirement not yet met for graduation.
-    ProbationNotComplete = 3014,
+    ProbationNotComplete = 3028,
     /// Invalid collateral amount (must be positive).
-    InvalidCollateralAmount = 3015,
+    InvalidCollateralAmount = 3029,
     /// Blinded review verification failed.
     BlindedReviewVerificationFailed = 3016,
     /// Blinded receipt already used (double-submission prevented).
@@ -575,9 +565,8 @@ pub enum ReputationError {
     InvalidFraudBond = 3019,
     /// Fraud report resolution invalid state.
     InvalidReportStatus = 3020,
-    UnverifiedOrder = 3012,
     /// A carrier proof was submitted by an oracle that is not registered.
-    CarrierOracleNotAuthorized = 3013,
+    CarrierOracleNotAuthorized = 3030,
 }
 
 #[cfg(test)]
@@ -766,7 +755,6 @@ pub struct ReputationCursor {
 /// `TryFrom<&T> for ScVal` conversion. The cursor is therefore encoded as the
 /// `(score_bps, merchant_id)` pair of the last record on the page, with
 /// `has_more` telling the caller whether to resume from it.
-#[contracttype]
 /// This type intentionally does not derive `contracttype`: it contains
 /// `Option<ReputationCursor>`, and the SDK's `testutils` expansion cannot
 /// convert `Option<UDT>` to `ScVal` (it requires `Into<ScVal>` for the inner
@@ -794,19 +782,31 @@ impl RankedMerchantPage {
         Some(ReputationCursor {
             last_score_bps: self.next_last_score_bps,
             last_merchant_id: self.next_last_merchant_id,
+        })
+    }
+}
+
 impl TryFromVal<Env, Val> for RankedMerchantPage {
     type Error = ConversionError;
 
     fn try_from_val(env: &Env, val: &Val) -> Result<Self, Self::Error> {
-        const KEYS: [&'static str; 3] = ["merchants", "next_cursor", "total_count"];
-        let mut vals: [Val; 3] = [Val::VOID.to_val(); 3];
+        const KEYS: [&'static str; 5] = [
+            "merchants",
+            "has_more",
+            "next_last_score_bps",
+            "next_last_merchant_id",
+            "total_count",
+        ];
+        let mut vals: [Val; 5] = [Val::VOID.to_val(); 5];
         let map: MapObject = val.try_into().map_err(|_| ConversionError)?;
         env.map_unpack_to_slice(map, &KEYS, &mut vals)
             .map_err(|_| ConversionError)?;
         Ok(Self {
             merchants: vals[0].try_into_val(env).map_err(|_| ConversionError)?,
-            next_cursor: vals[1].try_into_val(env).map_err(|_| ConversionError)?,
-            total_count: vals[2].try_into_val(env).map_err(|_| ConversionError)?,
+            has_more: vals[1].try_into_val(env).map_err(|_| ConversionError)?,
+            next_last_score_bps: vals[2].try_into_val(env).map_err(|_| ConversionError)?,
+            next_last_merchant_id: vals[3].try_into_val(env).map_err(|_| ConversionError)?,
+            total_count: vals[4].try_into_val(env).map_err(|_| ConversionError)?,
         })
     }
 }
@@ -815,12 +815,24 @@ impl TryFromVal<Env, RankedMerchantPage> for Val {
     type Error = ConversionError;
 
     fn try_from_val(env: &Env, val: &RankedMerchantPage) -> Result<Self, Self::Error> {
-        const KEYS: [&'static str; 3] = ["merchants", "next_cursor", "total_count"];
-        let vals: [Val; 3] = [
+        const KEYS: [&'static str; 5] = [
+            "merchants",
+            "has_more",
+            "next_last_score_bps",
+            "next_last_merchant_id",
+            "total_count",
+        ];
+        let vals: [Val; 5] = [
             (&val.merchants)
                 .try_into_val(env)
                 .map_err(|_| ConversionError)?,
-            (&val.next_cursor)
+            val.has_more
+                .try_into_val(env)
+                .map_err(|_| ConversionError)?,
+            val.next_last_score_bps
+                .try_into_val(env)
+                .map_err(|_| ConversionError)?,
+            val.next_last_merchant_id
                 .try_into_val(env)
                 .map_err(|_| ConversionError)?,
             (&val.total_count)
@@ -1624,6 +1636,9 @@ impl ReputationContract {
             expired,
             score_matches,
             current,
+        }
+    }
+
     /// Classifies `entity` as either a merchant or buyer agent. Admin-only;
     /// the role determines which domain metrics are relevant for risk
     /// assessment (fulfillment for merchants, payment timeliness and dispute
@@ -2554,6 +2569,8 @@ impl ReputationContract {
             certified_at_ledger,
             expires_at_ledger: certified_at_ledger.saturating_add(ATTESTATION_VALIDITY_LEDGERS),
         }
+    }
+
     /// Accumulated fraud penalty for `entity`, in basis points, as applied by
     /// every score recomputation.
     fn accumulated_fraud_penalty_bps(env: &Env, entity: &Address) -> i128 {
@@ -3372,7 +3389,7 @@ mod config_parity_test {
     }
 }
 
-
+impl ReputationContract {
     // --- Rehabilitation Program ---
 
     /// Enter a rehabilitation program by posting collateral. A frozen or penalised merchant
@@ -3423,7 +3440,7 @@ mod config_parity_test {
         env.events().publish(
             (
                 symbol_short!("reput"),
-                symbol_short!("rehab_start"),
+                symbol_short!("rehab_go"),
                 merchant,
             ),
             program.clone(),
@@ -3533,7 +3550,7 @@ mod config_parity_test {
         env.events().publish(
             (
                 symbol_short!("reput"),
-                symbol_short!("rehab_grad"),
+                symbol_short!("rehab_ok"),
                 merchant,
             ),
             program,
@@ -3570,19 +3587,19 @@ mod config_parity_test {
         for i in 0..8 {
             commitment_bytes[i] = escrow_bytes[i];
         }
-        let escrow_id_commitment = BytesN::<32>::from_array(&env, commitment_bytes);
+        let escrow_id_commitment = BytesN::<32>::from_array(&env, &commitment_bytes);
 
         let receipt = BlindedReviewReceipt {
             escrow_id_commitment: escrow_id_commitment.clone(),
             blinded_public_key,
-            blind_signature: BytesN::<64>::from_array(&env, [0u8; 64]), // Placeholder
+            blind_signature: BytesN::<64>::from_array(&env, &[0u8; 64]), // Placeholder
             issued_at: env.ledger().timestamp(),
         };
 
         env.events().publish(
             (
                 symbol_short!("reput"),
-                symbol_short!("blind_token"),
+                symbol_short!("bld_token"),
             ),
             receipt.clone(),
         );
@@ -3662,22 +3679,22 @@ mod config_parity_test {
         env.events().publish(
             (
                 symbol_short!("reput"),
-                symbol_short!("blind_review"),
-                entity,
+                symbol_short!("bld_rev"),
+                entity.clone(),
             ),
             EntityRatedEvent {
                 rater: env.current_contract_address(), // Anonymous reviewer
                 entity,
                 rating,
                 escrow_id: u64::from_le_bytes([
-                    receipt.escrow_id_commitment.get(0) as u8,
-                    receipt.escrow_id_commitment.get(1) as u8,
-                    receipt.escrow_id_commitment.get(2) as u8,
-                    receipt.escrow_id_commitment.get(3) as u8,
-                    receipt.escrow_id_commitment.get(4) as u8,
-                    receipt.escrow_id_commitment.get(5) as u8,
-                    receipt.escrow_id_commitment.get(6) as u8,
-                    receipt.escrow_id_commitment.get(7) as u8,
+                    receipt.escrow_id_commitment.get(0).unwrap_or(0),
+                    receipt.escrow_id_commitment.get(1).unwrap_or(0),
+                    receipt.escrow_id_commitment.get(2).unwrap_or(0),
+                    receipt.escrow_id_commitment.get(3).unwrap_or(0),
+                    receipt.escrow_id_commitment.get(4).unwrap_or(0),
+                    receipt.escrow_id_commitment.get(5).unwrap_or(0),
+                    receipt.escrow_id_commitment.get(6).unwrap_or(0),
+                    receipt.escrow_id_commitment.get(7).unwrap_or(0),
                 ]),
             },
         );
@@ -3761,7 +3778,7 @@ mod config_parity_test {
         env.events().publish(
             (
                 symbol_short!("reput"),
-                symbol_short!("fraud_filed"),
+                symbol_short!("fraud_new"),
             ),
             report.clone(),
         );
@@ -3806,7 +3823,7 @@ mod config_parity_test {
         env.events().publish(
             (
                 symbol_short!("reput"),
-                symbol_short!("fraud_resol"),
+                symbol_short!("fraud_res"),
             ),
             report.clone(),
         );
@@ -3860,68 +3877,6 @@ mod config_parity_test {
         Ok(result)
     }
 }
-
-// --- Helper methods ---
-
-impl ReputationContract {
-    fn require_admin(env: &Env) -> Result<Address, ReputationError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(ReputationError::NotInitialized)
-    }
-
-    fn require_caller_is_admin(env: &Env, caller: &Address) -> Result<(), ReputationError> {
-        let admin = Self::require_admin(env)?;
-        if caller != &admin {
-            Err(ReputationError::Unauthorized)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn bump_entity(env: &Env, entity: &Address) {
-        if let Ok(rep_key) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            DataKey::Reputation(entity.clone())
-        })) {
-            let _ = env.storage().persistent().extend_ttl(
-                &rep_key,
-                PERSISTENT_BUMP_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
-        }
-    }
-
-    fn has_transacted_with(env: &Env, entity: &Address, counterparty: &Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Transacted(entity.clone(), counterparty.clone()))
-            .unwrap_or(false)
-    }
-
-    fn load_or_default_reputation(env: &Env, entity: &Address) -> ReputationScore {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Reputation(entity.clone()))
-            .unwrap_or_else(|| ReputationScore {
-                entity: entity.clone(),
-                score: 0,
-                total_transactions: 0,
-                successful_transactions: 0,
-                disputed_transactions: 0,
-                avg_rating: 0,
-                last_updated: 0,
-            })
-    }
-
-    fn validate_config(config: &ReputationConfig) -> Result<(), ReputationError> {
-        if config.min_transactions_threshold > SCORE_WINDOW as u64 {
-            return Err(ReputationError::InvalidParam);
-        }
-        Ok(())
-    }
-}
-
 
 // --- ReputationReaderTrait Implementation for Cross-Contract Access ---
 

@@ -58,7 +58,12 @@ pub fn get_buyer_completed_orders(
         ];
 
         let page: EscrowListPageMirror = env
-            .try_invoke_contract(escrow_contract, &Symbol::new(env, "list_escrows_by_buyer"), args)?
+            .try_invoke_contract::<EscrowListPageMirror, soroban_sdk::Error>(
+                escrow_contract,
+                &Symbol::new(env, "list_escrows_by_buyer"),
+                args,
+            )
+            .map_err(|_| InvokeError::Contract(0))?
             .map_err(|_| InvokeError::Contract(0))?;
 
         for record in page.items.iter() {

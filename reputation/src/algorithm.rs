@@ -108,7 +108,7 @@ fn isqrt(n: i128) -> i128 {
 /// systematic compliance problems.
 pub fn compute_dispute_penalty_multiplier(consecutive_losses: u32, max_power: u32) -> u32 {
     let power = consecutive_losses.min(max_power);
-    1u32.saturating_shl(power) // 2^power
+    1u32.checked_shl(power).unwrap_or(u32::MAX) // 2^power, capped at u32::MAX
 }
 
 /// Resets dispute penalty if merchant has completed enough dispute-free orders.
@@ -164,11 +164,11 @@ pub fn tally_dispute_votes(
 
     // Determine winning verdict (highest vote weight)
     let winner = if buyer_weight >= merchant_weight && buyer_weight >= split_weight {
-        Some(buyer)
+        Some(buyer.clone())
     } else if merchant_weight >= split_weight {
-        Some(merchant)
+        Some(merchant.clone())
     } else {
-        Some(split)
+        Some(split.clone())
     };
 
     // Check if winner reached quorum
