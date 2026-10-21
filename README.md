@@ -771,3 +771,7 @@ Verification Matrix & Final Checklist
 | Docker Builder Stage | docker build -t indexer:test . | Multi-stage builder layer succeeds | PASSED |
 | Production Runtime Engine | docker run --rm indexer:test | Container boots and serves /health | PASSED |
 
+## Handsoff notes
+
+<!-- handsoff-issue-566 -->
+- #566: Implement Session Key Expiration Invariant Check with Strict Ledger Bounds
