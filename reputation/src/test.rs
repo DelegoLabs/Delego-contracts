@@ -1149,6 +1149,8 @@ fn test_rate_entity_updates_avg_rating() {
     // Only two of the five are rated; avg_rating must reflect only those,
     // not all five recorded transactions.
     client.rate_entity(&counterparty, &0u64, &entity, &8000u32);
+    env.ledger()
+        .with_mut(|l| l.sequence_number += crate::REVIEW_COOLDOWN_LEDGERS);
     client.rate_entity(&counterparty, &1u64, &entity, &10_000u32);
 
     let rep = client.get_reputation(&entity);
@@ -2542,15 +2544,16 @@ fn seed_clean_history(
 
     // 100 consecutive negative reviews: refunded outcomes rated 0/10_000.
     for i in 5..105u64 {
+        let one_off_reviewer = Address::generate(&env);
         client.record_transaction(
             &admin,
             &i,
             &entity,
-            &reviewer,
+            &one_off_reviewer,
             &1_000i128,
             &TransactionOutcome::Refunded,
         );
-        client.rate_entity(&reviewer, &i, &entity, &0u32);
+        client.rate_entity(&one_off_reviewer, &i, &entity, &0u32);
 
         let rep = client.get_reputation(&entity);
         assert!(
@@ -2682,16 +2685,16 @@ fn test_mixed_extreme_outcome_sequences_stay_bounded() {
         let env = Env::default();
         let (client, admin) = setup(&env);
         let entity = Address::generate(&env);
-        let counterparty = Address::generate(&env);
         let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
 
         for i in 0..40u64 {
             let outcome = outcomes[(next(&mut state) % outcomes.len() as u64) as usize].clone();
+            let one_off_counterparty = Address::generate(&env);
             let is_disputed = matches!(outcome, TransactionOutcome::Disputed);
-            client.record_transaction(&admin, &i, &entity, &counterparty, &1_000i128, &outcome);
+            client.record_transaction(&admin, &i, &entity, &one_off_counterparty, &1_000i128, &outcome);
             if !is_disputed {
                 let rating = (next(&mut state) % 10_001) as u32;
-                client.rate_entity(&counterparty, &i, &entity, &rating);
+                client.rate_entity(&one_off_counterparty, &i, &entity, &rating);
             }
 
             let rep = client.get_reputation(&entity);
@@ -3323,4 +3326,82 @@ fn test_role_metrics_update_on_outcome_change() {
     let metrics_after_resolve = client.get_role_specific_metrics(&entity);
     assert_eq!(metrics_after_resolve.dispute_frequency_bps, 0);
     assert_eq!(metrics_after_resolve.fulfillment_rate_bps, 10_000);
+}
+
+// --- review cooldown (issue #393) ---
+
+fn record_released(
+    client: &ReputationContractClient,
+    admin: &Address,
+    escrow_id: u64,
+    entity: &Address,
+    counterparty: &Address,
+) {
+    client.record_transaction(
+        admin,
+        &escrow_id,
+        entity,
+        counterparty,
+        &1000i128,
+        &TransactionOutcome::Released,
+    );
+}
+
+#[test]
+fn test_review_cooldown_blocks_rapid_reviews_between_same_pair() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let seller = Address::generate(&env);
+    let buyer = Address::generate(&env);
+
+    record_released(&client, &admin, 1, &seller, &buyer);
+    record_released(&client, &admin, 2, &seller, &buyer);
+
+    client.rate_entity(&buyer, &1u64, &seller, &9000u32);
+
+    // Immediately, and one ledger before the window closes: both blocked.
+    let res = client.try_rate_entity(&buyer, &2u64, &seller, &9000u32);
+    assert_eq!(res, Err(Ok(ReputationError::ReviewCooldownActive)));
+
+    env.ledger()
+        .with_mut(|l| l.sequence_number += crate::REVIEW_COOLDOWN_LEDGERS - 1);
+    let res = client.try_rate_entity(&buyer, &2u64, &seller, &9000u32);
+    assert_eq!(res, Err(Ok(ReputationError::ReviewCooldownActive)));
+}
+
+#[test]
+fn test_review_after_cooldown_window_succeeds() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let seller = Address::generate(&env);
+    let buyer = Address::generate(&env);
+
+    record_released(&client, &admin, 1, &seller, &buyer);
+    record_released(&client, &admin, 2, &seller, &buyer);
+
+    client.rate_entity(&buyer, &1u64, &seller, &9000u32);
+
+    env.ledger()
+        .with_mut(|l| l.sequence_number += crate::REVIEW_COOLDOWN_LEDGERS);
+    client.rate_entity(&buyer, &2u64, &seller, &8000u32);
+}
+
+#[test]
+fn test_review_cooldown_is_scoped_to_the_buyer_seller_pair() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let seller = Address::generate(&env);
+    let other_seller = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let other_buyer = Address::generate(&env);
+
+    record_released(&client, &admin, 1, &seller, &buyer);
+    record_released(&client, &admin, 2, &other_seller, &buyer);
+    record_released(&client, &admin, 3, &seller, &other_buyer);
+
+    client.rate_entity(&buyer, &1u64, &seller, &9000u32);
+
+    // Same buyer, different seller; same seller, different buyer: unaffected.
+    client.rate_entity(&buyer, &2u64, &other_seller, &9000u32);
+    client.rate_entity(&other_buyer, &3u64, &seller, &9000u32);
 }

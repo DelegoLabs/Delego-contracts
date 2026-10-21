@@ -47,3 +47,7 @@ path = "no_std_consistency.rs"
 [[test]]
 name = "gas_benchmark"
 path = "gas_benchmark.rs"
+
+[[test]]
+name = "conservation_invariant"
+path = "src/conservation_invariant.rs"

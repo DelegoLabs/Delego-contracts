@@ -3144,3 +3144,42 @@ fn test_ephemeral_session_clock_skew_resilience_and_dual_check() {
         }
     );
 }
+
+#[test]
+fn test_pause_ledger_expired_unswept_delegation_returns_expired() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Pause_Expired");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+
+    // Past expires_at_ledger (200) but never swept: status is still Active.
+    env.ledger().set_sequence_number(250);
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Active);
+
+    let result = client.try_pause_delegation(&id);
+    assert_eq!(result, Err(Ok(DelegationError::Expired)));
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Active);
+}
+
+#[test]
+fn test_rollback_cannot_reactivate_revoked_delegation() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Revoked_Rollback");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    // v1 snapshot (Active)
+
+    client.revoke_delegation(&id); // v2 snapshot (Revoked)
+    assert_eq!(client.get_delegation_version(&id), 2);
+
+    let result = client.try_rollback_delegation(&id, &1u32);
+    assert_eq!(result, Err(Ok(DelegationError::RevokedCannotBeRestored)));
+
+    let record = client.get_delegation(&id);
+    assert_eq!(record.status, DelegationStatus::Revoked);
+    assert_eq!(client.get_delegation_version(&id), 2);
+    assert!(!client.is_authorized(&id, &agent_id));
+}

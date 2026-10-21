@@ -578,6 +578,8 @@ pub enum ReputationError {
     UnverifiedOrder = 3012,
     /// A carrier proof was submitted by an oracle that is not registered.
     CarrierOracleNotAuthorized = 3013,
+    /// A review between this buyer/seller pair landed inside the cooldown window.
+    ReviewCooldownActive = 3021,
 }
 
 #[cfg(test)]
@@ -601,6 +603,7 @@ mod error_code_allocation {
             ReputationError::NotFlagReporter as u32,
             ReputationError::UnverifiedOrder as u32,
             ReputationError::CarrierOracleNotAuthorized as u32,
+            ReputationError::ReviewCooldownActive as u32,
         ];
         for code in codes {
             assert!(
@@ -923,6 +926,9 @@ pub enum DataKey {
     FraudPenalty(Address),
     /// Ed25519 public key registered for a carrier oracle address.
     CarrierOracle(Address),
+    /// Ledger sequence of the last review `.0` (buyer) left for `.1` (seller).
+    /// Drives the review-flooding cooldown (issue #393).
+    LastReviewLedger(Address, Address),
 }
 
 /// Maximum basis points value (100.00%), used both for ratings/scores and
@@ -1006,6 +1012,10 @@ const MAX_PAGE_SIZE: u32 = 50;
 /// for roughly 30 days, matching the repository's persistent-storage policy.
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400;
+
+/// Minimum ledgers between two reviews from the same buyer to the same seller
+/// (~2 hours). Blocks rapid micro-order review flooding (issue #393).
+pub const REVIEW_COOLDOWN_LEDGERS: u32 = 1_440;
 
 /// Weight (in basis points) applied to the count component of the
 /// composite score. Count and volume weights must sum to `BPS_SCALE`.
@@ -1318,6 +1328,31 @@ impl ReputationContract {
         Ok(())
     }
 
+    /// Rejects a review when `buyer` already reviewed `seller` less than
+    /// `REVIEW_COOLDOWN_LEDGERS` ledgers ago (issue #393).
+    fn check_review_cooldown(
+        env: &Env,
+        buyer: &Address,
+        seller: &Address,
+    ) -> Result<(), ReputationError> {
+        let key = DataKey::LastReviewLedger(buyer.clone(), seller.clone());
+        if let Some(last_ledger) = env.storage().persistent().get::<_, u32>(&key) {
+            if env.ledger().sequence() < last_ledger.saturating_add(REVIEW_COOLDOWN_LEDGERS) {
+                return Err(ReputationError::ReviewCooldownActive);
+            }
+        }
+        Ok(())
+    }
+
+    /// Records the current ledger as the last review from `buyer` to `seller`.
+    fn record_review_ledger(env: &Env, buyer: &Address, seller: &Address) {
+        let key = DataKey::LastReviewLedger(buyer.clone(), seller.clone());
+        env.storage().persistent().set(&key, &env.ledger().sequence());
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    }
+
     /// Rate the entity on the other side of a completed escrow. `rater` must
     /// be the `counterparty` recorded for `escrow_id`, and each escrow may
     /// be rated at most once (sybil resistance).
@@ -1349,6 +1384,8 @@ impl ReputationContract {
             return Err(ReputationError::InvalidParam);
         }
 
+        Self::check_review_cooldown(&env, &rater, &entity)?;
+
         let rated_key = DataKey::RatedEscrows(rater.clone());
         let mut rated: Vec<u64> = env
             .storage()
@@ -1360,6 +1397,8 @@ impl ReputationContract {
         }
         rated.push_back(escrow_id);
         env.storage().persistent().set(&rated_key, &rated);
+
+        Self::record_review_ledger(&env, &rater, &entity);
 
         record.rating = Some(rating);
         env.storage().persistent().set(&record_key, &record);
@@ -1421,6 +1460,8 @@ impl ReputationContract {
             return Err(ReputationError::EntityFrozen);
         }
 
+        Self::check_review_cooldown(&env, &rater, &entity)?;
+
         let reviewed_key = DataKey::VerifiedEscrowReview(proof.escrow_id);
         if env
             .storage()
@@ -1454,6 +1495,7 @@ impl ReputationContract {
             return Err(ReputationError::UnverifiedOrder);
         }
 
+        Self::record_review_ledger(&env, &rater, &entity);
         env.storage().persistent().set(&reviewed_key, &true);
         env.storage().persistent().extend_ttl(
             &reviewed_key,
