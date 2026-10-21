@@ -8,7 +8,12 @@ use crate::{
     BatchDepositItem, BatchDepositParams, BatchDepositResult, BatchRefundParams,
     BatchReleaseParams, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError,
     EscrowStatus, EscrowTerminalState, TreasuryShare, MAX_TREASURIES,
+    EscrowTranche, TrancheEscrowConfig, MAX_TRANCHES,
 };
+
+use ed25519_dalek::{SigningKey, Signer};
+use rand::thread_rng;
+use soroban_sdk::xdr::ToXdr;
 
 #[test]
 fn test_claim_fraud_restitution_for_banned_merchant() {
@@ -2986,7 +2991,7 @@ fn test_inspection_period_status_after_delivery() {
     assert_eq!(record.status, EscrowStatus::Funded);
 
     // Set up oracle key for delivery verification
-    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let signing_key = ed25519_dalek::SigningKey::generate(thread_rng());
     let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
     escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
 
@@ -3014,7 +3019,7 @@ fn test_buyer_can_release_after_inspection() {
     let record = escrow_client.get_escrow(&escrow_id);
 
     // Setup and verify delivery
-    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let signing_key = ed25519_dalek::SigningKey::generate(thread_rng());
     let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
     escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
 
@@ -3038,7 +3043,7 @@ fn test_inspection_auto_release_after_expiration() {
     let record = escrow_client.get_escrow(&escrow_id);
 
     // Setup and verify delivery with default inspection duration (72 hours)
-    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let signing_key = ed25519_dalek::SigningKey::generate(thread_rng());
     let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
     escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
 
@@ -3074,7 +3079,7 @@ fn test_buyer_can_dispute_during_inspection() {
     let record = escrow_client.get_escrow(&escrow_id);
 
     // Setup and verify delivery
-    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let signing_key = ed25519_dalek::SigningKey::generate(thread_rng());
     let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
     escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
 
@@ -3100,7 +3105,7 @@ fn test_dispute_fails_after_inspection_expiration() {
     let record = escrow_client.get_escrow(&escrow_id);
 
     // Setup and verify delivery
-    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let signing_key = ed25519_dalek::SigningKey::generate(thread_rng());
     let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
     escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
 
@@ -3126,7 +3131,7 @@ fn test_buyer_can_refund_during_inspection() {
     let record = escrow_client.get_escrow(&escrow_id);
 
     // Setup and verify delivery
-    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let signing_key = ed25519_dalek::SigningKey::generate(thread_rng());
     let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
     escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
 
@@ -3152,7 +3157,7 @@ fn test_seller_cannot_refund_during_inspection() {
     let record = escrow_client.get_escrow(&escrow_id);
 
     // Setup and verify delivery
-    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let signing_key = ed25519_dalek::SigningKey::generate(thread_rng());
     let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
     escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
 
@@ -3192,7 +3197,7 @@ fn test_release_not_allowed_during_inspection() {
     let record = escrow_client.get_escrow(&escrow_id);
 
     // Setup and verify delivery
-    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let signing_key = ed25519_dalek::SigningKey::generate(thread_rng());
     let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
     escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
 
@@ -3215,7 +3220,7 @@ fn test_inspection_events_emitted() {
     let record = escrow_client.get_escrow(&escrow_id);
 
     // Setup and verify delivery
-    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let signing_key = ed25519_dalek::SigningKey::generate(thread_rng());
     let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
     escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
 
@@ -3403,6 +3408,653 @@ fn test_cosign_rejects_unregistered_signer() {
     );
 }
 
+// Helper function to create signed delivery proofs for testing
+fn create_signed_delivery_proof(
+    t: &TestEnv,
+    signing_key: &ed25519_dalek::SigningKey,
+    escrow_id: u64,
+    created_at: u64,
+) -> crate::SignedDeliveryProof {
+    use ed25519_dalek::Signer;
+    use soroban_sdk::xdr::ToXdr;
+
+    let env = &t.env;
+    let payload = crate::SignedDeliveryPayload {
+        escrow_id,
+        carrier_code: symbol_short!("fedex"),
+        tracking_hash: BytesN::from_array(env, &[1u8; 32]),
+        delivery_timestamp: created_at + 1,
+    };
+
+    let payload_xdr = payload.to_xdr(env);
+    let signature_bytes = signing_key.sign(&payload_xdr.0);
+    
+    crate::SignedDeliveryProof {
+        escrow_id,
+        carrier_code: symbol_short!("fedex"),
+        tracking_hash: BytesN::from_array(env, &[1u8; 32]),
+        delivery_timestamp: created_at + 1,
+        oracle_pubkey: BytesN::from_array(
+            env,
+            &signing_key.verifying_key().to_bytes(),
+        ),
+        signature: BytesN::from_array(env, &signature_bytes.to_bytes()),
+    }
+}
+
+// ── Issue #484: Progressive Escrow Tranche Unlocking ───────────────────────
+//
+// Tests for the tranche-based escrow system bound to courier checkpoint milestones.
+
+/// Helper to create a tranche checkpoint proof signature
+fn create_tranche_proof(
+    env: &Env,
+    signing_key: &SigningKey,
+    escrow_id: u64,
+    tranche_index: u32,
+    checkpoint_hash: BytesN<32>,
+) -> BytesN<64> {
+    #[contracttype]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TranchePayload {
+        escrow_id: u64,
+        tranche_index: u32,
+        checkpoint_hash: BytesN<32>,
+    }
+    let payload = TranchePayload {
+        escrow_id,
+        tranche_index,
+        checkpoint_hash,
+    };
+    let payload_xdr = payload.to_xdr(env);
+    let signature_bytes = signing_key.sign(&payload_xdr.0);
+    BytesN::from_array(env, &signature_bytes.to_bytes())
+}
+
+/// Test creating a tranche escrow with valid schedule
+#[test]
+fn test_create_tranche_escrow_valid_schedule() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    // Generate courier keypair
+    let signing_key = SigningKey::generate(&mut thread_rng());
+    let courier_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+
+    // Define tranches: 30% pickup, 40% customs, 30% delivery
+    let mut tranches = soroban_sdk::Vec::new(&t.env);
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 0,
+        amount_stroops: 3000,
+        checkpoint_hash: BytesN::from_array(&t.env, &[0x01u8; 32]), // Pickup checkpoint
+        is_released: false,
+        release_ledger: 0,
+    });
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 1,
+        amount_stroops: 4000,
+        checkpoint_hash: BytesN::from_array(&t.env, &[0x02u8; 32]), // Customs checkpoint
+        is_released: false,
+        release_ledger: 0,
+    });
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 2,
+        amount_stroops: 3000,
+        checkpoint_hash: BytesN::from_array(&t.env, &[0x03u8; 32]), // Delivery checkpoint
+        is_released: false,
+        release_ledger: 0,
+    });
+
+    let escrow_id = escrow_client.create_tranche_escrow(
+        &t.buyer,
+        &t.seller,
+        &t.token_contract_id,
+        &t.order_id(),
+        &100,
+        &tranches,
+        &courier_pubkey,
+    );
+
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Funded);
+    assert_eq!(record.amount, 10000); // Total of all tranches
+
+    // Verify tranche config stored correctly
+    let config = escrow_client.get_tranches(&escrow_id);
+    assert_eq!(config.tranches.len(), 3);
+    assert_eq!(config.courier_pubkey, courier_pubkey);
+}
+
+/// Test creating tranche escrow with invalid schedule (duplicate indices)
+#[test]
+fn test_create_tranche_escrow_rejects_duplicate_indices() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let signing_key = SigningKey::generate(&mut thread_rng());
+    let courier_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+
+    let mut tranches = soroban_sdk::Vec::new(&t.env);
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 0,
+        amount_stroops: 5000,
+        checkpoint_hash: BytesN::from_array(&t.env, &[0x01u8; 32]),
+        is_released: false,
+        release_ledger: 0,
+    });
+    // Duplicate index 0
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 0,
+        amount_stroops: 5000,
+        checkpoint_hash: BytesN::from_array(&t.env, &[0x02u8; 32]),
+        is_released: false,
+        release_ledger: 0,
+    });
+
+    assert_eq!(
+        escrow_client.try_create_tranche_escrow(
+            &t.buyer,
+            &t.seller,
+            &t.token_contract_id,
+            &t.order_id(),
+            &100,
+            &tranches,
+            &courier_pubkey,
+        ),
+        Err(Ok(EscrowError::InvalidTrancheSchedule))
+    );
+}
+
+/// Test creating tranche escrow with non-sequential indices
+#[test]
+fn test_create_tranche_escrow_rejects_non_sequential_indices() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let signing_key = SigningKey::generate(&mut thread_rng());
+    let courier_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+
+    let mut tranches = soroban_sdk::Vec::new(&t.env);
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 0,
+        amount_stroops: 5000,
+        checkpoint_hash: BytesN::from_array(&t.env, &[0x01u8; 32]),
+        is_released: false,
+        release_ledger: 0,
+    });
+    // Skip index 1, go to index 2
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 2,
+        amount_stroops: 5000,
+        checkpoint_hash: BytesN::from_array(&t.env, &[0x02u8; 32]),
+        is_released: false,
+        release_ledger: 0,
+    });
+
+    assert_eq!(
+        escrow_client.try_create_tranche_escrow(
+            &t.buyer,
+            &t.seller,
+            &t.token_contract_id,
+            &t.order_id(),
+            &100,
+            &tranches,
+            &courier_pubkey,
+        ),
+        Err(Ok(EscrowError::InvalidTrancheSchedule))
+    );
+}
+
+/// Test creating tranche escrow with zero amount
+#[test]
+fn test_create_tranche_escrow_rejects_zero_amount() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let signing_key = SigningKey::generate(&mut thread_rng());
+    let courier_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+
+    let mut tranches = soroban_sdk::Vec::new(&t.env);
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 0,
+        amount_stroops: 0, // Invalid: zero amount
+        checkpoint_hash: BytesN::from_array(&t.env, &[0x01u8; 32]),
+        is_released: false,
+        release_ledger: 0,
+    });
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 1,
+        amount_stroops: 10000,
+        checkpoint_hash: BytesN::from_array(&t.env, &[0x02u8; 32]),
+        is_released: false,
+        release_ledger: 0,
+    });
+
+    assert_eq!(
+        escrow_client.try_create_tranche_escrow(
+            &t.buyer,
+            &t.seller,
+            &t.token_contract_id,
+            &t.order_id(),
+            &100,
+            &tranches,
+            &courier_pubkey,
+        ),
+        Err(Ok(EscrowError::InvalidTrancheSchedule))
+    );
+}
+
+/// Test unlock_tranche with valid proof
+#[test]
+fn test_unlock_tranche_valid_proof() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    // Generate courier keypair
+    let signing_key = SigningKey::generate(&mut thread_rng());
+    let courier_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+
+    // Create tranche escrow
+    let mut tranches = soroban_sdk::Vec::new(&t.env);
+    let checkpoint_hash_0 = BytesN::from_array(&t.env, &[0x01u8; 32]);
+    let checkpoint_hash_1 = BytesN::from_array(&t.env, &[0x02u8; 32]);
+    let checkpoint_hash_2 = BytesN::from_array(&t.env, &[0x03u8; 32]);
+
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 0,
+        amount_stroops: 3000,
+        checkpoint_hash: checkpoint_hash_0,
+        is_released: false,
+        release_ledger: 0,
+    });
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 1,
+        amount_stroops: 4000,
+        checkpoint_hash: checkpoint_hash_1,
+        is_released: false,
+        release_ledger: 0,
+    });
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 2,
+        amount_stroops: 3000,
+        checkpoint_hash: checkpoint_hash_2,
+        is_released: false,
+        release_ledger: 0,
+    });
+
+    let escrow_id = escrow_client.create_tranche_escrow(
+        &t.buyer,
+        &t.seller,
+        &t.token_contract_id,
+        &t.order_id(),
+        &100,
+        &tranches,
+        &courier_pubkey,
+    );
+
+    // Create valid proof for tranche 0
+    let proof = create_tranche_proof(&t.env, &signing_key, escrow_id, 0, checkpoint_hash_0);
+
+    // Unlock tranche 0
+    let result = escrow_client.unlock_tranche(&escrow_id, &0, &checkpoint_hash_0, &proof);
+    assert_eq!(result.released, 3000);
+    assert_eq!(result.remaining, 7000);
+
+    // Verify tranche marked as released
+    let config = escrow_client.get_tranches(&escrow_id);
+    assert!(config.tranches.get(0).unwrap().is_released);
+    assert_eq!(config.tranches.get(0).unwrap().release_ledger, t.env.ledger().sequence());
+    assert!(!config.tranches.get(1).unwrap().is_released);
+
+    // Verify seller received funds (minus fee)
+    // With 0% fee, seller gets full 3000
+    assert_eq!(token_client.balance(&t.seller), 3000);
+}
+
+/// Test unlock_tranche enforces sequential order
+#[test]
+fn test_unlock_tranche_enforces_sequential_order() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let signing_key = SigningKey::generate(&mut thread_rng());
+    let courier_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+
+    let mut tranches = soroban_sdk::Vec::new(&t.env);
+    let checkpoint_hash_0 = BytesN::from_array(&t.env, &[0x01u8; 32]);
+    let checkpoint_hash_1 = BytesN::from_array(&t.env, &[0x02u8; 32]);
+
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 0,
+        amount_stroops: 5000,
+        checkpoint_hash: checkpoint_hash_0,
+        is_released: false,
+        release_ledger: 0,
+    });
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 1,
+        amount_stroops: 5000,
+        checkpoint_hash: checkpoint_hash_1,
+        is_released: false,
+        release_ledger: 0,
+    });
+
+    let escrow_id = escrow_client.create_tranche_escrow(
+        &t.buyer,
+        &t.seller,
+        &t.token_contract_id,
+        &t.order_id(),
+        &100,
+        &tranches,
+        &courier_pubkey,
+    );
+
+    // Try to unlock tranche 1 before tranche 0 - should fail
+    let proof = create_tranche_proof(&t.env, &signing_key, escrow_id, 1, checkpoint_hash_1);
+    assert_eq!(
+        escrow_client.try_unlock_tranche(&escrow_id, &1, &checkpoint_hash_1, &proof),
+        Err(Ok(EscrowError::TrancheOutOfSequence))
+    );
+
+    // Unlock tranche 0 first
+    let proof_0 = create_tranche_proof(&t.env, &signing_key, escrow_id, 0, checkpoint_hash_0);
+    let result = escrow_client.unlock_tranche(&escrow_id, &0, &checkpoint_hash_0, &proof_0);
+    assert_eq!(result.released, 5000);
+
+    // Now unlock tranche 1 - should succeed
+    let result = escrow_client.unlock_tranche(&escrow_id, &1, &checkpoint_hash_1, &proof);
+    assert_eq!(result.released, 5000);
+    assert_eq!(result.remaining, 0);
+}
+
+/// Test unlock_tranche with invalid signature
+#[test]
+fn test_unlock_tranche_rejects_invalid_signature() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let signing_key = SigningKey::generate(&mut thread_rng());
+    let courier_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+
+    let mut tranches = soroban_sdk::Vec::new(&t.env);
+    let checkpoint_hash_0 = BytesN::from_array(&t.env, &[0x01u8; 32]);
+
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 0,
+        amount_stroops: 5000,
+        checkpoint_hash: checkpoint_hash_0,
+        is_released: false,
+        release_ledger: 0,
+    });
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 1,
+        amount_stroops: 5000,
+        checkpoint_hash: BytesN::from_array(&t.env, &[0x02u8; 32]),
+        is_released: false,
+        release_ledger: 0,
+    });
+
+    let escrow_id = escrow_client.create_tranche_escrow(
+        &t.buyer,
+        &t.seller,
+        &t.token_contract_id,
+        &t.order_id(),
+        &100,
+        &tranches,
+        &courier_pubkey,
+    );
+
+    // Create proof with wrong key (different signer)
+    let wrong_key = SigningKey::generate(&mut thread_rng());
+    let proof = create_tranche_proof(&t.env, &wrong_key, escrow_id, 0, checkpoint_hash_0);
+
+    assert_eq!(
+        escrow_client.try_unlock_tranche(&escrow_id, &0, &checkpoint_hash_0, &proof),
+        Err(Ok(EscrowError::InvalidTrancheProof))
+    );
+}
+
+/// Test unlock_tranche with mismatched checkpoint hash
+#[test]
+fn test_unlock_tranche_rejects_mismatched_checkpoint() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let signing_key = SigningKey::generate(&mut thread_rng());
+    let courier_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+
+    let mut tranches = soroban_sdk::Vec::new(&t.env);
+    let checkpoint_hash_0 = BytesN::from_array(&t.env, &[0x01u8; 32]);
+    let checkpoint_hash_1 = BytesN::from_array(&t.env, &[0x02u8; 32]);
+
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 0,
+        amount_stroops: 5000,
+        checkpoint_hash: checkpoint_hash_0,
+        is_released: false,
+        release_ledger: 0,
+    });
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 1,
+        amount_stroops: 5000,
+        checkpoint_hash: checkpoint_hash_1,
+        is_released: false,
+        release_ledger: 0,
+    });
+
+    let escrow_id = escrow_client.create_tranche_escrow(
+        &t.buyer,
+        &t.seller,
+        &t.token_contract_id,
+        &t.order_id(),
+        &100,
+        &tranches,
+        &courier_pubkey,
+    );
+
+    // Try to unlock tranche 0 with tranche 1's checkpoint hash
+    let proof = create_tranche_proof(&t.env, &signing_key, escrow_id, 0, checkpoint_hash_1);
+
+    assert_eq!(
+        escrow_client.try_unlock_tranche(&escrow_id, &0, &checkpoint_hash_1, &proof),
+        Err(Ok(EscrowError::InvalidTrancheProof))
+    );
+}
+
+/// Test unlock_tranche rejects already released tranche
+#[test]
+fn test_unlock_tranche_rejects_already_released() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let signing_key = SigningKey::generate(&mut thread_rng());
+    let courier_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+
+    let mut tranches = soroban_sdk::Vec::new(&t.env);
+    let checkpoint_hash_0 = BytesN::from_array(&t.env, &[0x01u8; 32]);
+
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 0,
+        amount_stroops: 10000,
+        checkpoint_hash: checkpoint_hash_0,
+        is_released: false,
+        release_ledger: 0,
+    });
+
+    let escrow_id = escrow_client.create_tranche_escrow(
+        &t.buyer,
+        &t.seller,
+        &t.token_contract_id,
+        &t.order_id(),
+        &100,
+        &tranches,
+        &courier_pubkey,
+    );
+
+    // Unlock tranche 0 once
+    let proof = create_tranche_proof(&t.env, &signing_key, escrow_id, 0, checkpoint_hash_0);
+    let result = escrow_client.unlock_tranche(&escrow_id, &0, &checkpoint_hash_0, &proof);
+    assert_eq!(result.released, 10000);
+    assert_eq!(result.fully_released, true);
+
+    // Try to unlock again - should fail
+    assert_eq!(
+        escrow_client.try_unlock_tranche(&escrow_id, &0, &checkpoint_hash_0, &proof),
+        Err(Ok(EscrowError::TrancheAlreadyReleased))
+    );
+}
+
+/// Test partial payouts and remaining balance integrity
+#[test]
+fn test_tranche_partial_payouts_and_balance_integrity() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let signing_key = SigningKey::generate(&mut thread_rng());
+    let courier_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+
+    // 4 tranches: 20%, 30%, 25%, 25%
+    let mut tranches = soroban_sdk::Vec::new(&t.env);
+    let checkpoint_hashes: [BytesN<32>; 4] = [
+        BytesN::from_array(&t.env, &[0x01u8; 32]),
+        BytesN::from_array(&t.env, &[0x02u8; 32]),
+        BytesN::from_array(&t.env, &[0x03u8; 32]),
+        BytesN::from_array(&t.env, &[0x04u8; 32]),
+    ];
+    let amounts = [2000, 3000, 2500, 2500];
+
+    for i in 0..4 {
+        tranches.push_back(crate::EscrowTranche {
+            tranche_index: i,
+            amount_stroops: amounts[i],
+            checkpoint_hash: checkpoint_hashes[i],
+            is_released: false,
+            release_ledger: 0,
+        });
+    }
+
+    let escrow_id = escrow_client.create_tranche_escrow(
+        &t.buyer,
+        &t.seller,
+        &t.token_contract_id,
+        &t.order_id(),
+        &100,
+        &tranches,
+        &courier_pubkey,
+    );
+
+    let initial_buyer_balance = token_client.balance(&t.buyer);
+    let initial_seller_balance = token_client.balance(&t.seller);
+
+    // Unlock tranche 0 (20%)
+    let proof_0 = create_tranche_proof(&t.env, &signing_key, escrow_id, 0, checkpoint_hashes[0]);
+    let result_0 = escrow_client.unlock_tranche(&escrow_id, &0, &checkpoint_hashes[0], &proof_0);
+    assert_eq!(result_0.released, 2000);
+    assert_eq!(result_0.remaining, 8000);
+    assert_eq!(token_client.balance(&t.seller), 2000);
+
+    // Unlock tranche 1 (30%)
+    let proof_1 = create_tranche_proof(&t.env, &signing_key, escrow_id, 1, checkpoint_hashes[1]);
+    let result_1 = escrow_client.unlock_tranche(&escrow_id, &1, &checkpoint_hashes[1], &proof_1);
+    assert_eq!(result_1.released, 3000);
+    assert_eq!(result_1.remaining, 5000);
+    assert_eq!(token_client.balance(&t.seller), 5000);
+
+    // Unlock tranche 2 (25%)
+    let proof_2 = create_tranche_proof(&t.env, &signing_key, escrow_id, 2, checkpoint_hashes[2]);
+    let result_2 = escrow_client.unlock_tranche(&escrow_id, &2, &checkpoint_hashes[2], &proof_2);
+    assert_eq!(result_2.released, 2500);
+    assert_eq!(result_2.remaining, 2500);
+    assert_eq!(token_client.balance(&t.seller), 7500);
+
+    // Unlock tranche 3 (25%) - final
+    let proof_3 = create_tranche_proof(&t.env, &signing_key, escrow_id, 3, checkpoint_hashes[3]);
+    let result_3 = escrow_client.unlock_tranche(&escrow_id, &3, &checkpoint_hashes[3], &proof_3);
+    assert_eq!(result_3.released, 2500);
+    assert_eq!(result_3.remaining, 0);
+    assert_eq!(result_3.fully_released, true);
+    assert_eq!(token_client.balance(&t.seller), 10000);
+
+    // Verify final escrow status
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Released);
+    assert_eq!(record.released_amount, 10000);
+
+    // Verify all tranches marked as released
+    let config = escrow_client.get_tranches(&escrow_id);
+    for i in 0..4 {
+        let t_config = config.tranches.get(i);
+        assert!(t_config.is_released, "Tranche {} should be released", i);
+        assert_eq!(t_config.release_ledger, t.env.ledger().sequence());
+    }
+
+    // Verify buyer balance unchanged (funds already deducted at creation)
+    assert_eq!(token_client.balance(&t.buyer), initial_buyer_balance);
+}
+
+/// Test tranche escrow cannot use regular release functions
+#[test]
+fn test_tranche_escrow_requires_unlock_tranche() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let signing_key = SigningKey::generate(&mut thread_rng());
+    let courier_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+
+    let mut tranches = soroban_sdk::Vec::new(&t.env);
+    tranches.push_back(crate::EscrowTranche {
+        tranche_index: 0,
+        amount_stroops: 10000,
+        checkpoint_hash: BytesN::from_array(&t.env, &[0x01u8; 32]),
+        is_released: false,
+        release_ledger: 0,
+    });
+
+    let escrow_id = escrow_client.create_tranche_escrow(
+        &t.buyer,
+        &t.seller,
+        &t.token_contract_id,
+        &t.order_id(),
+        &100,
+        &tranches,
+        &courier_pubkey,
+    );
+
+    // Try to use regular release - should fail
+    assert_eq!(
+        escrow_client.try_release(&escrow_id, &t.buyer, &t.seller),
+        Err(Ok(EscrowError::TrancheReleaseRequired))
+    );
+
+    // Try to use partial_release - should fail
+    assert_eq!(
+        escrow_client.try_partial_release(&escrow_id, &t.buyer, &5000),
+        Err(Ok(EscrowError::TrancheReleaseRequired))
+    );
+
+    // Try to use release_milestone - should fail
+    assert_eq!(
+        escrow_client.try_release_milestone(&escrow_id, &0),
+        Err(Ok(EscrowError::TrancheReleaseRequired))
+    );
+}
+
+/// Test get_tranches returns NotFound for non-tranche escrow
+#[test]
+fn test_get_tranches_not_found_for_regular_escrow() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+
+    assert_eq!(
+        escrow_client.try_get_tranches(&escrow_id),
+        Err(Ok(EscrowError::TrancheNotFound))
+    );
+}
 // Helper function to create signed delivery proofs for testing
 fn create_signed_delivery_proof(
     t: &TestEnv,

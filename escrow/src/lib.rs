@@ -691,6 +691,54 @@ pub struct MilestoneReleasedEvent {
     pub remaining: i128,
 }
 
+/// Maximum number of tranches a single tranche escrow may carry.
+pub const MAX_TRANCHES: u32 = 20;
+
+/// One tranche of a progressive escrow release bound to courier checkpoint milestones.
+/// (Issue #484)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowTranche {
+    /// Sequential index of this tranche (0-based).
+    pub tranche_index: u32,
+    /// Amount to release for this tranche (in stroops).
+    pub amount_stroops: i128,
+    /// Hash of the courier checkpoint data (e.g., pickup scan, customs clearance, delivery confirmation).
+    pub checkpoint_hash: BytesN<32>,
+    /// Whether this tranche has been released.
+    pub is_released: bool,
+    /// Ledger sequence when this tranche was released.
+    pub release_ledger: u32,
+}
+
+/// Configuration for a tranche-based escrow (Issue #484).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrancheEscrowConfig {
+    /// Ordered tranche schedule; amounts sum to the escrowed principal.
+    pub tranches: Vec<EscrowTranche>,
+    /// Ed25519 public key of the courier/oracle authorized to sign checkpoint attestations.
+    pub courier_pubkey: BytesN<32>,
+}
+
+/// Emitted when a tranche is unlocked and paid out to the seller.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TrancheUnlockedEvent {
+    /// Escrow the tranche belongs to.
+    pub escrow_id: u64,
+    /// Index of the tranche that was unlocked.
+    pub tranche_index: u32,
+    /// Amount released for this tranche.
+    pub amount: i128,
+    /// Seller receiving the payout.
+    pub seller: Address,
+    /// Principal still held in escrow after this payout.
+    pub remaining: i128,
+    /// Checkpoint hash that was verified.
+    pub checkpoint_hash: BytesN<32>,
+}
+
 /// Emitted when an admin registers (or updates) an approved metadata schema.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -1830,6 +1878,8 @@ pub enum DataKey {
     RegisteredSchema(Symbol),
     /// Milestone schedule for escrows created via `create_milestone_escrow`.
     MilestoneConfig(u64),
+    /// Tranche schedule for escrows created via `create_tranche_escrow` (Issue #484).
+    TrancheConfig(u64),
     /// Prevents release entry points from being re-entered during token calls.
     ReleaseGuard,
     /// Per-escrow order acceptance + cancel lockout snapshot (issue #355).
@@ -2276,6 +2326,21 @@ pub enum EscrowError {
     TimelockExtensionPendingApproval = 455,
     /// Requested storage TTL extension is outside the supported bounds.
     InvalidTtlExtension = 450,
+    /// Tranche schedule is empty, too long, has duplicate indices, non-positive
+    /// amounts, or an overflowing total (Issue #484).
+    InvalidTrancheSchedule = 456,
+    /// Escrow has no tranche with the requested index (or is not a tranche escrow).
+    TrancheNotFound = 457,
+    /// Tranche has already been released.
+    TrancheAlreadyReleased = 458,
+    /// Tranches must be unlocked in sequential order (Issue #484).
+    TrancheOutOfSequence = 459,
+    /// Invalid checkpoint proof signature for tranche unlock (Issue #484).
+    InvalidTrancheProof = 460,
+    /// Courier public key not configured for this tranche escrow (Issue #484).
+    CourierPubkeyNotSet = 461,
+    /// Tranche escrows must be paid out through `unlock_tranche`.
+    TrancheReleaseRequired = 462,
 }
 
 /// Runs `f` under a re-entrancy lock and returns its result unchanged.
@@ -2435,6 +2500,13 @@ impl_escrow_error_try_from! {
     416 => ExceedsTotalEscrowAmount,
     417 => MerchantCategoryNotAllowed,
     418 => SubItemAlreadyResolved,
+    456 => InvalidTrancheSchedule,
+    457 => TrancheNotFound,
+    458 => TrancheAlreadyReleased,
+    459 => TrancheOutOfSequence,
+    460 => InvalidTrancheProof,
+    461 => CourierPubkeyNotSet,
+    462 => TrancheReleaseRequired,
 }
 
 impl TryFrom<&soroban_sdk::Error> for EscrowError {
@@ -2543,6 +2615,21 @@ pub enum MultiOracleError {
     MilestoneAlreadyReleased = 413,
     /// Milestone escrows must be paid out through `release_milestone`.
     MilestoneReleaseRequired = 414,
+    /// Tranche schedule is empty, too long, has duplicate indices, non-positive
+    /// amounts, or an overflowing total (Issue #484).
+    InvalidTrancheSchedule = 415,
+    /// Escrow has no tranche with the requested index (or is not a tranche escrow).
+    TrancheNotFound = 416,
+    /// Tranche has already been released.
+    TrancheAlreadyReleased = 417,
+    /// Tranches must be unlocked in sequential order (Issue #484).
+    TrancheOutOfSequence = 418,
+    /// Invalid checkpoint proof signature for tranche unlock (Issue #484).
+    InvalidTrancheProof = 419,
+    /// Courier public key not configured for this tranche escrow (Issue #484).
+    CourierPubkeyNotSet = 420,
+    /// Tranche escrows must be paid out through `unlock_tranche`.
+    TrancheReleaseRequired = 421,
     /// Configure a guardian before proposing critical changes.
     GuardianNotSet = 411,
     /// Guardian bootstrap may only run once.
@@ -5682,6 +5769,7 @@ impl EscrowContract {
         }
         Self::validate_release_status(&record)?;
         Self::ensure_not_milestone_escrow(&env, escrow_id)?;
+        Self::ensure_not_tranche_escrow(&env, escrow_id)?;
 
         let published_root: Option<BytesN<32>> =
             env.storage().persistent().get(&DataKey::MerkleRoot(date));
@@ -6846,6 +6934,7 @@ impl EscrowContract {
         check_not_terminal(&record)?;
 
         Self::ensure_not_milestone_escrow(&env, escrow_id)?;
+        Self::ensure_not_tranche_escrow(&env, escrow_id)?;
 
         if record.status != EscrowStatus::Funded {
             return Err(EscrowError::InvalidStatus);
@@ -7375,6 +7464,252 @@ impl EscrowContract {
                 .ok_or(EscrowError::InvalidMilestoneSchedule)?;
         }
         Ok(total)
+    }
+
+    /// Validates a tranche schedule and returns its total principal (Issue #484).
+    fn validate_tranches(tranches: &Vec<EscrowTranche>) -> Result<i128, EscrowError> {
+        if tranches.is_empty() || tranches.len() > MAX_TRANCHES {
+            return Err(EscrowError::InvalidTrancheSchedule);
+        }
+        let mut total: i128 = 0;
+        for (i, t) in tranches.iter().enumerate() {
+            if t.tranche_index != i as u32 {
+                return Err(EscrowError::InvalidTrancheSchedule);
+            }
+            if t.amount_stroops <= 0 || t.is_released || t.release_ledger != 0 {
+                return Err(EscrowError::InvalidTrancheSchedule);
+            }
+            // Check for duplicate indices
+            if tranches
+                .iter()
+                .skip(i + 1)
+                .any(|other| other.tranche_index == t.tranche_index)
+            {
+                return Err(EscrowError::InvalidTrancheSchedule);
+            }
+            total = total
+                .checked_add(t.amount_stroops)
+                .ok_or(EscrowError::InvalidTrancheSchedule)?;
+        }
+        Ok(total)
+    }
+
+    /// Create and fund an escrow whose principal is paid out in sequential
+    /// tranches bound to courier checkpoint milestones (Issue #484).
+    ///
+    /// The escrowed principal is the sum of the tranche amounts, so the
+    /// schedule always equals the funded balance exactly. Tranches must be
+    /// submitted in sequential order (index 0, 1, 2...) with positive amounts
+    /// and unique checkpoint hashes. Funds are pulled from the buyer
+    /// immediately, as with `deposit`.
+    ///
+    /// The courier_pubkey is the Ed25519 public key authorized to sign
+    /// checkpoint attestations for unlocking tranches.
+    ///
+    /// # Errors
+    /// - [`EscrowError::InvalidTrancheSchedule`] if the schedule is invalid.
+    /// - Any error `deposit` returns (limits, whitelist, pause, ...).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_tranche_escrow(
+        env: Env,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+        order_id: BytesN<32>,
+        timeout_ledgers: u32,
+        tranches: Vec<EscrowTranche>,
+        courier_pubkey: BytesN<32>,
+    ) -> Result<u64, EscrowError> {
+        if is_zero_address(&env, &buyer)
+            || is_zero_address(&env, &seller)
+            || is_zero_address(&env, &token)
+        {
+            return Err(EscrowError::InvalidAddress);
+        }
+        if buyer == seller {
+            return Err(EscrowError::InvalidEscrowParticipants);
+        }
+        let total = Self::validate_tranches(&tranches)?;
+
+        buyer.require_auth();
+        let escrow_id = Self::deposit_internal(
+            env.clone(),
+            buyer,
+            seller,
+            token,
+            total,
+            order_id,
+            timeout_ledgers,
+            None,
+            None,
+        )?;
+
+        let key = DataKey::TrancheConfig(escrow_id);
+        env.storage()
+            .persistent()
+            .set(&key, &TrancheEscrowConfig { tranches, courier_pubkey });
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(escrow_id)
+    }
+
+    /// Unlock a tranche by verifying a courier checkpoint attestation (Issue #484).
+    ///
+    /// The caller provides a proof containing the tranche index, checkpoint hash,
+    /// and an Ed25519 signature from the authorized courier. The signature is
+    /// verified against the courier_pubkey configured at escrow creation.
+    ///
+    /// Tranches MUST be unlocked in sequential order (0, 1, 2...). The platform
+    /// fee is deducted from the tranche amount exactly as in `partial_release`.
+    /// Once every tranche is unlocked, the escrow's remaining balance is zero
+    /// and it transitions to the terminal `Released` state.
+    ///
+    /// # Errors
+    /// - [`EscrowError::NotFound`] if the escrow does not exist.
+    /// - [`EscrowError::TrancheNotFound`] if the escrow has no such tranche.
+    /// - [`EscrowError::TrancheAlreadyReleased`] if it was already paid.
+    /// - [`EscrowError::TrancheOutOfSequence`] if a previous tranche is still locked.
+    /// - [`EscrowError::InvalidTrancheProof`] if the signature verification fails.
+    /// - [`EscrowError::CourierPubkeyNotSet`] if no courier key is configured.
+    /// - [`EscrowError::AlreadyReleased`] / [`EscrowError::AlreadyRefunded`] /
+    ///   [`EscrowError::InvalidStatus`] if the escrow is not `Funded`.
+    /// - [`EscrowError::InsufficientEscrowBalance`] if a partial refund has
+    ///   left too little principal to cover the tranche.
+    pub fn unlock_tranche(
+        env: Env,
+        escrow_id: u64,
+        tranche_index: u32,
+        checkpoint_hash: BytesN<32>,
+        signature: BytesN<64>,
+    ) -> Result<PartialReleaseResult, EscrowError> {
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        check_not_terminal(&record)?;
+        Self::validate_release_status(&record)?;
+
+        if record.amount > DUAL_CONTROL_THRESHOLD {
+            return Err(EscrowError::SignedProofRequired);
+        }
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::RequireReleaseCondition(escrow_id))
+            .unwrap_or(false)
+            && Self::release_block_reason(env.clone(), &record).is_some()
+        {
+            return Err(EscrowError::ConditionNotMet);
+        }
+
+        let config_key = DataKey::TrancheConfig(escrow_id);
+        let mut config: TrancheEscrowConfig = env
+            .storage()
+            .persistent()
+            .get(&config_key)
+            .ok_or(EscrowError::TrancheNotFound)?;
+
+        // Verify sequential order: all previous tranches must be released
+        if tranche_index > 0 {
+            for i in 0..tranche_index {
+                let prev_tranche = config.tranches.get(i as u32).ok_or(EscrowError::TrancheNotFound)?;
+                if !prev_tranche.is_released {
+                    return Err(EscrowError::TrancheOutOfSequence);
+                }
+            }
+        }
+
+        let mut tranche = config.tranches.get(tranche_index).ok_or(EscrowError::TrancheNotFound)?;
+        if tranche.is_released {
+            return Err(EscrowError::TrancheAlreadyReleased);
+        }
+        // Verify checkpoint hash matches
+        if tranche.checkpoint_hash != checkpoint_hash {
+            return Err(EscrowError::InvalidTrancheProof);
+        }
+
+        // Verify Ed25519 signature
+        // The signed payload consists of the XDR encoding of escrow_id, tranche_index, and checkpoint_hash
+        use soroban_sdk::xdr::ToXdr;
+        #[contracttype]
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct TranchePayload {
+            escrow_id: u64,
+            tranche_index: u32,
+            checkpoint_hash: BytesN<32>,
+        }
+        let payload = TranchePayload {
+            escrow_id,
+            tranche_index,
+            checkpoint_hash,
+        }
+        .to_xdr(&env);
+        
+        env.crypto()
+            .ed25519_verify(&config.courier_pubkey, &payload, &signature)
+            .map_err(|_| EscrowError::InvalidTrancheProof)?;
+
+        let seller = record.seller.clone();
+        let caller = record.buyer.clone();
+        let result =
+            Self::execute_release(&env, escrow_id, &key, record, caller, tranche.amount_stroops)?;
+
+        tranche.is_released = true;
+        tranche.release_ledger = env.ledger().sequence();
+        let amount = tranche.amount_stroops;
+        config.tranches.set(tranche_index, tranche);
+        env.storage().persistent().set(&config_key, &config);
+        env.storage().persistent().extend_ttl(
+            &config_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("escrow"),
+                symbol_short!("tranche"),
+                escrow_id,
+            ),
+            TrancheUnlockedEvent {
+                escrow_id,
+                tranche_index,
+                amount,
+                seller,
+                remaining: result.remaining,
+                checkpoint_hash,
+            },
+        );
+
+        Ok(result)
+    }
+
+    /// Returns the tranche schedule for a tranche escrow (Issue #484).
+    pub fn get_tranches(env: Env, escrow_id: u64) -> Result<TrancheEscrowConfig, EscrowError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TrancheConfig(escrow_id))
+            .ok_or(EscrowError::TrancheNotFound)
+    }
+
+    /// Tranche escrows may only be paid through `unlock_tranche`;
+    /// arbitrary-amount payouts would desync the schedule.
+    fn ensure_not_tranche_escrow(env: &Env, escrow_id: u64) -> Result<(), EscrowError> {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::TrancheConfig(escrow_id))
+        {
+            return Err(EscrowError::TrancheReleaseRequired);
+        }
+        Ok(())
     }
 
     /// Milestone escrows may only be paid through `release_milestone`;
@@ -8013,6 +8348,7 @@ impl EscrowContract {
         }
 
         Self::ensure_not_milestone_escrow(&env, escrow_id)?;
+        Self::ensure_not_tranche_escrow(&env, escrow_id)?;
         let remaining = record.amount - record.released_amount - record.refunded_amount;
         if remaining <= 0 {
             return Err(EscrowError::ZeroAmount);
@@ -10960,6 +11296,7 @@ impl EscrowContract {
 
         check_not_terminal(&record)?;
         Self::ensure_not_milestone_escrow(&env, escrow_id)?;
+        Self::ensure_not_tranche_escrow(&env, escrow_id)?;
 
         if record.status != EscrowStatus::Funded {
             return Err(EscrowError::InvalidStatus);
