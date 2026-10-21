@@ -27,7 +27,11 @@
 #![allow(clippy::too_many_arguments)]
 #![warn(missing_docs)]
 mod recurring_quota;
+mod crypto;
 pub use recurring_quota::RecurringQuotaConfig;
+pub use crypto::{
+    verify_passkey_signature, verify_passkey_signature_compressed, verify_passkey_signature_flexible,
+};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, xdr::ToXdr, Address, BytesN,
@@ -244,6 +248,10 @@ pub enum PermissionError {
     /// The relayer address has been frozen by an admin; all delegated spends
     /// submitted by this relayer are blocked until the freeze is lifted.
     RelayerFrozen = 2426,
+    /// Secp256r1 (P-256) signature verification failed: the signature does not
+    /// match the message digest for the given public key, or the public key is
+    /// not a valid point on the curve.
+    InvalidSignature = 2431,
 }
 
 /// Epoch period for allowance reset logic.
@@ -319,11 +327,12 @@ mod error_code_tests {
         PermissionError::TooManyPendingProposals as u32,
         PermissionError::EphemeralRelayerUnsupported as u32,
         PermissionError::RelayerFrozen as u32,
+        PermissionError::InvalidSignature as u32,
     ];
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 39);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 40);
 
         let permission_range = ERROR_CODE_RANGES
             .iter()
