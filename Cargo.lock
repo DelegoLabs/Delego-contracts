@@ -432,21 +432,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
-name = "delego-cross-contract-tests"
-version = "0.0.1"
-dependencies = [
- "delego-delegation-registry",
- "delego-escrow",
- "delego-interfaces",
- "delego-marketplace",
- "delego-permissions",
- "delego-reputation",
- "ed25519-dalek",
- "proptest",
- "soroban-sdk",
-]
-
-[[package]]
 name = "delego-delegation-registry"
 version = "0.0.1"
 dependencies = [
@@ -490,6 +475,7 @@ dependencies = [
 name = "delego-reputation"
 version = "0.0.1"
 dependencies = [
+ "delego-interfaces",
  "ed25519-dalek",
  "soroban-sdk",
 ]
@@ -498,6 +484,7 @@ dependencies = [
 name = "delego-tests"
 version = "0.0.1"
 dependencies = [
+ "arbitrary",
  "delego-delegation-registry",
  "delego-escrow",
  "delego-interfaces",
@@ -505,6 +492,7 @@ dependencies = [
  "delego-permissions",
  "delego-reputation",
  "ed25519-dalek",
+ "proptest",
  "soroban-sdk",
 ]
 
@@ -1814,6 +1802,13 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "value-conservation-prop"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+]
 
 [[package]]
 name = "version_check"

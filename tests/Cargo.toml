@@ -42,7 +42,6 @@ path = "src/lending_pool.rs"
 [[test]]
 name = "no_std_consistency"
 path = "src/no_std_consistency.rs"
-path = "no_std_consistency.rs"
 
 [[test]]
 name = "gas_benchmark"
