@@ -400,6 +400,19 @@ pub struct DisputeQuorumVote {
     pub staked_vote_weight: i128,
 }
 
+/// Aggregated arbiter vote tally for a dispute adjudicated by a panel of
+/// elected arbiters. A resolution finalizes once 3 of 5 arbiters agree on
+/// the same outcome.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbiterTally {
+    pub dispute_id: u64,
+    pub votes_for_buyer: u32,
+    pub votes_for_merchant: u32,
+    pub total_voters: u32,
+    pub finalized: bool,
+}
+
 /// Normalized reputation score with sigmoid scaling and recency weighting.
 /// This is the final, user-facing score combining multiple signals into a
 /// confidence-weighted 0-10,000 basis point scale.

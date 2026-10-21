@@ -7,6 +7,9 @@ edition = "2021"
 soroban-sdk = { workspace = true }
 delego-interfaces = { path = "../interfaces" }
 
+[lib]
+path = "src/lib.rs"
+
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 ed25519-dalek = "2"
