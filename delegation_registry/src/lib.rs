@@ -264,6 +264,34 @@ pub struct DelegationExpiredEvent {
     pub timestamp: u64,
 }
 
+/// Keeper liveness details for a delegation's primary and fallback keepers.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeeperHeartbeat {
+    /// Primary keeper expected to execute recurring work.
+    pub keeper: Address,
+    /// Secondary keeper selected after the primary misses its heartbeat.
+    pub fallback_keeper: Address,
+    /// Timestamp of the primary keeper's latest heartbeat.
+    pub last_heartbeat_timestamp: u64,
+    /// Whether the primary keeper is currently within its liveness window.
+    pub is_active: bool,
+}
+
+/// Emitted once when a primary keeper misses its liveness window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeeperHeartbeatMissedEvent {
+    /// Delegation whose keeper missed its heartbeat.
+    pub delegation_id: u64,
+    /// Primary keeper that missed the heartbeat.
+    pub keeper: Address,
+    /// Secondary keeper selected for fallback execution.
+    pub fallback_keeper: Address,
+    /// Timestamp at which the missed heartbeat was detected.
+    pub detected_at: u64,
+}
+
 /// Emitted when a delegation's capability bitmask changes (issue #322).
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -385,6 +413,8 @@ pub enum DataKey {
     NextSubAccountId(Address),
     /// Sub-account ids associated with an owner.
     OwnerSubAccounts(Address),
+    /// Keeper liveness configuration for a delegation.
+    KeeperHeartbeat(u64),
 }
 
 /// Errors for delegation registry operations.
@@ -443,7 +473,16 @@ pub enum DelegationError {
     SubAccountNotActive = 4018,
     /// The delegation does not match the sub-account.
     DelegationMismatch = 4019,
+    /// Keeper heartbeat configuration has not been set.
+    HeartbeatNotConfigured = 4020,
+    /// The configured keeper does not match the caller.
+    InvalidKeeper = 4021,
+    /// Primary and fallback keepers must be different addresses.
+    InvalidFallbackKeeper = 4022,
 }
+
+/// Seven days in seconds, matching the keeper liveness policy.
+pub const KEEPER_LIVENESS_WINDOW_SECONDS: u64 = 604_800;
 
 /// The delegation registry contract.
 #[contract]
@@ -1623,6 +1662,106 @@ impl DelegationRegistry {
         Ok(swept)
     }
 
+    /// Configures the primary and fallback keepers for a delegation.
+    /// Only the delegation owner may choose the liveness pair.
+    pub fn configure_keepers(
+        env: Env,
+        delegation_id: u64,
+        keeper: Address,
+        fallback_keeper: Address,
+    ) -> Result<bool, DelegationError> {
+        if keeper == fallback_keeper {
+            return Err(DelegationError::InvalidFallbackKeeper);
+        }
+        let record: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+            .ok_or(DelegationError::NotFound)?;
+        record.owner.require_auth();
+        let key = DataKey::KeeperHeartbeat(delegation_id);
+        env.storage().persistent().set(
+            &key,
+            &KeeperHeartbeat {
+                keeper,
+                fallback_keeper,
+                last_heartbeat_timestamp: 0,
+                is_active: false,
+            },
+        );
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        Ok(true)
+    }
+
+    /// Records an authenticated liveness ping from the configured primary keeper.
+    pub fn submit_heartbeat(
+        env: Env,
+        delegation_id: u64,
+        keeper: Address,
+    ) -> Result<bool, DelegationError> {
+        keeper.require_auth();
+        let key = DataKey::KeeperHeartbeat(delegation_id);
+        let mut heartbeat: KeeperHeartbeat = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(DelegationError::HeartbeatNotConfigured)?;
+        if heartbeat.keeper != keeper {
+            return Err(DelegationError::InvalidKeeper);
+        }
+        heartbeat.last_heartbeat_timestamp = env.ledger().timestamp();
+        heartbeat.is_active = true;
+        env.storage().persistent().set(&key, &heartbeat);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        Ok(true)
+    }
+
+    /// Returns the live primary keeper, or the fallback after seven days
+    /// without a heartbeat. A missed-heartbeat event is emitted once per outage.
+    pub fn check_keeper_liveness(env: Env, delegation_id: u64) -> Result<Address, DelegationError> {
+        let key = DataKey::KeeperHeartbeat(delegation_id);
+        let mut heartbeat: KeeperHeartbeat = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(DelegationError::HeartbeatNotConfigured)?;
+        let now = env.ledger().timestamp();
+        let missed = !heartbeat.is_active
+            || now
+                > heartbeat
+                    .last_heartbeat_timestamp
+                    .saturating_add(KEEPER_LIVENESS_WINDOW_SECONDS);
+        if missed {
+            if heartbeat.is_active {
+                env.events().publish(
+                    (
+                        symbol_short!("keeper"),
+                        symbol_short!("missed"),
+                        delegation_id,
+                    ),
+                    KeeperHeartbeatMissedEvent {
+                        delegation_id,
+                        keeper: heartbeat.keeper.clone(),
+                        fallback_keeper: heartbeat.fallback_keeper.clone(),
+                        detected_at: now,
+                    },
+                );
+            }
+            heartbeat.is_active = false;
+            env.storage().persistent().set(&key, &heartbeat);
+            return Ok(heartbeat.fallback_keeper);
+        }
+        Ok(heartbeat.keeper)
+    }
+
     /// Returns all delegations owned by `owner` that are currently expired.
     ///
     /// A delegation is considered expired here when the current ledger has
@@ -1862,11 +2001,7 @@ impl DelegationRegistry {
 
         // Get or initialize the next sub-account id for this owner
         let next_id_key = DataKey::NextSubAccountId(owner.clone());
-        let id = env
-            .storage()
-            .persistent()
-            .get(&next_id_key)
-            .unwrap_or(1u64);
+        let id = env.storage().persistent().get(&next_id_key).unwrap_or(1u64);
         let next_id = id.checked_add(1).ok_or(DelegationError::IdExhausted)?;
         env.storage().persistent().set(&next_id_key, &next_id);
         env.storage().persistent().extend_ttl(
@@ -2087,10 +2222,7 @@ impl DelegationRegistry {
     }
 
     /// Returns all sub-accounts associated with a specific delegation.
-    pub fn get_sub_accounts_by_delegation(
-        env: Env,
-        delegation_id: u64,
-    ) -> Vec<SubAccountRecord> {
+    pub fn get_sub_accounts_by_delegation(env: Env, delegation_id: u64) -> Vec<SubAccountRecord> {
         // First verify the delegation exists
         let delegation: DelegationRecord = match env
             .storage()

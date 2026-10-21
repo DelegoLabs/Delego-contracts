@@ -5,7 +5,7 @@ use super::*;
 use soroban_sdk::{
     symbol_short,
     testutils::{storage::Persistent, Address as _, Events, Ledger},
-    Address, BytesN, Env, Symbol, TryFromVal,
+    Address, BytesN, Env, IntoVal, Symbol, TryFromVal,
 };
 
 /// Mirrors the clamp the contract applies to paginated queries, so the
@@ -300,6 +300,31 @@ fn test_sweep_expired_updates_expired_delegations() {
 
     let record = client.get_delegation(&id);
     assert_eq!(record.status, DelegationStatus::Expired);
+}
+
+#[test]
+fn test_keeper_heartbeat_selects_fallback_after_seven_days() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+    let label = Symbol::new(&env, "heartbeat");
+    let delegation_id =
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let primary = Address::generate(&env);
+    let fallback = Address::generate(&env);
+
+    client.configure_keepers(&delegation_id, &primary, &fallback);
+    client.submit_heartbeat(&delegation_id, &primary);
+    assert_eq!(client.check_keeper_liveness(&delegation_id), primary);
+
+    env.ledger()
+        .set_timestamp(1_000 + KEEPER_LIVENESS_WINDOW_SECONDS + 1);
+    assert_eq!(client.check_keeper_liveness(&delegation_id), fallback);
+    assert!(env.events().all().iter().any(|event| {
+        event
+            .topics
+            .contains(&symbol_short!("missed").into_val(&env))
+    }));
 }
 
 #[test]
