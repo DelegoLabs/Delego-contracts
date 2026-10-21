@@ -244,6 +244,14 @@ pub enum PermissionError {
     /// The relayer address has been frozen by an admin; all delegated spends
     /// submitted by this relayer are blocked until the freeze is lifted.
     RelayerFrozen = 2426,
+    /// A key replacement proposal already exists for this (owner, delegate) pair
+    KeyReplacementAlreadyPending = 2431,
+    /// No key replacement proposal exists for this (owner, delegate) pair
+    KeyReplacementNotFound = 2432,
+    /// The key replacement proposal's 24-hour timelock has not elapsed yet
+    KeyReplacementTimelockActive = 2433,
+    /// The key replacement proposal has already been executed
+    KeyReplacementAlreadyExecuted = 2434,
 }
 
 /// Epoch period for allowance reset logic.
