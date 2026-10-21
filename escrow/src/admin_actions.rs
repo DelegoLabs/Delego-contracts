@@ -1,5 +1,7 @@
 use super::*;
 use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::Bytes;
+use soroban_sdk::BytesN;
 
 /// Minimum wall-clock review period for critical administrative changes.
 pub const ADMIN_ACTION_DELAY_SECONDS: u64 = 86_400;
@@ -22,6 +24,10 @@ pub enum AdminAction {
     RemoveToken(Address),
     /// Rotate the guardian after the existing guardian's veto period.
     Guardian(Address),
+    /// Authorize a courier public key to sign delivery vouchers.
+    AddCourier(BytesN<32>),
+    /// Revoke a courier public key.
+    RemoveCourier(BytesN<32>),
 }
 
 /// Public commitment and review state for a queued administrative change.
@@ -57,6 +63,8 @@ enum AdminActionKey {
     LastId,
     Proposal(u64),
     Current(BytesN<32>),
+    Courier(BytesN<32>),
+    CourierCount,
 }
 
 fn commitment(env: &Env, action: &AdminAction) -> BytesN<32> {
@@ -71,6 +79,8 @@ fn action_type(action: &AdminAction) -> Symbol {
         AdminAction::AddToken(_) => symbol_short!("token_add"),
         AdminAction::RemoveToken(_) => symbol_short!("token_del"),
         AdminAction::Guardian(_) => symbol_short!("guardian"),
+        AdminAction::AddCourier(_) => symbol_short!("cour_add"),
+        AdminAction::RemoveCourier(_) => symbol_short!("cour_del"),
     }
 }
 
@@ -109,6 +119,10 @@ fn validate(env: &Env, action: &AdminAction) -> Result<(), EscrowError> {
             if is_zero_address(env, address) =>
         {
             Err(EscrowError::InvalidAddress)
+        }
+        AdminAction::AddCourier(key) | AdminAction::RemoveCourier(key) => {
+            let _ = key;
+            Ok(())
         }
         _ => Ok(()),
     }
@@ -161,14 +175,7 @@ impl EscrowContract {
         guardian: Address,
     ) -> Result<(), EscrowError> {
         admin.require_auth();
-        let primary: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(EscrowError::Unauthorized)?;
-        if admin != primary {
-            return Err(EscrowError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, ContractRole::Admin)?;
         if env.storage().instance().has(&AdminActionKey::Guardian) {
             return Err(EscrowError::GuardianAlreadySet);
         }
@@ -197,7 +204,12 @@ impl EscrowContract {
         action: AdminAction,
     ) -> Result<u64, EscrowError> {
         admin.require_auth();
-        if !Self::is_admin(env.clone(), admin) {
+        let authorized = match &action {
+            AdminAction::Fee(_) | AdminAction::FeeConfig(_, _) | AdminAction::FeeDistribution(_) =>
+                Self::has_role(env.clone(), admin.clone(), ContractRole::FeeManager),
+            _ => Self::is_admin(env.clone(), admin.clone()),
+        };
+        if !authorized {
             return Err(EscrowError::Unauthorized);
         }
         if Self::get_security_guardian(env.clone()).is_none() {
@@ -283,11 +295,17 @@ impl EscrowContract {
     /// Execute the stored proposal with current admin authorization. Legacy
     /// setters use the same consume gate and cannot bypass this review period.
     pub fn execute_admin_action(env: Env, admin: Address, id: u64) -> Result<bool, EscrowError> {
-        if !Self::is_admin(env.clone(), admin.clone()) {
-            return Err(EscrowError::Unauthorized);
-        }
+        admin.require_auth();
         let proposal =
             Self::get_admin_action(env.clone(), id).ok_or(EscrowError::AdminActionNotFound)?;
+        let authorized = match &proposal.action {
+            AdminAction::Fee(_) | AdminAction::FeeConfig(_, _) | AdminAction::FeeDistribution(_) =>
+                Self::has_role(env.clone(), admin.clone(), ContractRole::FeeManager),
+            _ => Self::is_admin(env.clone(), admin.clone()),
+        };
+        if !authorized {
+            return Err(EscrowError::Unauthorized);
+        }
         if proposal.pending.is_vetoed {
             return Err(EscrowError::AdminActionVetoed);
         }
@@ -321,6 +339,72 @@ impl EscrowContract {
                 );
                 Ok(true)
             }
+            AdminAction::AddCourier(key) => {
+                admin.require_auth();
+                consume(&env, proposal.action)?;
+                Self::add_courier(env, key);
+                Ok(true)
+            }
+            AdminAction::RemoveCourier(key) => {
+                admin.require_auth();
+                consume(&env, proposal.action)?;
+                Self::remove_courier(env, key);
+                Ok(true)
+            }
         }
+    }
+
+    /// Register an authorized courier public key. Only reachable through the
+    /// queued admin action gate, so it inherits the review period and veto.
+    pub(super) fn add_courier(env: Env, key: BytesN<32>) {
+        let storage_key = AdminActionKey::Courier(key.clone());
+        if !env.storage().persistent().has(&storage_key) {
+            env.storage().persistent().set(&storage_key, &true);
+            env.storage().persistent().extend_ttl(
+                &storage_key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&AdminActionKey::CourierCount)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&AdminActionKey::CourierCount, &(count + 1));
+        }
+        env.events().publish(
+            (symbol_short!("courier"), symbol_short!("added")),
+            key,
+        );
+    }
+
+    /// Revoke a courier public key so future vouchers from it are rejected.
+    pub(super) fn remove_courier(env: Env, key: BytesN<32>) {
+        let storage_key = AdminActionKey::Courier(key.clone());
+        if env.storage().persistent().has(&storage_key) {
+            env.storage().persistent().remove(&storage_key);
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&AdminActionKey::CourierCount)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&AdminActionKey::CourierCount, &count.saturating_sub(1));
+        }
+        env.events().publish(
+            (symbol_short!("courier"), symbol_short!("removed")),
+            key,
+        );
+    }
+
+    /// Whether a courier public key is currently authorized.
+    pub fn is_authorized_courier(env: Env, key: BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&AdminActionKey::Courier(key))
+            .unwrap_or(false)
     }
 }

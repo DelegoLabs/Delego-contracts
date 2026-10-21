@@ -14,7 +14,9 @@ use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, ReputationError,
     TransactionOutcome,
 };
+use delego_tests::fixtures::create_mock_token_contract;
 use ed25519_dalek::{Signer, SigningKey};
+use proptest::prelude::*;
 use soroban_sdk::{
     testutils::Address as _, testutils::Ledger as _, xdr::ToXdr, Address, BytesN, Env,
     InvokeError, Vec,
@@ -68,8 +70,7 @@ impl TestEnv {
         let treasury = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        #[allow(deprecated)]
-        let token_contract_id = env.register_stellar_asset_contract(token_admin.clone());
+        let (token_contract_id, _token_client) = create_mock_token_contract(&env, &token_admin);
         let token_admin_client =
             soroban_sdk::token::StellarAssetClient::new(&env, &token_contract_id);
         token_admin_client.mint(&buyer, &10000);
@@ -852,5 +853,74 @@ fn test_error_code_ranges_are_pairwise_disjoint() {
             hi_a < lo_b,
             "error ranges overlap: {name_a} ends at {hi_a}, but {name_b} starts at {lo_b}"
         );
+    }
+}
+
+
+/// Randomized cross-contract escrow lifecycle test (#524). One generated
+/// sequence contains 10,000 calls; invalid actions are deliberately included
+/// and must leave the accounting invariant unchanged.
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 1, max_shrink_iters: 0, .. ProptestConfig::default() })]
+    #[test]
+    fn randomized_escrow_actions_preserve_token_conservation(actions in prop::collection::vec(any::<u8>(), 10_000)) {
+        let t = TestEnv::setup();
+        let escrow = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+        let token = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+        let asset_admin = soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token_contract_id);
+        let mut current: Option<u64> = None;
+        let mut next_order = 1u32;
+
+        for action in actions {
+            if current.is_none() && action % 7 == 0 {
+                let mut order = [0u8; 32];
+                order[..4].copy_from_slice(&next_order.to_be_bytes());
+                next_order = next_order.wrapping_add(1);
+                let order_id = BytesN::from_array(&t.env, &order);
+                if let Ok(Ok(id)) = escrow.try_create(&t.buyer, &t.seller, &t.token_contract_id, &100, &order_id, &1, &None, &None) {
+                    current = Some(id);
+                }
+            } else if let Some(id) = current {
+                match action % 7 {
+                    1 => { let _ = escrow.try_fund(&id, &t.buyer); }
+                    2 => { let _ = escrow.try_dispute(&id, &t.buyer); }
+                    3 => {
+                        let _ = escrow.try_release(&id, &t.buyer, &t.seller);
+                        // Recycle seller proceeds so the generated run can
+                        // exercise many independent escrows without exhausting
+                        // the fixture's initial token supply.
+                        if token.balance(&t.seller) >= 100 {
+                            token.transfer(&t.seller, &t.buyer, &100);
+                        }
+                    }
+                    4 => {
+                        let timeout = escrow.get_escrow(&id).timeout_ledger;
+                        t.env.ledger().with_mut(|l| l.sequence_number = l.sequence_number.max(timeout));
+                        let _ = escrow.try_refund(&id, &t.buyer);
+                    }
+                    5 => {
+                        let _ = escrow.try_resolve_dispute_split(&id, &t._admin, &delego_escrow::DisputeResolutionAward {
+                            buyer_amount: 100,
+                            seller_amount: 0,
+                            mediator_fee: 0,
+                            mediator_address: t._admin.clone(),
+                        });
+                    }
+                    _ => {
+                        t.env.ledger().with_mut(|l| l.sequence_number = l.sequence_number.saturating_add(11));
+                        let _ = escrow.try_cancel(&id, &t.seller, &soroban_sdk::symbol_short!("fuzz"));
+                    }
+                }
+                let record = escrow.get_escrow(&id);
+                if matches!(record.status, EscrowStatus::Released | EscrowStatus::Refunded | EscrowStatus::Cancelled) {
+                    current = None;
+                }
+            }
+
+            let active_balance = current.map(|id| escrow.get_escrow(&id).amount).unwrap_or(0);
+            let fees = 0i128; // Fixture configures a zero fee rate.
+            prop_assert_eq!(token.balance(&t.escrow_contract_id), active_balance + fees,
+                "escrow token balance must equal active commitments plus accrued fees");
+        }
     }
 }

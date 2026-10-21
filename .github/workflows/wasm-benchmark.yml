@@ -1,0 +1,443 @@
+# =============================================================================
+# .github/workflows/wasm-benchmark.yml
+#
+# Automated WASM binary size and Soroban resource benchmarking.
+#
+# Triggers
+# --------
+#   - Every pull request targeting main (measure + comment on PR)
+#   - Every push to main (update the committed baseline)
+#   - Weekly schedule (Monday 06:00 UTC) to catch silent regressions from
+#     upstream dependency bumps even when no code changes occur
+#   - Manual trigger (workflow_dispatch) for on-demand runs
+#
+# Jobs
+# ----
+#   wasm-size-check   Build → optimize → measure → enforce 64 KiB hard limit
+#                     → post diff table as PR comment
+#   resource-budget   Run cross-contract integration tests with --nocapture
+#                     to capture per-operation Soroban CPU/RAM instruction counts
+#   update-baseline   (main branch only) Commit updated baseline JSON when
+#                     sizes change legitimately after a merge
+# =============================================================================
+
+name: WASM Benchmark
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Monday 06:00 UTC — catch silent regressions from dependency bumps
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      write_baseline:
+        description: "Update baseline JSON after measuring (main branch only)"
+        type: boolean
+        default: false
+
+# Allow the job to post PR comments and commit baseline updates.
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: wasm-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: WASM binary size check
+  # ---------------------------------------------------------------------------
+  wasm-size-check:
+    name: WASM Size Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Checkout
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history so we can diff against the baseline branch
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # Rust toolchain — pinned via rust-toolchain.toml
+      # -----------------------------------------------------------------------
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain-file: rust-toolchain.toml
+
+      # -----------------------------------------------------------------------
+      # Dependency cache — keyed on Cargo.lock to avoid stale hits
+      # -----------------------------------------------------------------------
+      - name: Restore Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-wasm-benchmark-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-wasm-benchmark-${{ runner.os }}-
+
+      # -----------------------------------------------------------------------
+      # Install stellar-cli (provides `stellar contract optimize`)
+      # Using cargo install with a pinned version so the tool is reproducible.
+      # We cache the binary separately so subsequent runs skip compilation.
+      # -----------------------------------------------------------------------
+      - name: Cache stellar-cli binary
+        id: cache-stellar-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/stellar
+          key: stellar-cli-v22-${{ runner.os }}
+
+      - name: Install stellar-cli
+        if: steps.cache-stellar-cli.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked stellar-cli --version "^22" --features opt 2>/dev/null \
+            || cargo install --locked stellar-cli --version "^22"
+
+      # -----------------------------------------------------------------------
+      # Install jq (needed by the benchmark script)
+      # -----------------------------------------------------------------------
+      - name: Install jq
+        run: sudo apt-get install -y --no-install-recommends jq
+
+      # -----------------------------------------------------------------------
+      # Make the benchmark script executable
+      # -----------------------------------------------------------------------
+      - name: Prepare benchmark script
+        run: chmod +x scripts/wasm-benchmark.sh
+
+      # -----------------------------------------------------------------------
+      # Build all contract WASM artifacts
+      # -----------------------------------------------------------------------
+      - name: Build WASM artifacts
+        run: |
+          cargo build \
+            --target wasm32-unknown-unknown \
+            --release \
+            --workspace \
+            --exclude tests
+
+      # -----------------------------------------------------------------------
+      # Optimize WASM artifacts with stellar-cli
+      # -----------------------------------------------------------------------
+      - name: Optimize WASM artifacts
+        run: |
+          set -euo pipefail
+          for wasm in target/wasm32-unknown-unknown/release/*.wasm; do
+            # Skip already-optimized files from a previous step
+            [[ "$wasm" == *.optimized.wasm ]] && continue
+            echo "Optimizing: $wasm"
+            stellar contract optimize --wasm "$wasm"
+          done
+
+      # -----------------------------------------------------------------------
+      # Run the benchmark script (skip the build step since we just built)
+      # -----------------------------------------------------------------------
+      - name: Measure WASM sizes and enforce limits
+        run: |
+          bash scripts/wasm-benchmark.sh \
+            --no-build \
+            --github-summary
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+
+      # -----------------------------------------------------------------------
+      # Post PR comment with size diff table
+      # Only runs on pull_request events where a comment is useful.
+      # -----------------------------------------------------------------------
+      - name: Post PR size diff comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const commentPath = 'benchmark-results/pr-comment.md';
+
+            if (!fs.existsSync(commentPath)) {
+              core.warning('PR comment file not found — skipping comment post.');
+              return;
+            }
+
+            const body = fs.readFileSync(commentPath, 'utf8');
+            const marker = '<!-- wasm-benchmark-bot -->';
+            const fullBody = `${marker}\n${body}`;
+
+            // Find and update an existing bot comment, or create a new one.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: fullBody,
+              });
+              core.info(`Updated existing benchmark comment #${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: fullBody,
+              });
+              core.info('Created new benchmark comment on PR.');
+            }
+
+      # -----------------------------------------------------------------------
+      # Always upload benchmark artifacts for inspection
+      # -----------------------------------------------------------------------
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-benchmark-results-${{ github.sha }}
+          path: benchmark-results/
+          if-no-files-found: warn
+          retention-days: 90
+
+      # -----------------------------------------------------------------------
+      # Upload optimized WASM artifacts so reviewers can inspect binary size
+      # -----------------------------------------------------------------------
+      - name: Upload optimized WASM artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-optimized-${{ github.sha }}
+          path: target/wasm32-unknown-unknown/release/*.optimized.wasm
+          if-no-files-found: warn
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Soroban CPU / RAM resource instruction budget tracking
+  #
+  # Runs the cross-contract integration suite with --nocapture so Soroban's
+  # test environment prints per-invocation CPU and RAM instruction counts.
+  # These are captured as a structured artifact and surfaced in the PR comment.
+  # ---------------------------------------------------------------------------
+  resource-budget:
+    name: Resource Instruction Budget
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Run in parallel with wasm-size-check — they share the same build cache
+    # key so whichever finishes first will prime the cache for the other.
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain-file: rust-toolchain.toml
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-wasm-benchmark-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-wasm-benchmark-${{ runner.os }}-
+
+      # Run cross-contract integration tests with full output to capture
+      # Soroban's per-invocation resource consumption lines.
+      - name: Run cross-contract integration tests (resource capture)
+        id: resource_capture
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-results
+
+          cargo test \
+            --workspace \
+            --test cross_contract \
+            -- --nocapture --test-threads=1 \
+            2>&1 | tee benchmark-results/resource-budget-raw.txt
+
+          echo "Raw output captured."
+
+      # Parse the raw output into a structured Markdown table for the PR comment.
+      - name: Parse resource output into summary table
+        if: always()
+        run: |
+          set -euo pipefail
+          RAW="benchmark-results/resource-budget-raw.txt"
+          OUT="benchmark-results/resource-budget-summary.md"
+
+          cat > "$OUT" << 'EOF'
+          ## ⚡ Soroban Resource Instruction Budget
+
+          The table below is extracted from the cross-contract integration test
+          suite. Each row corresponds to a contract invocation captured during
+          the delegated purchase flow test.
+
+          > Soroban limits: **CPU instructions ≤ 100 000 000**, **RAM ≤ 41 943 040 bytes**
+
+          | Test / Operation | CPU Instructions | RAM (bytes) | CPU % of limit | RAM % of limit |
+          |---|---|---|---|---|
+          EOF
+
+          # Extract lines that contain Soroban resource data.
+          # Soroban SDK testutils print lines in the form:
+          #   cpu_insns: 1234567  mem_bytes: 891011
+          # or variations thereof. We normalize them into the table.
+          grep -E "cpu_insns|cpu instructions|mem_bytes|memory bytes" "$RAW" \
+            | sed 's/^[[:space:]]*//' \
+            | awk '
+              /cpu_insns/ {
+                match($0, /cpu_insns:[[:space:]]*([0-9]+)/, cpu_arr)
+                match($0, /mem_bytes:[[:space:]]*([0-9]+)/, mem_arr)
+                cpu = cpu_arr[1]
+                mem = mem_arr[1]
+                cpu_pct = int(cpu / 100000000 * 100)
+                mem_pct = int(mem / 41943040 * 100)
+                printf "| (invocation) | %s | %s | %s%% | %s%% |\n", cpu, mem, cpu_pct, mem_pct
+              }
+            ' >> "$OUT" || true
+
+          # If no resource lines were captured add a notice.
+          if ! grep -q "cpu_insns\|cpu instructions" "$RAW" 2>/dev/null; then
+            echo "" >> "$OUT"
+            echo "> ℹ️ No structured resource output detected in test output." >> "$OUT"
+            echo "> Detailed CPU/RAM per-invocation data requires the Soroban" >> "$OUT"
+            echo "> testutils \`budget\` API to be called explicitly within tests." >> "$OUT"
+            echo "> See \`tests/cross_contract.rs\` for how to add \`env.budget()\` calls." >> "$OUT"
+          fi
+
+          echo "Resource summary written to $OUT"
+          cat "$OUT"
+
+      - name: Append resource summary to GitHub step summary
+        if: always()
+        run: |
+          if [ -f benchmark-results/resource-budget-summary.md ]; then
+            cat benchmark-results/resource-budget-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload resource budget artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resource-budget-${{ github.sha }}
+          path: benchmark-results/resource-budget-*.{txt,md}
+          if-no-files-found: warn
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Update baseline (main branch only)
+  #
+  # After a PR merges into main, re-measure and commit an updated baseline
+  # JSON so future PRs diff against the new expected sizes.
+  # Only runs when triggered on push to main OR via workflow_dispatch with
+  # write_baseline=true.
+  # ---------------------------------------------------------------------------
+  update-baseline:
+    name: Update Size Baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [wasm-size-check]
+    # Only commit on main branch pushes (not PRs, not forks)
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.write_baseline == true)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Need write access to push baseline updates
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain-file: rust-toolchain.toml
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-wasm-benchmark-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-wasm-benchmark-${{ runner.os }}-
+
+      - name: Cache stellar-cli binary
+        id: cache-stellar-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/stellar
+          key: stellar-cli-v22-${{ runner.os }}
+
+      - name: Install stellar-cli
+        if: steps.cache-stellar-cli.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked stellar-cli --version "^22" --features opt 2>/dev/null \
+            || cargo install --locked stellar-cli --version "^22"
+
+      - name: Install jq
+        run: sudo apt-get install -y --no-install-recommends jq
+
+      - name: Build WASM artifacts
+        run: |
+          cargo build \
+            --target wasm32-unknown-unknown \
+            --release \
+            --workspace \
+            --exclude tests
+
+      - name: Optimize WASM artifacts
+        run: |
+          set -euo pipefail
+          for wasm in target/wasm32-unknown-unknown/release/*.wasm; do
+            [[ "$wasm" == *.optimized.wasm ]] && continue
+            stellar contract optimize --wasm "$wasm"
+          done
+
+      - name: Write new baseline
+        run: |
+          chmod +x scripts/wasm-benchmark.sh
+          bash scripts/wasm-benchmark.sh --no-build --write-baseline
+
+      - name: Commit updated baseline if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet scripts/wasm-size-baseline.json; then
+            echo "Baseline unchanged — nothing to commit."
+          else
+            git add scripts/wasm-size-baseline.json
+            git commit -m "chore(benchmark): update WASM size baseline [skip ci]
+
+          Automatically updated by the wasm-benchmark workflow after
+          merging commit ${{ github.sha }} into main.
+
+          $(cat benchmark-results/wasm-sizes.json)"
+            git push
+            echo "Baseline committed and pushed."
+          fi

@@ -389,3 +389,26 @@ fn bootstrap_requires_both_signatures_and_missing_guardian_fails_closed() {
     client.set_security_guardian(&admin, &guardian);
     assert_eq!(client.get_security_guardian(), Some(guardian));
 }
+
+#[test]
+fn roles_are_independent_and_pause_is_limited_to_pausers() {
+    let env = Env::default();
+    let (client, admin, _) = setup(&env);
+    let pauser = Address::generate(&env);
+    assert_eq!(
+        client.try_set_create_paused(&pauser, &true),
+        Err(Ok(EscrowError::Unauthorized))
+    );
+    assert!(client.grant_role(&admin, &pauser, &ContractRole::Pauser));
+    assert!(client.has_role(&pauser, &ContractRole::Pauser));
+    assert!(!client.has_role(&pauser, &ContractRole::FeeManager));
+    assert!(client.set_create_paused(&pauser, &true));
+    assert!(client.get_create_paused());
+    assert!(client.revoke_role(&admin, &pauser, &ContractRole::Pauser));
+    assert!(!client.has_role(&pauser, &ContractRole::Pauser));
+    assert_eq!(
+        client.try_set_create_paused(&pauser, &false),
+        Err(Ok(EscrowError::Unauthorized))
+    );
+    assert!(client.is_admin(&admin));
+}

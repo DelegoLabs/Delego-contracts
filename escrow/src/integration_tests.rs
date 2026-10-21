@@ -1,13 +1,10 @@
 #![cfg(test)]
 
 use crate::{
-    BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig, EscrowContract,
-    EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, MerchantVolumeRecord,
-    TreasuryShare, MAX_TREASURIES,
-
+    CorporateQuorumConfig, BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig,
     AffiliateConfig, BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig,
-    EscrowContract, EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, TreasuryShare,
-    MAX_TREASURIES,
+    EscrowContract, EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState,
+    MerchantVolumeRecord, TreasuryShare, MAX_TREASURIES,
     BatchDepositItem, BatchDepositParams, BatchDepositResult, BatchRefundParams,
     BatchReleaseParams, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError,
     EscrowStatus, EscrowTerminalState, TreasuryShare, MAX_TREASURIES,
@@ -3250,6 +3247,160 @@ fn test_inspection_events_emitted() {
         .collect();
 
     assert!(!inspection_events.is_empty(), "Inspection started event should be emitted");
+}
+
+// ── Corporate M-of-N threshold signature co-signer registry ───────────────
+
+fn setup_corporate_quorum(
+    t: &TestEnv,
+    signers: &soroban_sdk::Vec<Address>,
+    threshold: u32,
+    cutoff: i128,
+) {
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let config = CorporateQuorumConfig {
+        signers: signers.clone(),
+        threshold,
+        high_value_cutoff_stroops: cutoff,
+    };
+    assert!(escrow_client.set_quorum(&t.admin, &config));
+}
+
+fn make_signers(t: &TestEnv, n: u32) -> soroban_sdk::Vec<Address> {
+    let mut signers = soroban_sdk::Vec::new(&t.env);
+    for _ in 0..n {
+        signers.push_back(Address::generate(&t.env));
+    }
+    signers
+}
+
+#[test]
+fn test_set_quorum_stores_config() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let signers = make_signers(&t, 5);
+    setup_corporate_quorum(&t, &signers, 3, 5000);
+
+    let stored = escrow_client.get_quorum();
+    assert_eq!(stored.threshold, 3);
+    assert_eq!(stored.high_value_cutoff_stroops, 5000);
+    assert_eq!(stored.signers.len(), 5);
+}
+
+#[test]
+fn test_set_quorum_rejects_non_admin() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let signers = make_signers(&t, 3);
+    let config = CorporateQuorumConfig {
+        signers,
+        threshold: 2,
+        high_value_cutoff_stroops: 5000,
+    };
+    assert_eq!(
+        escrow_client.try_set_quorum(&t.agent, &config),
+        Err(Ok(EscrowError::Unauthorized))
+    );
+}
+
+#[test]
+fn test_set_quorum_rejects_threshold_above_signer_count() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let signers = make_signers(&t, 3);
+    let config = CorporateQuorumConfig {
+        signers,
+        threshold: 4,
+        high_value_cutoff_stroops: 5000,
+    };
+    assert!(escrow_client.try_set_quorum(&t.admin, &config).is_err());
+}
+
+#[test]
+fn test_high_value_release_requires_quorum() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let signers = make_signers(&t, 5);
+    setup_corporate_quorum(&t, &signers, 3, 5000);
+
+    // Above cutoff: single-signer release must be rejected.
+    let escrow_id = deposit_escrow(&t, 6000, 100);
+    assert_eq!(
+        escrow_client.try_release(&escrow_id, &t.buyer, &t.seller),
+        Err(Ok(EscrowError::QuorumRequired))
+    );
+    assert_eq!(token_client.balance(&t.seller), 0);
+
+    // Collect M-of-N co-signatures.
+    escrow_client.cosign_release(&escrow_id, &signers.get(0).unwrap());
+    escrow_client.cosign_release(&escrow_id, &signers.get(1).unwrap());
+    assert_eq!(
+        escrow_client.try_release(&escrow_id, &t.buyer, &t.seller),
+        Err(Ok(EscrowError::QuorumRequired))
+    );
+    escrow_client.cosign_release(&escrow_id, &signers.get(2).unwrap());
+
+    assert!(escrow_client.release(&escrow_id, &t.buyer, &t.seller));
+    assert_eq!(token_client.balance(&t.seller), 6000);
+    assert_eq!(
+        escrow_client.get_escrow(&escrow_id).status,
+        EscrowStatus::Released
+    );
+}
+
+#[test]
+fn test_below_cutoff_release_uses_single_signer() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let signers = make_signers(&t, 5);
+    setup_corporate_quorum(&t, &signers, 3, 5000);
+
+    // Below cutoff: standard single-signer flow succeeds without co-signatures.
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    assert!(escrow_client.release(&escrow_id, &t.buyer, &t.seller));
+    assert_eq!(token_client.balance(&t.seller), 1000);
+}
+
+#[test]
+fn test_cosign_rejects_duplicate_signer() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let signers = make_signers(&t, 5);
+    setup_corporate_quorum(&t, &signers, 3, 5000);
+
+    let escrow_id = deposit_escrow(&t, 6000, 100);
+    let signer = signers.get(0).unwrap();
+
+    escrow_client.cosign_release(&escrow_id, &signer);
+    assert_eq!(
+        escrow_client.try_cosign_release(&escrow_id, &signer),
+        Err(Ok(EscrowError::AlreadyVoted))
+    );
+}
+
+#[test]
+fn test_cosign_rejects_unregistered_signer() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let signers = make_signers(&t, 5);
+    setup_corporate_quorum(&t, &signers, 3, 5000);
+
+    let escrow_id = deposit_escrow(&t, 6000, 100);
+    let stranger = Address::generate(&t.env);
+
+    assert_eq!(
+        escrow_client.try_cosign_release(&escrow_id, &stranger),
+        Err(Ok(EscrowError::NotAnArbiter))
+    );
 }
 
 // Helper function to create signed delivery proofs for testing

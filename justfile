@@ -62,7 +62,14 @@ fmt-check:
 check: lint fmt-check
     cargo check --workspace
 
+# Measure optimized WASM binary sizes, enforce the 64 KiB hard limit, and
+# show a diff against the committed baseline.  Requires jq and either
+# stellar-cli or soroban CLI to be installed for the optimize step.
+# Pass --write-baseline to update scripts/wasm-size-baseline.json in-place.
+benchmark *FLAGS: build-all
+    bash scripts/wasm-benchmark.sh --no-build {{FLAGS}}
+
 # Run every CI check locally in the same order as the GitHub Actions
 # workflow.  A single `just ci` should catch every failure before pushing.
-ci: fmt-check lint test build-all
+ci: fmt-check lint test build-all benchmark
     echo "✅ all CI checks passed"

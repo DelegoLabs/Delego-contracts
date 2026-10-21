@@ -1,11 +1,11 @@
-use soroban_sdk::{contracttype, Env, Symbol, Vec};
-use soroban_sdk::types::ContractData;
+use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpendAuthorization {
     pub delegator: Address,
     pub agent: Address,
+    pub token_contract: Address,
     pub amount: i128,
     pub recipient: Address,
     pub nonce: u64,
@@ -18,6 +18,6 @@ impl SpendAuthorization {
         if self.epoch != current_epoch {
             return Err(PermissionError::StaleEpoch);
         }
-        Ok(())
+        Ok(()
     }
 }

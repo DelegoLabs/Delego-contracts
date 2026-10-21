@@ -26,6 +26,9 @@
 #![cfg_attr(not(test), no_std)]
 #![allow(clippy::too_many_arguments)]
 #![warn(missing_docs)]
+mod recurring_quota;
+pub use recurring_quota::RecurringQuotaConfig;
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, xdr::ToXdr, Address, BytesN,
     Env, Symbol, Vec,
@@ -212,15 +215,15 @@ pub enum PermissionError {
     /// Admin-gated call made before `set_admin` has ever been called
     NotInitialized = 2500,
     /// Allowance sweep targeted a delegation that is still live
-    DelegationNotExpired = 2418,
+    DelegationNotExpired = 2427,
     /// A child permission grant would exceed `MAX_HIERARCHY_DEPTH`
-    MaxHierarchyDepthExceeded = 2419,
+    MaxHierarchyDepthExceeded = 2428,
     /// Merchant's verification is below the currently required policy
     /// threshold and the grace period has elapsed.
-    VerificationBelowPolicy = 2420,
+    VerificationBelowPolicy = 2429,
     /// Merchant's verification is below the currently required policy
     /// threshold but still within the grace period.
-    VerificationGracePeriod = 2415,
+    VerificationGracePeriod = 2430,
     /// No queued spend proposal exists for the supplied proposal id (issue #377)
     ProposalNotFound = 2418,
     /// The queued spend proposal already settled and cannot be acted on again
@@ -238,7 +241,9 @@ pub enum PermissionError {
     TooManyPendingProposals = 2424,
     /// Ephemeral session keys cannot use relayer-based spend entrypoints.
     EphemeralRelayerUnsupported = 2425,
-    VerificationGracePeriod = 2421,
+    /// The relayer address has been frozen by an admin; all delegated spends
+    /// submitted by this relayer are blocked until the freeze is lifted.
+    RelayerFrozen = 2426,
 }
 
 /// Epoch period for allowance reset logic.
@@ -253,7 +258,6 @@ pub enum Epoch {
     /// Reset spent monthly (every 30 ledgers, roughly)
     Monthly,
 }
-
 
 #[cfg(test)]
 mod error_code_tests {
@@ -314,11 +318,12 @@ mod error_code_tests {
         PermissionError::AmbiguousMultiOwnerGrant as u32,
         PermissionError::TooManyPendingProposals as u32,
         PermissionError::EphemeralRelayerUnsupported as u32,
+        PermissionError::RelayerFrozen as u32,
     ];
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 38);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 39);
 
         let permission_range = ERROR_CODE_RANGES
             .iter()
@@ -608,6 +613,17 @@ pub struct UpdateQuorumThresholdProposal {
     /// Owners endorsing this migration. At least the *current* threshold of
     /// distinct current owners must appear here.
     pub signers: Vec<Address>,
+}
+
+/// Pending signer-key rotation proposal for a multi-signature quorum.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct SignerRotationProposal {
+    pub outgoing_signer: Address,
+    pub incoming_signer: Address,
+    pub effective_epoch: u32,
+    pub approvals: Vec<Address>,
 }
 
 /// Emitted when a multi-owner permission's quorum is reconfigured in place
@@ -1144,6 +1160,15 @@ pub struct AdminAcceptedEvent {
     pub new_admin: Address,
 }
 
+/// Emitted when an admin freezes a relayer address, immediately blocking all
+/// delegated spend entry points submitted by that relayer.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RelayerFrozenEvent {
+    pub admin: Address,
+    pub relayer: Address,
+}
+
 /// A single entry in the on-chain audit log for a (owner, delegate) pair.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1345,6 +1370,8 @@ pub struct ChildPermission {
 
 #[contracttype]
 pub enum DataKey {
+    /// Immutable recurring quota and lifetime spend for a permission pair.
+    RecurringQuota(Address, Address),
     Permission(Address, Address),
     /// Temporary session-key authorization and spend state for an owner/key pair.
     EphemeralSession(Address, Address),
@@ -1428,6 +1455,9 @@ pub enum DataKey {
     /// Instance-level grace period (seconds) granted to pre-existing
     /// merchants when the required verification count increases.
     VerificationGracePeriodSecs,
+    /// Admin-frozen relayer flag. When present and `true`, all delegated
+    /// spend entry points submitted by this relayer are blocked.
+    FrozenRelayer(Address),
 }
 
 /// Computes `current + ttl` as an absolute expiry ledger.
@@ -1492,6 +1522,9 @@ impl PermissionsContract {
     ) -> Result<(), PermissionError> {
         owner.require_auth();
 
+        if recurring_quota::load(&env, &owner, &config.session_key).is_some() {
+            return Err(PermissionError::AlreadyGranted);
+        }
         if owner == config.session_key || config.max_spend_per_session <= 0 {
             return Err(PermissionError::InvalidParam);
         }
@@ -1519,8 +1552,7 @@ impl PermissionsContract {
         if env.storage().persistent().has(&DataKey::Permission(
             owner.clone(),
             config.session_key.clone(),
-        ))
-            || env.storage().temporary().has(&key)
+        )) || env.storage().temporary().has(&key)
         {
             return Err(PermissionError::AlreadyGranted);
         }
@@ -1532,13 +1564,9 @@ impl PermissionsContract {
             .checked_add(ttl_ledgers)
             .ok_or(PermissionError::InvalidExpiry)?;
 
-        env.storage().temporary().set(
-            &key,
-            &EphemeralSessionState {
-                config,
-                spent: 0,
-            },
-        );
+        env.storage()
+            .temporary()
+            .set(&key, &EphemeralSessionState { config, spent: 0 });
         env.storage()
             .temporary()
             .extend_ttl(&key, ttl_ledgers, ttl_ledgers);
@@ -2148,7 +2176,7 @@ impl PermissionsContract {
             return Err(PermissionError::Expired);
         }
 
-        let parent_remaining = parent_record.limit_total - parent_record.spent;
+        let parent_remaining = recurring_quota::remaining(&env, &parent_record);
         if limit_total > parent_remaining || limit_per_tx > parent_record.limit_per_tx {
             return Err(PermissionError::ExceedsParentLimit);
         }
@@ -2344,6 +2372,13 @@ impl PermissionsContract {
         new_delegate: Address,
     ) -> Result<(), PermissionError> {
         owner.require_auth();
+
+        // A quota cannot be copied into a second independent lifetime budget.
+        if recurring_quota::load(&env, &owner, &old_delegate).is_some()
+            || recurring_quota::load(&env, &owner, &new_delegate).is_some()
+        {
+            return Err(PermissionError::InvalidParam);
+        }
 
         // Prevent self-transfer
         if old_delegate == new_delegate {
@@ -2820,7 +2855,10 @@ impl PermissionsContract {
         record: &PermissionRecord,
         amount: i128,
     ) -> Result<(), PermissionError> {
-        let remaining = record.limit_total - record.spent;
+        let remaining = recurring_quota::remaining(env, record);
+        if amount <= 0 {
+            return Err(PermissionError::InvalidParam);
+        }
         if amount > remaining {
             return Err(PermissionError::ExceedsTotalLimit);
         }
@@ -2838,7 +2876,7 @@ impl PermissionsContract {
                 .get(&parent_key)
                 .ok_or(PermissionError::ParentNotFound)?;
 
-            let parent_remaining = parent_record.limit_total - parent_record.spent;
+            let parent_remaining = recurring_quota::remaining(env, &parent_record);
             if amount > parent_remaining {
                 return Err(PermissionError::ExceedsParentLimit);
             }
@@ -3581,9 +3619,6 @@ impl PermissionsContract {
         let key = DataKey::Permission(owner.clone(), delegate.clone());
         let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
 
-let key = DataKey::Permission(owner.clone(), delegate.clone());
-        let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
-
         // Reset spent when crossing an epoch boundary (issue #11).
         let current_ledger = env.ledger().sequence();
         let ledgers_since_reset = current_ledger.saturating_sub(record.last_reset_ledger);
@@ -3593,33 +3628,44 @@ let key = DataKey::Permission(owner.clone(), delegate.clone());
                     record.spent = 0;
                     record.last_reset_ledger = current_ledger;
                 }
-            }
-            Epoch::Weekly => {
-                if ledgers_since_reset >= 7 {
-                    record.spent = 0;
-                    record.last_reset_ledger = current_ledger;
+        if !recurring_quota::consume(env, &mut record, amount)? {
+            // Reset spent when crossing an epoch boundary (issue #11).
+            let current_ledger = env.ledger().sequence();
+            let ledgers_since_reset = current_ledger.saturating_sub(record.last_reset_ledger);
+            match record.epoch {
+                Epoch::Daily => {
+                    if ledgers_since_reset >= 1 {
+                        record.spent = 0;
+                        record.last_reset_ledger = current_ledger;
+                    }
+                }
+                Epoch::Weekly => {
+                    if ledgers_since_reset >= 7 {
+                        record.spent = 0;
+                        record.last_reset_ledger = current_ledger;
+                    }
+                }
+                Epoch::Monthly => {
+                    if ledgers_since_reset >= 30 {
+                        record.spent = 0;
+                        record.last_reset_ledger = current_ledger;
+                    }
                 }
             }
-            Epoch::Monthly => {
-                if ledgers_since_reset >= 30 {
-                    record.spent = 0;
-                    record.last_reset_ledger = current_ledger;
-                }
-            }
-        }
 
-        if amount <= 0 {
-            return Err(PermissionError::InvalidParam);
+            if amount <= 0 {
+                return Err(PermissionError::InvalidParam);
+            }
+            let new_spent = record
+                .spent
+                .checked_add(amount)
+                .ok_or(PermissionError::ExceedsTotalLimit)?;
+            if new_spent > record.limit_total {
+                return Err(PermissionError::ExceedsTotalLimit);
+            }
+            record.spent = new_spent;
         }
-        let new_spent = record
-            .spent
-            .checked_add(amount)
-            .ok_or(PermissionError::ExceedsTotalLimit)?;
-        if new_spent > record.limit_total {
-            return Err(PermissionError::ExceedsTotalLimit);
-        }
-        record.spent = new_spent;
-        let remaining = record.limit_total - record.spent;
+        let remaining = recurring_quota::remaining(env, &record);
         let new_spend_ledger = env.ledger().sequence();
 
         // Capture the parent link before writing the updated record so we can
@@ -3654,14 +3700,16 @@ let key = DataKey::Permission(owner.clone(), delegate.clone());
             let mut parent_record: PermissionRecord =
                 env.storage().persistent().get(&parent_key).unwrap();
 
-            let parent_spent = parent_record
-                .spent
-                .checked_add(amount)
-                .ok_or(PermissionError::ExceedsTotalLimit)?;
-            if parent_spent > parent_record.limit_total {
-                return Err(PermissionError::ExceedsTotalLimit);
+            if !recurring_quota::consume(env, &mut parent_record, amount)? {
+                let parent_spent = parent_record
+                    .spent
+                    .checked_add(amount)
+                    .ok_or(PermissionError::ExceedsTotalLimit)?;
+                if parent_spent > parent_record.limit_total {
+                    return Err(PermissionError::ExceedsTotalLimit);
+                }
+                parent_record.spent = parent_spent;
             }
-            parent_record.spent = parent_spent;
             next_parent = match (
                 parent_record.parent_owner.clone(),
                 parent_record.parent_delegate.clone(),
@@ -4107,6 +4155,11 @@ let key = DataKey::Permission(owner.clone(), delegate.clone());
     ) -> Result<(), PermissionError> {
         relayer.require_auth();
 
+        // Emergency freeze check: block all spends from frozen relayer addresses.
+        if Self::is_relayer_frozen(env.clone(), relayer.clone()) {
+            return Err(PermissionError::RelayerFrozen);
+        }
+
         Self::reject_ephemeral_relayer_spend(&env, &owner, &delegate)?;
 
         if env.ledger().sequence() >= expiration_ledger {
@@ -4227,6 +4280,11 @@ let key = DataKey::Permission(owner.clone(), delegate.clone());
         epoch: u32,
     ) -> Result<(), PermissionError> {
         relayer.require_auth();
+
+        // Emergency freeze check: block all spends from frozen relayer addresses.
+        if Self::is_relayer_frozen(env.clone(), relayer.clone()) {
+            return Err(PermissionError::RelayerFrozen);
+        }
 
         Self::reject_ephemeral_relayer_spend(&env, &owner, &delegate)?;
 
@@ -5207,7 +5265,7 @@ let key = DataKey::Permission(owner.clone(), delegate.clone());
             .storage()
             .persistent()
             .get::<DataKey, PermissionRecord>(&DataKey::Permission(owner.clone(), delegate.clone()))
-            .map(|r| r.limit_total - r.spent)
+            .map(|r| recurring_quota::remaining(&env, &r))
             .unwrap_or(0);
 
         match Self::can_spend(env.clone(), owner, delegate, amount, merchant) {
@@ -5362,7 +5420,7 @@ let key = DataKey::Permission(owner.clone(), delegate.clone());
             .persistent()
             .get(&key)
             .ok_or(PermissionError::PermissionNotFound)?;
-        Ok(record.limit_total - record.spent)
+        Ok(recurring_quota::remaining(&env, &record))
     }
 
     /// Typed allowance getter: returns limit, spent, remaining (clamped ≥ 0),
@@ -5379,12 +5437,12 @@ let key = DataKey::Permission(owner.clone(), delegate.clone());
             .get(&key)
             .ok_or(PermissionError::PermissionNotFound)?;
 
-        let raw = record.limit_total - record.spent;
+        let raw = recurring_quota::remaining(&env, &record);
         let remaining = if raw < 0 { 0 } else { raw };
 
         Ok(RemainingAllowance {
             limit: record.limit_total,
-            spent: record.spent,
+            spent: recurring_quota::epoch_spent(&env, &record),
             remaining,
             expires_at_ledger: record.expires_at_ledger,
         })
@@ -5462,9 +5520,6 @@ let key = DataKey::Permission(owner.clone(), delegate.clone());
             return Err(PermissionError::LimitBelowSpent);
         }
 
-        let execution_time = env.ledger().timestamp() + 86400;
-        let execution_time =
-            env.ledger().timestamp() + Self::get_decrease_timelock_secs(env.clone());
         let execution_time =
             env.ledger().timestamp() + Self::get_decrease_timelock_secs(env.clone());
 
@@ -5716,6 +5771,52 @@ let key = DataKey::Permission(owner.clone(), delegate.clone());
         );
 
         Ok(())
+    }
+
+    /// Immediately suspend all delegated spend entry points for `relayer`.
+    ///
+    /// Once frozen, any call to [`Self::execute_spend_via_relayer`],
+    /// [`Self::execute_spend_via_channel`], or [`Self::execute_spend_multi`]
+    /// that names `relayer` as the submitting relayer will fail with
+    /// [`PermissionError::RelayerFrozen`] until the entry is manually removed
+    /// from storage.
+    ///
+    /// Only the contract admin may call this.
+    ///
+    /// Returns `true` when the relayer was newly frozen (idempotent: returns
+    /// `true` even if it was already frozen, so callers can confirm the freeze
+    /// without a separate query).
+    pub fn freeze_relayer(
+        env: Env,
+        admin: Address,
+        relayer: Address,
+    ) -> Result<bool, PermissionError> {
+        Self::require_admin(&env, &admin)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::FrozenRelayer(relayer.clone()), &true);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("rlyr_frz")),
+            RelayerFrozenEvent {
+                admin,
+                relayer,
+            },
+        );
+
+        Ok(true)
+    }
+
+    /// Returns `true` when `relayer` has been frozen by an admin.
+    ///
+    /// This is a pure read that costs no write resources; use it from off-chain
+    /// tooling or as a pre-flight check before submitting a relayed spend.
+    pub fn is_relayer_frozen(env: Env, relayer: Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::FrozenRelayer(relayer))
+            .unwrap_or(false)
     }
 
     /// Pause new grant creation. Admin-only.
@@ -6719,7 +6820,7 @@ let key = DataKey::Permission(owner.clone(), delegate.clone());
         };
 
         let remaining = {
-            let raw = record.limit_total - record.spent;
+            let raw = recurring_quota::remaining(&env, &record);
             if raw < 0 {
                 0
             } else {
@@ -6791,7 +6892,7 @@ let key = DataKey::Permission(owner.clone(), delegate.clone());
         };
 
         let remaining = if effective_status == PermissionStatus::Active {
-            let raw = record.limit_total - record.spent;
+            let raw = recurring_quota::remaining(&env, &record);
             if raw < 0 {
                 0
             } else {
@@ -7077,3 +7178,6 @@ mod audit_log_page_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod recurring_quota_tests;

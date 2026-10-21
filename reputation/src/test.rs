@@ -2,14 +2,18 @@
 #![allow(clippy::module_inception)]
 
 use crate::{
-    CompositeScore, DataKey, ReputationConfig, ReputationContract, ReputationContractClient,
-    ReputationError, TransactionOutcome, PERSISTENT_BUMP_AMOUNT, PERSISTENT_BUMP_THRESHOLD,
-    SCORE_WINDOW,
+    CompositeScore, DataKey, EntityRole, ReputationConfig, ReputationContract,
+    ReputationContractClient, ReputationError, TransactionOutcome, PERSISTENT_BUMP_AMOUNT,
+    PERSISTENT_BUMP_THRESHOLD, SCORE_WINDOW,
+    oracle_proof::test_signing_payload, CarrierProof, CompositeScore, DataKey, ReputationConfig,
+    ReputationContract, ReputationContractClient, ReputationError, TransactionOutcome,
+    PERSISTENT_BUMP_AMOUNT, PERSISTENT_BUMP_THRESHOLD, SCORE_WINDOW,
 };
+use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
     symbol_short,
-    testutils::{storage::Persistent, Address as _, Ledger},
-    Address, Env, String,
+    testutils::{storage::Persistent, Address as _, Events, Ledger},
+    Address, BytesN, Env, String,
 };
 
 const MAX_RECORD_CPU_INSTRUCTIONS: u64 = 3_000_000;
@@ -36,6 +40,80 @@ fn setup(env: &Env) -> (ReputationContractClient<'_>, Address) {
     let contract_id = env.register(ReputationContract, (admin.clone(), default_config()));
     let client = ReputationContractClient::new(env, &contract_id);
     (client, admin)
+}
+
+fn signed_carrier_proof(
+    env: &Env,
+    contract: &Address,
+    carrier_oracle: Address,
+    signing_key: &SigningKey,
+) -> CarrierProof {
+    let mut proof = CarrierProof {
+        carrier_oracle,
+        tracking_number_hash: BytesN::from_array(env, &[7; 32]),
+        delivery_status: symbol_short!("delivered"),
+        signature: BytesN::from_array(env, &[0; 64]),
+    };
+    let payload = test_signing_payload(env, contract, &proof);
+    let payload_len = payload.len() as usize;
+    let mut payload_bytes = [0u8; 512];
+    payload.copy_into_slice(&mut payload_bytes[..payload_len]);
+    proof.signature = BytesN::from_array(
+        env,
+        &signing_key.sign(&payload_bytes[..payload_len]).to_bytes(),
+    );
+    proof
+}
+
+#[test]
+fn carrier_proof_verifies_and_emits_event_for_registered_oracle() {
+    use soroban_sdk::IntoVal;
+
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let carrier_oracle = Address::generate(&env);
+    let signing_key = SigningKey::from_bytes(&[42; 32]);
+    let public_key = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+    client.set_carrier_oracle(&admin, &carrier_oracle, &public_key);
+    let proof = signed_carrier_proof(&env, &client.address, carrier_oracle.clone(), &signing_key);
+
+    client.verify_carrier_proof(&proof);
+
+    let events = env.events().all();
+    assert!(events.iter().any(|(contract, topics, _)| {
+        contract == client.address
+            && topics.len() == 3
+            && topics.get(0) == Some(symbol_short!("reput").into_val(&env))
+            && topics.get(1) == Some(symbol_short!("carproof").into_val(&env))
+            && topics.get(2) == Some(carrier_oracle.clone().into_val(&env))
+    }));
+}
+
+#[test]
+fn carrier_proof_rejects_unregistered_oracle() {
+    let env = Env::default();
+    let (client, _) = setup(&env);
+    let signing_key = SigningKey::from_bytes(&[43; 32]);
+    let proof = signed_carrier_proof(&env, &client.address, Address::generate(&env), &signing_key);
+
+    assert_eq!(
+        client.try_verify_carrier_proof(&proof),
+        Err(Ok(ReputationError::CarrierOracleNotAuthorized))
+    );
+}
+
+#[test]
+fn carrier_proof_rejects_signature_not_matching_registered_key() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let carrier_oracle = Address::generate(&env);
+    let registered_key = SigningKey::from_bytes(&[44; 32]);
+    let forged_key = SigningKey::from_bytes(&[45; 32]);
+    let public_key = BytesN::from_array(&env, &registered_key.verifying_key().to_bytes());
+    client.set_carrier_oracle(&admin, &carrier_oracle, &public_key);
+    let proof = signed_carrier_proof(&env, &client.address, carrier_oracle, &forged_key);
+
+    assert!(client.try_verify_carrier_proof(&proof).is_err());
 }
 
 fn advance_time(env: &Env, seconds: u64) {
@@ -2171,4 +2249,1078 @@ fn test_score_recalculates_after_feedback_submission() {
         found,
         "expected a (reput, updated, entity) score-updated event"
     );
+}
+
+// --- ConfigUpdatedEvent tests ---
+//
+// Each test confirms that `update_config` emits a `(reput, cfg_upd)` event
+// carrying the exact old and new `ReputationConfig` values.  One test per
+// mutable field satisfies the "field-level change tests" acceptance criterion.
+
+/// Helper: find the single `ConfigUpdatedEvent` emitted by the contract and
+/// return it, panicking if none (or more than one) is found.
+#[cfg(test)]
+fn extract_config_updated_event(
+    env: &Env,
+    contract_id: &Address,
+) -> crate::ConfigUpdatedEvent {
+    use soroban_sdk::{testutils::Events, IntoVal, TryIntoVal};
+
+    let events = env.events().all();
+    let mut found: Vec<crate::ConfigUpdatedEvent> = std::vec![];
+    for (contract, topics, data) in events.into_iter() {
+        if contract != *contract_id {
+            continue;
+        }
+        if topics.len() < 2 {
+            continue;
+        }
+        let ns: soroban_sdk::Symbol = match topics.get(0).unwrap().try_into_val(env) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let name: soroban_sdk::Symbol = match topics.get(1).unwrap().try_into_val(env) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if ns == symbol_short!("reput") && name == symbol_short!("cfg_upd") {
+            let evt: crate::ConfigUpdatedEvent = data.try_into_val(env).unwrap();
+            found.push(evt);
+        }
+    }
+    assert_eq!(found.len(), 1, "expected exactly one cfg_upd event, got {}", found.len());
+    found.remove(0)
+}
+
+#[test]
+fn test_update_config_emits_event_with_old_and_new_config() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let old_config = default_config();
+    let mut new_config = old_config.clone();
+    new_config.min_transactions_threshold = 3;
+
+    client.update_config(&admin, &new_config);
+
+    let evt = extract_config_updated_event(&env, &client.address);
+    assert_eq!(evt.old, old_config);
+    assert_eq!(evt.new, new_config);
+}
+
+#[test]
+fn test_update_config_event_decay_window_change() {
+    // Changing decay_window_seconds: old and new differ only in that field.
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let old_config = default_config();
+    let mut new_config = old_config.clone();
+    new_config.decay_window_seconds = old_config.decay_window_seconds * 2;
+
+    client.update_config(&admin, &new_config);
+
+    let evt = extract_config_updated_event(&env, &client.address);
+    assert_eq!(evt.old.decay_window_seconds, old_config.decay_window_seconds);
+    assert_eq!(evt.new.decay_window_seconds, new_config.decay_window_seconds);
+    // All other fields are identical.
+    assert_eq!(evt.old.min_transactions_threshold, evt.new.min_transactions_threshold);
+    assert_eq!(evt.old.dispute_penalty_bps, evt.new.dispute_penalty_bps);
+    assert_eq!(evt.old.freeze_threshold_flags, evt.new.freeze_threshold_flags);
+}
+
+#[test]
+fn test_update_config_event_min_transactions_threshold_change() {
+    // Changing min_transactions_threshold: old and new differ only in that field.
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let old_config = default_config();
+    let mut new_config = old_config.clone();
+    new_config.min_transactions_threshold = old_config.min_transactions_threshold + 1;
+
+    client.update_config(&admin, &new_config);
+
+    let evt = extract_config_updated_event(&env, &client.address);
+    assert_eq!(evt.old.min_transactions_threshold, old_config.min_transactions_threshold);
+    assert_eq!(evt.new.min_transactions_threshold, new_config.min_transactions_threshold);
+    assert_eq!(evt.old.decay_window_seconds, evt.new.decay_window_seconds);
+    assert_eq!(evt.old.dispute_penalty_bps, evt.new.dispute_penalty_bps);
+    assert_eq!(evt.old.freeze_threshold_flags, evt.new.freeze_threshold_flags);
+}
+
+#[test]
+fn test_update_config_event_dispute_penalty_bps_change() {
+    // Changing dispute_penalty_bps: old and new differ only in that field.
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let old_config = default_config();
+    let mut new_config = old_config.clone();
+    new_config.dispute_penalty_bps = old_config.dispute_penalty_bps + 100;
+
+    client.update_config(&admin, &new_config);
+
+    let evt = extract_config_updated_event(&env, &client.address);
+    assert_eq!(evt.old.dispute_penalty_bps, old_config.dispute_penalty_bps);
+    assert_eq!(evt.new.dispute_penalty_bps, new_config.dispute_penalty_bps);
+    assert_eq!(evt.old.decay_window_seconds, evt.new.decay_window_seconds);
+    assert_eq!(evt.old.min_transactions_threshold, evt.new.min_transactions_threshold);
+    assert_eq!(evt.old.freeze_threshold_flags, evt.new.freeze_threshold_flags);
+}
+
+#[test]
+fn test_update_config_event_freeze_threshold_flags_change() {
+    // Changing freeze_threshold_flags: old and new differ only in that field.
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let old_config = default_config();
+    let mut new_config = old_config.clone();
+    new_config.freeze_threshold_flags = old_config.freeze_threshold_flags + 2;
+
+    client.update_config(&admin, &new_config);
+
+    let evt = extract_config_updated_event(&env, &client.address);
+    assert_eq!(evt.old.freeze_threshold_flags, old_config.freeze_threshold_flags);
+    assert_eq!(evt.new.freeze_threshold_flags, new_config.freeze_threshold_flags);
+    assert_eq!(evt.old.decay_window_seconds, evt.new.decay_window_seconds);
+    assert_eq!(evt.old.min_transactions_threshold, evt.new.min_transactions_threshold);
+    assert_eq!(evt.old.dispute_penalty_bps, evt.new.dispute_penalty_bps);
+}
+
+#[test]
+fn test_update_config_emits_no_event_on_unauthorized_call() {
+    // A rejected call must not emit any cfg_upd event.
+    use soroban_sdk::testutils::Events;
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let not_admin = Address::generate(&env);
+
+    let _ = client.try_update_config(&not_admin, &default_config());
+
+    let events = env.events().all();
+    let cfg_upd_count = events.iter().filter(|(contract, topics, _)| {
+        use soroban_sdk::{IntoVal, TryIntoVal};
+        *contract == client.address
+            && topics.get(1)
+                .and_then(|v| v.try_into_val::<_, soroban_sdk::Symbol>(&env).ok())
+                .map(|s| s == symbol_short!("cfg_upd"))
+                .unwrap_or(false)
+    }).count();
+    assert_eq!(cfg_upd_count, 0, "unauthorized call must not emit cfg_upd event");
+}
+
+#[test]
+fn test_update_config_event_namespace_is_reput() {
+    // Confirm the event topics follow the ('reput', 'cfg_upd') schema required
+    // by the namespace-consistency rule checked in test_event_namespace_consistency.
+    use soroban_sdk::{testutils::Events, IntoVal, TryIntoVal};
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let mut new_config = default_config();
+    new_config.dispute_penalty_bps = 200;
+    client.update_config(&admin, &new_config);
+
+    let events = env.events().all();
+    let cfg_upd_events: Vec<_> = events
+        .iter()
+        .filter(|(contract, topics, _)| {
+            *contract == client.address
+                && topics
+                    .get(1)
+                    .and_then(|v| v.try_into_val::<_, soroban_sdk::Symbol>(&env).ok())
+                    .map(|s| s == symbol_short!("cfg_upd"))
+                    .unwrap_or(false)
+        })
+        .collect();
+
+    assert_eq!(cfg_upd_events.len(), 1, "expected exactly one cfg_upd event");
+    let (_, topics, _) = &cfg_upd_events[0];
+    let ns: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(ns, symbol_short!("reput"), "cfg_upd event namespace must be 'reput'");
+// --- strict numeric normalization (issue #395) ---
+//
+// Score recalculation must never panic, underflow, or wrap when a merchant
+// accumulates extreme consecutive negative reviews. Every persisted score
+// funnels through `normalize_score`, which clamps the raw signed value into
+// the legal `0..=10_000` basis-point band.
+
+#[test]
+fn test_normalize_score_clamps_to_basis_point_band() {
+    assert_eq!(crate::normalize_score(i64::MIN), 0);
+    assert_eq!(crate::normalize_score(-1), 0);
+    assert_eq!(crate::normalize_score(0), 0);
+    assert_eq!(crate::normalize_score(1), 1);
+    assert_eq!(crate::normalize_score(5_000), 5_000);
+    assert_eq!(crate::normalize_score(9_999), 9_999);
+    assert_eq!(crate::normalize_score(10_000), 10_000);
+    assert_eq!(crate::normalize_score(10_001), 10_000);
+    assert_eq!(crate::normalize_score(i64::MAX), 10_000);
+}
+#[test]
+fn test_normalize_score_is_idempotent_and_monotonic() {
+    // Property: the clamp output always lands in the legal band, normalizing
+    // an already-normalized value is a no-op, and the mapping is monotonically
+    // non-decreasing across the whole signed domain.
+    const STEP: i64 = 1_000_000_000_000;
+    let mut previous = crate::normalize_score(i64::MIN);
+    let mut raw: i64 = i64::MIN;
+    while raw < i64::MAX {
+        raw = raw.saturating_add(STEP);
+        let normalized = crate::normalize_score(raw);
+        assert!(
+            normalized <= 10_000,
+            "score {normalized} escaped 0..=10_000"
+        );
+        assert!(normalized >= previous, "normalization must not decrease");
+        assert_eq!(crate::normalize_score(normalized as i64), normalized);
+        previous = normalized;
+    }
+}
+
+#[test]
+fn test_calculate_decayed_score_stays_within_basis_point_band() {
+    // Decay is a score recalculation too, so an out-of-band input must be
+    // folded back into the legal band rather than returned verbatim.
+    assert_eq!(crate::calculate_decayed_score(20_000, 0, 100), 10_000);
+    assert_eq!(crate::calculate_decayed_score(10_000, 0, 100), 10_000);
+    assert!(crate::calculate_decayed_score(10_000, 50, 100) <= 10_000);
+}
+
+#[test]
+fn test_hundred_consecutive_negative_reviews_never_wrap() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let reviewer = Address::generate(&env);
+
+    // Establish a perfect score first so the negative run has room to fall.
+    for i in 0..5u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &reviewer,
+// --- reputation score attestations (issue #394) ---
+
+/// Moves the mocked ledger to `sequence`, which is the checkpoint an
+/// attestation records.
+fn set_sequence(env: &Env, sequence: u32) {
+    env.ledger().set_sequence_number(sequence);
+}
+
+/// Records `count` freshly Released transactions for `entity`, enough to pass
+/// the config's `min_transactions_threshold` when `count >= 5`.
+fn seed_released_transactions(
+// --- fraud reputation slashing (issue #392) ---
+
+/// Registers the standard 5-escrow clean history so `entity` has a visible
+/// score of 10_000 before a fraud ruling lands.
+fn seed_clean_history(
+    client: &ReputationContractClient,
+    admin: &Address,
+    entity: &Address,
+    counterparty: &Address,
+    start: u64,
+    count: u64,
+) {
+    for i in start..(start + count) {
+) {
+    for i in 0..5u64 {
+        client.record_transaction(
+            admin,
+            &i,
+            entity,
+            counterparty,
+            &1_000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+    assert_eq!(client.get_reputation(&entity).score, 10_000);
+
+    // 100 consecutive negative reviews: refunded outcomes rated 0/10_000.
+    for i in 5..105u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &reviewer,
+            &1_000i128,
+            &TransactionOutcome::Refunded,
+        );
+        client.rate_entity(&reviewer, &i, &entity, &0u32);
+
+        let rep = client.get_reputation(&entity);
+        assert!(
+            rep.score <= 10_000,
+            "score {} escaped the basis-point band on review {i}",
+            rep.score
+        );
+        assert!(rep.avg_rating <= 10_000);
+    }
+}
+
+#[test]
+fn test_hundred_disputes_with_max_penalty_saturate_at_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut config = default_config();
+    // Maximum legal per-dispute penalty, so the accumulated penalty is far
+    // larger than the maximum possible base score.
+    config.dispute_penalty_bps = 10_000;
+    let contract_id = env.register(ReputationContract, (admin.clone(), config));
+    let client = ReputationContractClient::new(&env, &contract_id);
+
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    for i in 0..100u64 {
+// ════════════════════════════════════════════════════════════════════════════
+// Issue #396: Role-specific scoring weight models
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_set_entity_role_classifies_merchant() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::Merchant);
+
+    let rep = client.get_reputation(&entity);
+    assert_eq!(rep.role, EntityRole::Merchant);
+}
+
+#[test]
+fn test_set_entity_role_classifies_buyer_agent() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::BuyerAgent);
+
+    let rep = client.get_reputation(&entity);
+    assert_eq!(rep.role, EntityRole::BuyerAgent);
+}
+
+#[test]
+fn test_set_entity_role_rejects_non_admin() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let not_admin = Address::generate(&env);
+
+    let res = client.try_set_entity_role(
+        &not_admin,
+        &entity.clone(),
+        &EntityRole::Merchant,
+    );
+    assert_eq!(res, Err(Ok(ReputationError::Unauthorized)));
+}
+
+#[test]
+fn test_get_role_specific_metrics_merchant() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::Merchant);
+
+    // 4 Released, 1 Disputed out of 5 total.
+    for i in 0..4u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1_000i128,
+            &TransactionOutcome::Disputed,
+        );
+        let rep = client.get_reputation(&entity);
+        assert!(rep.score <= 10_000, "score wrapped on dispute {i}");
+    }
+
+    let rep = client.get_reputation(&entity);
+    assert_eq!(rep.score, 0);
+    assert_eq!(rep.disputed_transactions, 100);
+
+    // The raw decomposition shows the *pre-clamp* value was deeply negative:
+    // 100 disputes x 10_000 bps of penalty against a 0 bps base score. The
+    // clamp — not an accidental wrap — is what produced 0.
+    let decomposition = client.get_score_decomposition(&entity);
+    assert_eq!(decomposition.base_score_bps, 0);
+    assert_eq!(decomposition.penalty_bps, 1_000_000);
+    assert_eq!(decomposition.final_score, 0);
+}
+
+#[test]
+fn test_mixed_extreme_outcome_sequences_stay_bounded() {
+    // Deterministic pseudo-random sequences (no external proptest
+    // dependency): every generated history must leave the persisted score
+    // inside `0..=10_000`, and the incremental fast path used by
+    // `record_transaction` must agree with a full recompute.
+    fn next(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state >> 33
+    }
+
+    let outcomes = [
+        TransactionOutcome::Released,
+        TransactionOutcome::Refunded,
+        TransactionOutcome::Disputed,
+        TransactionOutcome::ResolvedSeller,
+        TransactionOutcome::ResolvedBuyer,
+    ];
+
+    for seed in 0..8u64 {
+        let env = Env::default();
+        let (client, admin) = setup(&env);
+        let entity = Address::generate(&env);
+        let counterparty = Address::generate(&env);
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+
+        for i in 0..40u64 {
+            let outcome = outcomes[(next(&mut state) % outcomes.len() as u64) as usize].clone();
+            let is_disputed = matches!(outcome, TransactionOutcome::Disputed);
+            client.record_transaction(&admin, &i, &entity, &counterparty, &1_000i128, &outcome);
+            if !is_disputed {
+                let rating = (next(&mut state) % 10_001) as u32;
+                client.rate_entity(&counterparty, &i, &entity, &rating);
+            }
+
+            let rep = client.get_reputation(&entity);
+            assert!(
+                rep.score <= 10_000,
+                "seed {seed} step {i}: score escaped band"
+            );
+            assert!(rep.avg_rating <= 10_000);
+
+            let decomposition = client.get_score_decomposition(&entity);
+            assert!(
+                (0..=10_000).contains(&decomposition.final_score),
+                "seed {seed} step {i}: decomposition escaped band"
+            );
+            assert!(decomposition.base_score_bps <= 10_000);
+        }
+
+        // The incrementally maintained score is re-derivable from scratch.
+        let incremental = client.get_reputation(&entity).score;
+        let recomputed = client.get_score_decomposition(&entity).final_score;
+        assert_eq!(incremental, recomputed, "seed {seed}: paths disagree");
+    }
+}
+
+#[test]
+fn test_generate_attestation_snapshots_public_score_and_window() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    set_sequence(&env, 1_000);
+    seed_released_transactions(&client, &admin, &entity, &counterparty, 0, 5);
+
+    let attestation = client.generate_score_attestation(&entity);
+
+    assert_eq!(attestation.entity, entity);
+    assert_eq!(attestation.score_bps, 10_000);
+    assert_eq!(attestation.total_transactions, 5);
+    // Sequence checkpoint plus the documented validity window.
+    assert_eq!(attestation.certified_at_ledger, 1_000);
+    assert_eq!(
+        attestation.expires_at_ledger,
+        1_000 + crate::ATTESTATION_VALIDITY_LEDGERS
+    );
+    assert!(attestation.expires_at_ledger > attestation.certified_at_ledger);
+}
+
+#[test]
+fn test_generate_attestation_masks_score_below_threshold() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    seed_released_transactions(&client, &admin, &entity, &counterparty, 0, 1);
+
+    let attestation = client.generate_score_attestation(&entity);
+    let reputation = client.get_reputation(&entity);
+
+    // The attestation must agree with the canonical read path, including the
+    // min-transactions visibility gate.
+    assert_eq!(reputation.score, 0);
+    assert_eq!(attestation.score_bps, 0);
+    assert_eq!(attestation.total_transactions, 1);
+}
+
+#[test]
+fn test_generate_attestation_for_unknown_entity_is_zeroed_snapshot() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let unknown = Address::generate(&env);
+    set_sequence(&env, 42);
+
+    let attestation = client.generate_score_attestation(&unknown);
+
+    assert_eq!(attestation.entity, unknown);
+    assert_eq!(attestation.score_bps, 0);
+    assert_eq!(attestation.total_transactions, 0);
+    assert_eq!(attestation.certified_at_ledger, 42);
+    assert!(attestation.expires_at_ledger > 42);
+}
+
+#[test]
+fn test_verify_attestation_accepts_fresh_snapshot() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    set_sequence(&env, 500);
+    seed_released_transactions(&client, &admin, &entity, &counterparty, 0, 5);
+
+    let attestation = client.generate_score_attestation(&entity);
+    let verification = client.verify_score_attestation(&attestation);
+
+    assert!(verification.valid);
+    assert!(!verification.expired);
+    assert!(verification.score_matches);
+    assert_eq!(verification.attestation, attestation);
+    assert_eq!(verification.current, attestation);
+}
+
+#[test]
+fn test_verify_attestation_detects_score_drift() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    set_sequence(&env, 500);
+    seed_released_transactions(&client, &admin, &entity, &counterparty, 0, 5);
+
+    let cached = client.generate_score_attestation(&entity);
+
+    // A dispute lands after the snapshot was certified, degrading the score.
+    client.record_transaction(
+        &admin,
+        &99u64,
+        &entity,
+        &counterparty,
+        &1_000i128,
+        &TransactionOutcome::Disputed,
+    );
+
+    let verification = client.verify_score_attestation(&cached);
+    assert!(!verification.valid);
+    assert!(!verification.expired);
+    assert!(!verification.score_matches);
+    assert!(verification.current.score_bps < cached.score_bps);
+    // The refreshed snapshot is itself verifiable.
+    assert!(client.verify_score_attestation(&verification.current).valid);
+}
+
+#[test]
+fn test_verify_attestation_detects_transaction_count_drift() {
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+    client.record_transaction(
+        &admin,
+        &4u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Disputed,
+    );
+
+    let metrics = client.get_role_specific_metrics(&entity);
+    // fulfillment = 4/5 * 10000 = 8000
+    assert_eq!(metrics.fulfillment_rate_bps, 8000);
+    // dispute frequency = 1/5 * 10000 = 2000
+    assert_eq!(metrics.dispute_frequency_bps, 2000);
+    assert_eq!(metrics.role, EntityRole::Merchant);
+    assert_eq!(metrics.timely_payment_rate_bps, 8000);
+}
+
+#[test]
+fn test_get_role_specific_metrics_buyer_agent() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    set_sequence(&env, 500);
+    seed_released_transactions(&client, &admin, &entity, &counterparty, 0, 5);
+
+    let cached = client.generate_score_attestation(&entity);
+
+    // Same score (a clean Released outcome keeps it at 10_000), but the
+    // lifetime transaction count backing it moved on.
+    seed_released_transactions(&client, &admin, &entity, &counterparty, 100, 1);
+
+    let verification = client.verify_score_attestation(&cached);
+    assert!(!verification.valid);
+    assert!(!verification.expired);
+    assert!(!verification.score_matches);
+    assert_eq!(verification.current.score_bps, cached.score_bps);
+    assert_eq!(
+        verification.current.total_transactions,
+        cached.total_transactions + 1
+    );
+}
+
+#[test]
+fn test_verify_attestation_detects_expiry() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    set_sequence(&env, 500);
+    seed_released_transactions(&client, &admin, &entity, &counterparty, 0, 5);
+
+    let cached = client.generate_score_attestation(&entity);
+
+    // One ledger before the window closes the snapshot is still authoritative.
+    set_sequence(&env, cached.expires_at_ledger - 1);
+    let fresh_window = client.verify_score_attestation(&cached);
+    assert!(fresh_window.valid);
+    assert!(!fresh_window.expired);
+
+    // At the expiry ledger it is stale even though state is unchanged.
+    set_sequence(&env, cached.expires_at_ledger);
+    let expired = client.verify_score_attestation(&cached);
+    assert!(!expired.valid);
+    assert!(expired.expired);
+    assert!(expired.score_matches);
+    // Refreshing yields a snapshot anchored at the current ledger.
+    assert_eq!(
+        expired.current.certified_at_ledger,
+        cached.expires_at_ledger
+    );
+    assert!(client.verify_score_attestation(&expired.current).valid);
+}
+
+#[test]
+fn test_attestation_is_expired_boundaries() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    set_sequence(&env, 100);
+    seed_released_transactions(&client, &admin, &entity, &counterparty, 0, 5);
+
+    let attestation = client.generate_score_attestation(&entity);
+    assert!(!crate::attestation_is_expired(&attestation, 100));
+    assert!(!crate::attestation_is_expired(
+        &attestation,
+        attestation.expires_at_ledger - 1
+    ));
+    assert!(crate::attestation_is_expired(
+        &attestation,
+        attestation.expires_at_ledger
+    ));
+    assert!(crate::attestation_is_expired(&attestation, u32::MAX));
+
+    // Malformed windows (expiry at or before certification) are always stale,
+    // so a hand-built snapshot cannot bypass expiry.
+    let malformed = crate::ReputationAttestation {
+        entity: entity.clone(),
+        score_bps: 10_000,
+        total_transactions: 5,
+        certified_at_ledger: 100,
+        expires_at_ledger: 100,
+    };
+    assert!(crate::attestation_is_expired(&malformed, 0));
+    let verification = client.verify_score_attestation(&malformed);
+    assert!(!verification.valid);
+    assert!(verification.expired);
+}
+
+#[test]
+fn test_fraud_slash_reduces_score_by_penalty() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let escrow = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    seed_clean_history(&client, &admin, &merchant, &counterparty);
+    assert_eq!(client.get_reputation(&merchant).score, 10_000);
+
+    client.set_fraud_authority(&admin, &escrow);
+    assert_eq!(client.get_fraud_authority(), Some(escrow.clone()));
+
+    let new_score = client.apply_fraud_reputation_slash(&merchant, &crate::FRAUD_PENALTY_SCORE_BPS);
+
+    // A confirmed fraud ruling costs exactly the fixed 25% penalty.
+    assert_eq!(new_score, 7_500);
+    assert_eq!(client.get_reputation(&merchant).score, 7_500);
+    let record = client.get_fraud_record(&merchant);
+    assert_eq!(record.strike_count, 1);
+    assert_eq!(
+        record.accumulated_penalty_bps,
+        crate::FRAUD_PENALTY_SCORE_BPS
+    );
+}
+
+#[test]
+fn test_fraud_slash_survives_later_score_recomputation() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let escrow = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    seed_clean_history(&client, &admin, &merchant, &counterparty);
+    client.set_fraud_authority(&admin, &escrow);
+    client.apply_fraud_reputation_slash(&merchant, &crate::FRAUD_PENALTY_SCORE_BPS);
+
+    // A long run of clean Released outcomes after the ruling must not restore
+    // the merchant's score: the slash is part of the score, not a one-off
+    // edit that the next recompute overwrites.
+    for i in 100..120u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &merchant,
+            &counterparty,
+            &1_000i128,
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::BuyerAgent);
+
+    // All Released -> no disputes, full fulfillment/timely payment.
+    for i in 0..5u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep = client.get_reputation(&merchant);
+    assert_eq!(rep.score, 7_500);
+    assert_eq!(client.get_fraud_record(&merchant).strike_count, 1);
+    assert_eq!(client.get_score_decomposition(&merchant).penalty_bps, 2_500);
+}
+
+#[test]
+fn test_fraud_slash_accumulates_and_clamps_at_zero() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let escrow = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    seed_clean_history(&client, &admin, &merchant, &counterparty);
+    client.set_fraud_authority(&admin, &escrow);
+
+    // A maximum legal slash removes the entire score without underflowing.
+    let score = client.apply_fraud_reputation_slash(&merchant, &10_000u32);
+    assert_eq!(score, 0);
+    assert_eq!(client.get_reputation(&merchant).score, 0);
+
+    // A second ruling keeps clamping at 0 while the permanent audit trail
+    // keeps growing.
+    let score = client.apply_fraud_reputation_slash(&merchant, &2_500u32);
+    assert_eq!(score, 0);
+    let record = client.get_fraud_record(&merchant);
+    assert_eq!(record.strike_count, 2);
+    assert_eq!(record.accumulated_penalty_bps, 12_500);
+    assert_eq!(
+        client.get_score_decomposition(&merchant).final_score,
+        0,
+        "score must stay clamped at the floor"
+    );
+}
+
+#[test]
+fn test_fraud_slash_for_unknown_merchant_records_strike() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let escrow = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    client.set_fraud_authority(&admin, &escrow);
+
+    let score = client.apply_fraud_reputation_slash(&merchant, &crate::FRAUD_PENALTY_SCORE_BPS);
+
+    assert_eq!(score, 0);
+    let record = client.get_fraud_record(&merchant);
+    assert_eq!(record.strike_count, 1);
+    // The merchant now has an explicit record at the floor rather than
+    // disappearing from the registry.
+    assert_eq!(client.get_reputation(&merchant).score, 0);
+}
+
+#[test]
+fn test_fraud_slash_requires_configured_authority() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let merchant = Address::generate(&env);
+
+    // No escrow contract has been authorized yet.
+    let res = client.try_apply_fraud_reputation_slash(&merchant, &2_500u32);
+    assert_eq!(res, Err(Ok(ReputationError::NotInitialized)));
+    assert_eq!(client.get_fraud_record(&merchant).strike_count, 0);
+}
+
+#[test]
+fn test_fraud_slash_rejects_unauthorized_caller() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let escrow = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    client.set_fraud_authority(&admin, &escrow);
+
+    // With no mocked authorization at all, the configured authority has not
+    // signed the invocation, so the slash must be rejected.
+    env.mock_auths(&[]);
+    let res = client.try_apply_fraud_reputation_slash(&merchant, &2_500u32);
+    assert!(res.is_err(), "slash without authority auth must fail");
+    assert_eq!(client.get_fraud_record(&merchant).strike_count, 0);
+
+    // Mocking an unrelated account's authorization is also insufficient.
+    let stranger = Address::generate(&env);
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &stranger,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "apply_fraud_reputation_slash",
+            args: (merchant.clone(), 2_500u32).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    let res = client.try_apply_fraud_reputation_slash(&merchant, &2_500u32);
+    assert!(res.is_err(), "stranger auth must not authorize a slash");
+    assert_eq!(client.get_fraud_record(&merchant).strike_count, 0);
+}
+
+#[test]
+fn test_fraud_slash_accepts_authorized_escrow_contract() {
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let escrow = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    seed_clean_history(&client, &admin, &merchant, &counterparty);
+    client.set_fraud_authority(&admin, &escrow);
+
+    // Only the configured escrow's authorization satisfies the call.
+    env.mock_auths(&[MockAuth {
+        address: &escrow,
+        invoke: &MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "apply_fraud_reputation_slash",
+            args: (merchant.clone(), crate::FRAUD_PENALTY_SCORE_BPS).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let score = client.apply_fraud_reputation_slash(&merchant, &crate::FRAUD_PENALTY_SCORE_BPS);
+    assert_eq!(score, 7_500);
+}
+
+#[test]
+fn test_fraud_slash_rejects_out_of_range_penalty() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let escrow = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    client.set_fraud_authority(&admin, &escrow);
+
+    // Zero would be a silent no-op rather than a penalty.
+    assert_eq!(
+        client.try_apply_fraud_reputation_slash(&merchant, &0u32),
+        Err(Ok(ReputationError::InvalidParam))
+    );
+    // More than 100% of the score is not a meaningful slash.
+    assert_eq!(
+        client.try_apply_fraud_reputation_slash(&merchant, &10_001u32),
+        Err(Ok(ReputationError::InvalidParam))
+    );
+    assert_eq!(client.get_fraud_record(&merchant).strike_count, 0);
+}
+
+#[test]
+fn test_set_fraud_authority_requires_admin() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let not_admin = Address::generate(&env);
+    let escrow = Address::generate(&env);
+
+    let res = client.try_set_fraud_authority(&not_admin, &escrow);
+    assert_eq!(res, Err(Ok(ReputationError::Unauthorized)));
+    assert_eq!(client.get_fraud_authority(), None);
+}
+
+#[test]
+fn test_set_fraud_authority_replaces_previous_authority() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let old_escrow = Address::generate(&env);
+    let new_escrow = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    client.set_fraud_authority(&admin, &old_escrow);
+    client.set_fraud_authority(&admin, &new_escrow);
+    assert_eq!(client.get_fraud_authority(), Some(new_escrow.clone()));
+
+    // The replaced authority can no longer slash.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &old_escrow,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "apply_fraud_reputation_slash",
+            args: (merchant.clone(), 2_500u32).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    let res = client.try_apply_fraud_reputation_slash(&merchant, &2_500u32);
+    assert!(res.is_err());
+    let metrics = client.get_role_specific_metrics(&entity);
+    assert_eq!(metrics.fulfillment_rate_bps, 10_000);
+    assert_eq!(metrics.dispute_frequency_bps, 0);
+    assert_eq!(metrics.timely_payment_rate_bps, 10_000);
+    assert_eq!(metrics.role, EntityRole::BuyerAgent);
+}
+
+#[test]
+fn test_get_merchant_metrics_rejects_buyer_agent() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::BuyerAgent);
+
+    let res = client.try_get_merchant_metrics(&entity);
+    assert_eq!(res, Err(Ok(ReputationError::EntityNotFound)));
+}
+
+#[test]
+fn test_get_buyer_agent_metrics_rejects_merchant() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::Merchant);
+
+    let res = client.try_get_buyer_agent_metrics(&entity);
+    assert_eq!(res, Err(Ok(ReputationError::EntityNotFound)));
+}
+
+#[test]
+fn test_get_merchant_metrics_returns_for_merchant() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::Merchant);
+
+    for i in 0..5u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let metrics = client.get_merchant_metrics(&entity);
+    assert_eq!(metrics.role, EntityRole::Merchant);
+    assert_eq!(metrics.fulfillment_rate_bps, 10_000);
+    assert_eq!(metrics.dispute_frequency_bps, 0);
+}
+
+#[test]
+fn test_get_buyer_agent_metrics_returns_for_buyer_agent() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::BuyerAgent);
+
+    // 3 Released, 2 Disputed out of 5 total.
+    for i in 0..3u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+    for i in 3..5u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Disputed,
+        );
+    }
+
+    let metrics = client.get_buyer_agent_metrics(&entity);
+    assert_eq!(metrics.role, EntityRole::BuyerAgent);
+    // fulfillment = 3/5 * 10000 = 6000
+    assert_eq!(metrics.fulfillment_rate_bps, 6000);
+    // dispute frequency = 2/5 * 10000 = 4000
+    assert_eq!(metrics.dispute_frequency_bps, 4000);
+    assert_eq!(metrics.timely_payment_rate_bps, 6000);
+}
+
+#[test]
+fn test_role_specific_metrics_entity_not_found() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let entity = Address::generate(&env);
+
+    assert_eq!(
+        client.try_get_role_specific_metrics(&entity),
+        Err(Ok(ReputationError::EntityNotFound))
+    );
+}
+
+#[test]
+fn test_role_metrics_update_on_outcome_change() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::Merchant);
+
+    // Start with a Disputed outcome.
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Disputed,
+    );
+    let metrics_after_dispute = client.get_role_specific_metrics(&entity);
+    assert_eq!(metrics_after_dispute.dispute_frequency_bps, 10_000);
+
+    // Lifecycle update to ResolvedSeller: dispute count drops, fulfillment rises.
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::ResolvedSeller,
+    );
+    let metrics_after_resolve = client.get_role_specific_metrics(&entity);
+    assert_eq!(metrics_after_resolve.dispute_frequency_bps, 0);
+    assert_eq!(metrics_after_resolve.fulfillment_rate_bps, 10_000);
 }

@@ -25,6 +25,7 @@
 //! | `escrow` | `vote` | `u64` escrow_id | `DisputeVotedEvent` |
 //! | `escrow` | `resolved` | `u64` escrow_id | `EscrowResolvedEvent` |
 //! | `escrow` | `tmo_ext` | `u64` escrow_id | `TimeoutExtendedEvent` / `EscrowTimeoutExtendedEvent` |
+//! | `escrow` | `tlock_ext` | `u64` escrow_id | `TimelockExtendedEvent` |
 //! | `escrow` | `bounty` | `u64` escrow_id | `KeeperBountyPaidEvent` |
 //! | `escrow` | `fee_sched` | — | `ConfigChangeScheduledEvent` |
 //! | `escrow` | `dispsplit` | `u64` escrow_id | `DisputeResolvedEvent` |
@@ -53,6 +54,10 @@ use soroban_sdk::{
 };
 use soroban_sdk::xdr::ToXdr;
 use delego_interfaces::LendingPoolClient;
+
+/// Real, opt-in Blend lending positions (issue #490).
+pub mod blend_yield;
+pub use blend_yield::YieldBearingEscrowConfig;
 
 // Formal verification specifications for escrow lifecycle invariants
 pub mod invariants;
@@ -235,6 +240,26 @@ pub struct InspectionPeriodConfig {
     pub delivery_confirmed_ledger: u32,
     /// Ledger sequence at which funds will auto-release if no dispute is filed.
     pub auto_release_ledger: u32,
+}
+
+/// Mutual consent timelock extension agreement for extending the inspection
+/// period auto-release deadline (issue #485).
+///
+/// When international shipments encounter customs delays, both parties can
+/// agree to extend the auto-release ledger by mutual on-chain consent.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockExtensionAgreement {
+    /// The escrow ID this agreement applies to.
+    pub escrow_id: u64,
+    /// Additional ledgers to add to the auto_release_ledger.
+    pub additional_ledgers: u32,
+    /// Whether the buyer has approved the extension.
+    pub buyer_approved: bool,
+    /// Whether the merchant (seller) has approved the extension.
+    pub merchant_approved: bool,
+    /// Ledger sequence at which the agreement was proposed.
+    pub proposed_at_ledger: u32,
 }
 
 /// Order acceptance and cancel-protection state for a single escrow
@@ -511,6 +536,18 @@ pub struct EscrowCreatedEvent {
     pub order_id: BytesN<32>,
     /// Ledger sequence at which the escrow can be refunded or disputed.
     pub timeout_ledger: u32,
+}
+
+/// Standard payload shape for escrow funding and settlement events.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StandardEscrowEventPayload {
+    pub escrow_id: u64,
+    pub buyer: Address,
+    pub merchant: Address,
+    pub amount_stroops: i128,
+    pub token: Address,
+    pub event_timestamp: u64,
 }
 
 /// Emitted when escrow creation includes an off-chain order metadata hash.
@@ -1260,6 +1297,37 @@ pub struct ReleasePayout {
     pub treasury: Address,
 }
 
+/// Tier-based fee discount for staked merchants (issue #542).
+///
+/// `tier` identifies the merchant's reputation tier (1 = Bronze, 2 = Silver,
+/// 3 = Gold, 4 = Platinum).  `discount_bps` is the percentage reduction
+/// applied to the platform fee in basis points (e.g. 1000 = 10% off the fee).
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TierFeeDiscount {
+    /// 1 = Bronze, 2 = Silver, 3 = Gold, 4 = Platinum.
+    pub tier: u32,
+    /// Discount on the platform fee in basis points (e.g. 1000 = 10%).
+    pub discount_bps: u32,
+}
+
+/// Emitted when a fee rebate is applied to a release because the seller is a
+/// staked merchant with a reputation tier discount (issue #542).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FeeRebateAppliedEvent {
+    /// Escrow that was settled.
+    pub escrow_id: u64,
+    /// Merchant (seller) who received the rebate.
+    pub seller: Address,
+    /// Reputation tier that qualified the rebate.
+    pub tier: u32,
+    /// Basis points rebated off the platform fee.
+    pub discount_bps: u32,
+    /// Token amount rebated back to the seller (extra net payout).
+    pub rebate_amount: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowAmountLimits {
@@ -1415,6 +1483,16 @@ pub struct KeeperBountyPaidEvent {
     pub new_timeout_ledger: u32,
 }
 
+/// Emitted when a keeper extends the storage TTL for an active escrow.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowTtlExtendedEvent {
+    /// Numeric escrow identifier.
+    pub escrow_id: u64,
+    /// Requested extension in ledgers.
+    pub ledgers_to_extend: u32,
+}
+
 /// Emitted when escrow enters inspection period after delivery confirmation.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -1439,6 +1517,17 @@ pub struct EscrowInspectionPassedEvent {
 pub struct EscrowInspectionAutoReleasedEvent {
     pub escrow_id: u64,
     pub released_by: Address,
+}
+
+/// Emitted when the inspection period auto-release deadline is extended by
+/// mutual consent of both parties (issue #485).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TimelockExtendedEvent {
+    pub escrow_id: u64,
+    pub previous_auto_release_ledger: u32,
+    pub new_auto_release_ledger: u32,
+    pub extension_ledgers: u32,
 }
 
 /// Emitted when a scheduled config change becomes effective.
@@ -1648,7 +1737,22 @@ pub struct PathPaymentSettledEvent {
     pub settled_by: Address,
 }
 
-#[contracttype(export = false)]
+/// Administrative capability assigned independently to an account.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ContractRole {
+    /// Full administrative capability, including role management.
+    Admin = 1,
+    /// May resolve disputed escrows.
+    Arbitrator = 2,
+    /// May update fee configuration.
+    FeeManager = 3,
+    /// May pause escrow creation.
+    Pauser = 4,
+}
+
+#[contracttype]
 pub enum DataKey {
     Admin,
     Escrow(u64),
@@ -1659,6 +1763,8 @@ pub enum DataKey {
     LastEscrowId,
     PendingAdmin,
     AdminList,
+    /// Explicit role assignment; false entries preserve independently revoked grants.
+    Role(Address, ContractRole),
     FeeConfig,
     AmountLimits,
     QuorumConfig,
@@ -1741,6 +1847,9 @@ pub enum DataKey {
     MerkleRoot(u64),
     /// Buyer inspection period configuration for an escrow (issue #356).
     InspectionPeriodConfig(u64),
+    /// Mutual consent timelock extension agreement for extending the inspection
+    /// period auto-release deadline (issue #485).
+    TimelockExtensionAgreement(u64),
     /// Emergency rescue proposal for a stranded escrow (issue #365).
     EmergencyRescueProposal(u64),
     /// Admin-approved metadata schema → hash of its definition document.
@@ -2159,54 +2268,20 @@ pub enum EscrowError {
     TimeoutExtensionNonceUsed = 448,
     /// Invalid timeout extension voucher
     InvalidTimeoutExtensionVoucher = 449,
-    /// Emergency rescue proposal not found
-    EmergencyRescueProposalNotFound = 450,
-    /// Emergency rescue timelock not elapsed
-    EmergencyRescueTimelockNotElapsed = 451,
-    /// Emergency rescue threshold not met
-    EmergencyRescueThresholdNotMet = 452,
-    /// Emergency rescue already executed
-    EmergencyRescueAlreadyExecuted = 453,
-    /// Escrow not eligible for rescue
-    EscrowNotEligibleForRescue = 454,
-    /// Guardian not set
-    GuardianNotSet = 455,
-    /// Guardian already set
-    GuardianAlreadySet = 456,
-    /// Admin action not found
-    AdminActionNotFound = 457,
-    /// Admin action locked
-    AdminActionLocked = 458,
-    /// Admin action vetoed
-    AdminActionVetoed = 459,
-    /// Admin action already queued
-    AdminActionAlreadyQueued = 460,
-    /// Admin action overflow
-    AdminActionOverflow = 461,
-    /// Cancel lockout active
-    CancelLockoutActive = 462,
-    /// Invalid cancel lockout
-    InvalidCancelLockout = 463,
-    /// Math overflow
-    MathOverflow = 464,
-    /// Invalid min fee
-    InvalidMinFee = 465,
-    /// Invalid milestone schedule
-    InvalidMilestoneSchedule = 466,
-    /// Milestone not found
-    MilestoneNotFound = 467,
-    /// Milestone already released
-    MilestoneAlreadyReleased = 468,
-    /// Milestone release required
-    MilestoneReleaseRequired = 469,
-    /// Deposit underfunded
-    DepositUnderfunded = 470,
-    /// Exceeds total escrow amount
-    ExceedsTotalEscrowAmount = 471,
-    /// Sub-item already resolved
-    SubItemAlreadyResolved = 472,
-    /// Oracle invocation failed
-    OracleInvocationFailed = 473,
+    /// Timelock extension agreement not found for this escrow.
+    TimelockExtensionNotFound = 450,
+    /// Timelock extension already proposed for this escrow.
+    TimelockExtensionAlreadyProposed = 451,
+    /// Timelock extension additional ledgers must be greater than zero.
+    InvalidTimelockExtension = 452,
+    /// Caller is not a party to the timelock extension agreement.
+    NotTimelockExtensionParty = 453,
+    /// Timelock extension already approved by this party.
+    TimelockExtensionAlreadyApproved = 454,
+    /// Timelock extension not yet approved by both parties.
+    TimelockExtensionPendingApproval = 455,
+    /// Requested storage TTL extension is outside the supported bounds.
+    InvalidTtlExtension = 450,
 }
 
 pub fn execute_atomic_operation<F, T>(env: &Env, f: F) -> Result<T, EscrowError>
@@ -2715,6 +2790,9 @@ const MAX_TREASURIES: u32 = 10;
 /// must not be evicted while funds are still locked.
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
+/// Minimum and maximum permissionless storage extensions (~1 day to ~116 days).
+pub const MIN_ESCROW_TTL_EXTENSION: u32 = 17_280;
+pub const MAX_ESCROW_TTL_EXTENSION: u32 = 2_000_000;
 
 /// Minimum ledgers between bump_ttl_with_bounty calls to prevent bounty draining.
 const BUMP_RATE_LIMIT_LEDGERS: u32 = 100;
@@ -3124,6 +3202,7 @@ impl EscrowContract {
 
         // Atomically store admin and configuration at deploy time
         env.storage().instance().set(&DataKey::Admin, &config.admin);
+        env.storage().instance().set(&DataKey::Role(config.admin.clone(), ContractRole::Admin), &true);
         env.storage().instance().set(&DataKey::LastEscrowId, &0u64);
         env.storage().instance().set(
             &DataKey::FeeConfig,
@@ -3171,6 +3250,7 @@ impl EscrowContract {
             return Err(EscrowError::InvalidAddress);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Role(admin.clone(), ContractRole::Admin), &true);
         env.storage().instance().set(&DataKey::LastEscrowId, &0u64);
         env.storage()
             .instance()
@@ -3731,6 +3811,7 @@ impl EscrowContract {
         let remaining = record.amount - record.released_amount - record.refunded_amount;
         let refunded_amount = match timeout.fallback_action {
             EscrowStatus::Refunded => {
+                blend_yield::redeem(&env, record.escrow_id);
                 let token_client = soroban_sdk::token::Client::new(&env, &record.token);
                 token_client.transfer(&env.current_contract_address(), &record.buyer, &remaining);
                 record.refunded_amount += remaining;
@@ -3811,6 +3892,9 @@ impl EscrowContract {
             }
             unique_arbiters.push_back(arbiter);
         }
+        for arbiter in unique_arbiters.iter() {
+            env.storage().instance().set(&DataKey::Role(arbiter, ContractRole::Arbitrator), &true);
+        }
         let quorum_config = QuorumConfig {
             arbiters: unique_arbiters,
             threshold,
@@ -3843,7 +3927,9 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::QuorumConfig)
             .ok_or(EscrowError::QuorumConfigNotSet)?;
-        if !quorum_config.arbiters.contains(&arbiter) {
+        if !quorum_config.arbiters.contains(&arbiter)
+            || !Self::has_role(env.clone(), arbiter.clone(), ContractRole::Arbitrator)
+        {
             return Err(EscrowError::NotAnArbiter);
         }
 
@@ -3951,6 +4037,7 @@ impl EscrowContract {
                 return Err(EscrowError::QuorumNotReached);
             };
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         if release_to_seller {
             let payout = Self::compute_payout(&env, &record.seller, record.amount)?;
@@ -4190,7 +4277,7 @@ impl EscrowContract {
     /// Update the fee percentage. Admin-only.
     pub fn update_fee(env: Env, admin: Address, new_fee_bps: u32) -> Result<bool, EscrowError> {
         admin.require_auth();
-        if !Self::is_admin(env.clone(), admin.clone()) {
+        if Self::require_role(&env, &admin, ContractRole::FeeManager).is_err() {
             return Err(EscrowError::Unauthorized);
         }
         if new_fee_bps > 1000 {
@@ -4228,7 +4315,7 @@ impl EscrowContract {
         min_fee_stroops: i128,
     ) -> Result<bool, EscrowError> {
         admin.require_auth();
-        if !Self::is_admin(env.clone(), admin) {
+        if Self::require_role(&env, &admin, ContractRole::FeeManager).is_err() {
             return Err(EscrowError::Unauthorized);
         }
         if !(0..=MAX_MIN_FEE_STROOPS).contains(&min_fee_stroops) {
@@ -4366,6 +4453,7 @@ impl EscrowContract {
         {
             let remaining = record.amount - record.released_amount - record.refunded_amount;
             if remaining >= KEEPER_BOUNTY_AMOUNT {
+                blend_yield::redeem(&env, record.escrow_id);
                 let token_client = soroban_sdk::token::Client::new(&env, &record.token);
                 token_client.transfer(
                     &env.current_contract_address(),
@@ -4483,7 +4571,7 @@ impl EscrowContract {
         shares: soroban_sdk::Vec<TreasuryShare>,
     ) -> Result<bool, EscrowError> {
         admin.require_auth();
-        if !Self::is_admin(env.clone(), admin.clone()) {
+        if Self::require_role(&env, &admin, ContractRole::FeeManager).is_err() {
             return Err(EscrowError::Unauthorized);
         }
 
@@ -4540,7 +4628,7 @@ impl EscrowContract {
         tiers: Vec<FeeTier>,
     ) -> Result<bool, EscrowError> {
         admin.require_auth();
-        if !Self::is_admin(env.clone(), admin.clone()) {
+        if Self::require_role(&env, &admin, ContractRole::FeeManager).is_err() {
             return Err(EscrowError::Unauthorized);
         }
         if tiers.len() > MAX_FEE_TIERS {
@@ -5084,6 +5172,7 @@ impl EscrowContract {
 
         Self::assert_value_conservation_invariant(&record, remaining, 0)?;
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         token_client.transfer(&env.current_contract_address(), &record.seller, &remaining);
 
@@ -5358,6 +5447,7 @@ impl EscrowContract {
             return Err(EscrowError::InsufficientEscrowBalance);
         }
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let payout = Self::compute_payout(&env, &record.seller, result.input_amount)?;
         Self::distribute_fee(&env, &token_client, payout.fee)?;
@@ -5852,6 +5942,56 @@ impl EscrowContract {
         Ok(last_id)
     }
 
+    /// Opt into Blend before funding. Both admin approval and buyer consent are required.
+    /// The recipient is fixed to the buyer or the configured platform treasury.
+    pub fn configure_blend_yield(
+        env: Env,
+        escrow_id: u64,
+        admin: Address,
+        config: YieldBearingEscrowConfig,
+    ) -> Result<(), EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin) {
+            return Err(EscrowError::Unauthorized);
+        }
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        record.buyer.require_auth();
+        if record.status != EscrowStatus::Created
+            || env
+                .storage()
+                .persistent()
+                .has(&DataKey::EscrowYieldConfig(escrow_id))
+        {
+            return Err(EscrowError::InvalidYieldConfig);
+        }
+        if config.yield_recipient != record.buyer
+            && config.yield_recipient != Self::get_fee_config(env.clone())?.treasury
+        {
+            return Err(EscrowError::InvalidYieldConfig);
+        }
+        blend_yield::configure(&env, escrow_id, config);
+        Ok(())
+    }
+
+    /// Read the immutable Blend configuration and realized interest.
+    pub fn get_blend_yield_config(env: Env, escrow_id: u64) -> Option<YieldBearingEscrowConfig> {
+        blend_yield::config(&env, escrow_id)
+    }
+
+    /// Full settlement alias; preserves all existing release authorization and fee rules.
+    pub fn release_funds(env: Env, escrow_id: u64, caller: Address) -> Result<bool, EscrowError> {
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        Self::release(env, escrow_id, caller, record.seller)
+    }
+
     /// Fund an existing escrow that is in `Created` status.
     pub fn fund(env: Env, escrow_id: u64, buyer: Address) -> Result<bool, EscrowError> {
         buyer.require_auth();
@@ -5888,6 +6028,8 @@ impl EscrowContract {
             balance_before,
             record.amount,
         )?;
+
+        blend_yield::fund(&env, escrow_id, &record.token, net_received);
 
         record.amount = net_received;
         record.status = EscrowStatus::Funded;
@@ -6721,6 +6863,10 @@ impl EscrowContract {
     /// The platform fee (per `FeeConfig` or the multi-treasury
     /// `FeeDistribution`) is deducted from `release_amount` and transferred to
     /// the treasury(ies); the seller receives the remainder (issue #27).
+    /// When a marketplace contract is configured, the seller's reputation tier
+    /// is queried and the platform fee is discounted accordingly — the treasury
+    /// receives only `base_fee - rebate` and the seller receives the difference
+    /// (issue #542).
     /// `released_amount` tracks the full escrow-amount released, not the net
     /// seller payout.
     ///
@@ -6776,6 +6922,7 @@ impl EscrowContract {
         // the escrowed principal.
         Self::assert_value_conservation_invariant(&record, release_amount, 0)?;
 
+        blend_yield::redeem(env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(env, &record.token);
 
         let payout = Self::compute_payout(env, &record.seller, release_amount)?;
@@ -6783,7 +6930,7 @@ impl EscrowContract {
         token_client.transfer(
             &env.current_contract_address(),
             &record.seller,
-            &payout.seller_net,
+            &seller_net,
         );
 
         // Accumulate the merchant's settled volume and re-evaluate the fee
@@ -7260,6 +7407,7 @@ impl EscrowContract {
         // the escrowed principal.
         Self::assert_value_conservation_invariant(&record, 0, refund_amount)?;
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         token_client.transfer(
             &env.current_contract_address(),
@@ -7751,6 +7899,7 @@ impl EscrowContract {
             return Err(EscrowError::ZeroAmount);
         }
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let payout = Self::compute_payout(&env, &record.seller, remaining)?;
         Self::distribute_fee(&env, &token_client, payout.fee)?;
@@ -8120,7 +8269,7 @@ impl EscrowContract {
     }
 
     /// Permissionless keeper entrypoint: extend the persistent-storage TTL of
-    /// an active (non-terminal) escrow so it cannot be archived out from
+    /// an active (non-terminal) escrow by a bounded number of ledgers so it cannot be archived out from
     /// under its funds while resolution — including a pending dispute — is
     /// still in progress (issue #282). Unlike `bump_ttl_with_bounty`, this
     /// does not adjust `timeout_ledger`, pay a bounty, or rate-limit calls,
@@ -8133,7 +8282,14 @@ impl EscrowContract {
     /// Returns [`EscrowError::NotFound`] if the escrow does not exist, or one
     /// of the "already terminal" errors if it has already reached
     /// `Released`, `Refunded`, or `Cancelled`.
-    pub fn extend_escrow_ttl(env: Env, escrow_id: u64) -> Result<bool, EscrowError> {
+    pub fn extend_escrow_ttl(
+        env: Env,
+        escrow_id: u64,
+        ledgers_to_extend: u32,
+    ) -> Result<u32, EscrowError> {
+        if !(MIN_ESCROW_TTL_EXTENSION..=MAX_ESCROW_TTL_EXTENSION).contains(&ledgers_to_extend) {
+            return Err(EscrowError::InvalidTtlExtension);
+        }
         let key = DataKey::Escrow(escrow_id);
         let record: EscrowRecord = match env.storage().persistent().get(&key) {
             Some(rec) => rec,
@@ -8144,14 +8300,22 @@ impl EscrowContract {
 
         env.storage().persistent().extend_ttl(
             &key,
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
+            PERSISTENT_BUMP_THRESHOLD.min(ledgers_to_extend),
+            ledgers_to_extend,
         );
         env.storage()
             .instance()
-            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD.min(ledgers_to_extend), ledgers_to_extend);
 
-        Ok(true)
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("ttl_ext"), escrow_id),
+            EscrowTtlExtendedEvent {
+                escrow_id,
+                ledgers_to_extend,
+            },
+        );
+
+        Ok(ledgers_to_extend)
     }
 
     /// Resolve a disputed escrow with an initial ruling. Only the admin may call.
@@ -8176,9 +8340,7 @@ impl EscrowContract {
         caller.require_auth();
         Self::enter_release(&env)?;
 
-        if !Self::is_admin(env.clone(), caller.clone()) {
-            return Err(EscrowError::Unauthorized);
-        }
+        Self::require_role(&env, &caller, ContractRole::Arbitrator)?;
 
         let key = DataKey::Escrow(escrow_id);
         let mut record: EscrowRecord = match env.storage().persistent().get(&key) {
@@ -8222,6 +8384,7 @@ impl EscrowContract {
         env.storage().persistent().set(&key, &record);
 
         // Emit event: initial ruling issued, appeal window open
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let payout = if release_to_seller {
             Some(Self::compute_payout(&env, &record.seller, record.amount)?)
@@ -8280,7 +8443,7 @@ impl EscrowContract {
         award: DisputeResolutionAward,
     ) -> Result<bool, EscrowError> {
         caller.require_auth();
-        if !Self::is_admin(env.clone(), caller.clone()) {
+        if Self::require_role(&env, &caller, ContractRole::Arbitrator).is_err() {
             return Err(EscrowError::Unauthorized);
         }
 
@@ -8314,6 +8477,7 @@ impl EscrowContract {
             .checked_add(award.mediator_fee)
             .ok_or(EscrowError::InvalidDisputeAward)?;
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let contract_address = env.current_contract_address();
         if award.buyer_amount > 0 {
@@ -8504,6 +8668,7 @@ impl EscrowContract {
         let appeal_succeeded = final_winner != appeal.initial_winner;
 
         // Handle bond slashing logic
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let contract_address = env.current_contract_address();
 
@@ -8604,6 +8769,7 @@ impl EscrowContract {
             .ok_or(EscrowError::NotFound)?;
 
         // Release to initial winner (ruling stands uncontested)
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let payout = Self::compute_payout(&env, &record.seller, record.amount)?;
 
@@ -8687,6 +8853,183 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Propose a timelock extension for the inspection period auto-release deadline.
+    ///
+    /// Either the buyer or the merchant (seller) can propose an extension by specifying
+    /// the number of additional ledgers. The counterparty must then approve via
+    /// `approve_timelock_extension`. Once both parties approve, the `auto_release_ledger`
+    /// in the `InspectionPeriodConfig` is extended by the specified amount.
+    ///
+    /// This is useful when international shipments encounter customs delays and both
+    /// parties agree to extend the dispute grace period.
+    pub fn propose_timelock_extension(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+        additional_ledgers: u32,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+
+        if additional_ledgers == 0 {
+            return Err(EscrowError::InvalidTimelockExtension);
+        }
+
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        // Only allow proposing extension when escrow is in Inspection status
+        if record.status != EscrowStatus::Inspection {
+            return Err(EscrowError::NotInInspection);
+        }
+
+        // Verify caller is either buyer or seller
+        if caller != record.buyer && caller != record.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        // Check if inspection config exists
+        let inspection_config: InspectionPeriodConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InspectionPeriodConfig(escrow_id))
+            .ok_or(EscrowError::InspectionConfigNotSet)?;
+
+        // Check if there's already an active proposal
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::TimelockExtensionAgreement(escrow_id))
+        {
+            return Err(EscrowError::TimelockExtensionAlreadyProposed);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let agreement = TimelockExtensionAgreement {
+            escrow_id,
+            additional_ledgers,
+            buyer_approved: caller == record.buyer,
+            merchant_approved: caller == record.seller,
+            proposed_at_ledger: current_ledger,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TimelockExtensionAgreement(escrow_id), &agreement);
+
+        Ok(true)
+    }
+
+    /// Approve a proposed timelock extension for the inspection period.
+    ///
+    /// The counterparty (buyer or seller, whoever didn't propose) calls this to
+    /// approve the extension. Once both parties have approved, the
+    /// `auto_release_ledger` in the `InspectionPeriodConfig` is extended by the
+    /// agreed `additional_ledgers`, and a `TimelockExtendedEvent` is emitted.
+    pub fn approve_timelock_extension(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        // Verify caller is either buyer or seller
+        if caller != record.buyer && caller != record.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        // Get the existing agreement
+        let mut agreement: TimelockExtensionAgreement = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TimelockExtensionAgreement(escrow_id))
+            .ok_or(EscrowError::TimelockExtensionNotFound)?;
+
+        // Check if caller already approved
+        let is_buyer = caller == record.buyer;
+        let is_seller = caller == record.seller;
+
+        if is_buyer && agreement.buyer_approved {
+            return Err(EscrowError::TimelockExtensionAlreadyApproved);
+        }
+        if is_seller && agreement.merchant_approved {
+            return Err(EscrowError::TimelockExtensionAlreadyApproved);
+        }
+
+        // Update approval status
+        if is_buyer {
+            agreement.buyer_approved = true;
+        } else if is_seller {
+            agreement.merchant_approved = true;
+        }
+
+        // Check if both parties have approved
+        if agreement.buyer_approved && agreement.merchant_approved {
+            // Both parties approved - extend the auto_release_ledger
+            let mut inspection_config: InspectionPeriodConfig = env
+                .storage()
+                .persistent()
+                .get(&DataKey::InspectionPeriodConfig(escrow_id))
+                .ok_or(EscrowError::InspectionConfigNotSet)?;
+
+            let previous_auto_release_ledger = inspection_config.auto_release_ledger;
+            let new_auto_release_ledger = previous_auto_release_ledger
+                .saturating_add(agreement.additional_ledgers);
+
+            inspection_config.auto_release_ledger = new_auto_release_ledger;
+            inspection_config.inspection_duration_ledgers =
+                inspection_config.inspection_duration_ledgers.saturating_add(agreement.additional_ledgers);
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::InspectionPeriodConfig(escrow_id), &inspection_config);
+
+            // Remove the agreement as it's been executed
+            env.storage()
+                .persistent()
+                .remove(&DataKey::TimelockExtensionAgreement(escrow_id));
+
+            // Emit event
+            env.events().publish(
+                (symbol_short!("escrow"), symbol_short!("tlock_ext"), escrow_id),
+                TimelockExtendedEvent {
+                    escrow_id,
+                    previous_auto_release_ledger,
+                    new_auto_release_ledger,
+                    extension_ledgers: agreement.additional_ledgers,
+                },
+            );
+
+            Ok(true)
+        } else {
+            // Store updated agreement with one approval
+            env.storage()
+                .persistent()
+                .set(&DataKey::TimelockExtensionAgreement(escrow_id), &agreement);
+            Ok(false)
+        }
+    }
+
+    /// Get the current timelock extension agreement for an escrow, if any.
+    pub fn get_timelock_extension_agreement(
+        env: Env,
+        escrow_id: u64,
+    ) -> Option<TimelockExtensionAgreement> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TimelockExtensionAgreement(escrow_id))
+    }
+
     /// Buyer releases funds after passing inspection. Only the buyer may call.
     /// Transitions from Inspection to Released status.
     pub fn release_on_inspection_passed(
@@ -8727,6 +9070,7 @@ impl EscrowContract {
             return Err(EscrowError::ZeroAmount);
         }
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let payout = Self::compute_payout(&env, &record.seller, remaining)?;
         Self::distribute_fee(&env, &token_client, payout.fee)?;
@@ -8943,6 +9287,38 @@ impl EscrowContract {
         let items: soroban_sdk::Vec<SubOrderItem> = env
             .storage()
             .persistent()
+            .get(&DataKey::InspectionPeriodConfig(escrow_id))
+            .ok_or(EscrowError::InspectionConfigNotSet)?;
+
+        let current_ledger = env.ledger().sequence();
+        if current_ledger < inspection_config.auto_release_ledger {
+            return Err(EscrowError::InspectionAutoReleaseNotReady);
+        }
+
+        let remaining = record.amount - record.released_amount - record.refunded_amount;
+        if remaining <= 0 {
+            return Err(EscrowError::ZeroAmount);
+        }
+
+        blend_yield::redeem(&env, record.escrow_id);
+        let token_client = soroban_sdk::token::Client::new(&env, &record.token);
+        let payout = Self::compute_payout(&env, remaining)?;
+        Self::distribute_fee(&env, &token_client, payout.fee)?;
+        token_client.transfer(
+            &env.current_contract_address(),
+            &record.seller,
+            &payout.seller_net,
+        );
+
+        record.released_amount += remaining;
+        record.status = EscrowStatus::Released;
+        if record.status != EscrowStatus::Disputed {
+            return Err(EscrowError::NotDisputed);
+        }
+
+        let items: soroban_sdk::Vec<SubOrderItem> = env
+            .storage()
+            .persistent()
             .get(&DataKey::SubOrderItems(escrow_id))
             .ok_or(EscrowError::MetadataNotSet)?;
         let item = Self::find_sub_order_item(&items, &resolution.item_id)
@@ -8971,6 +9347,7 @@ impl EscrowContract {
             resolution.refund_amount,
         )?;
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let contract_address = env.current_contract_address();
         if resolution.refund_amount > 0 {
@@ -9210,6 +9587,9 @@ impl EscrowContract {
         if !Self::is_admin(env.clone(), admin.clone()) {
             return Err(EscrowError::Unauthorized);
         }
+        if blend_yield::config(&env, escrow_id).is_some() {
+            return Err(EscrowError::InvalidYieldConfig);
+        }
         if apr_bps > 10_000 {
             return Err(EscrowError::InvalidYieldConfig);
         }
@@ -9417,6 +9797,11 @@ impl EscrowContract {
                 .set(&DataKey::AdminList, &admin_list);
         }
 
+        let previous_admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(EscrowError::NotFound)?;
+        if previous_admin != new_admin {
+            env.storage().instance().set(&DataKey::Role(previous_admin, ContractRole::Admin), &false);
+        }
+        env.storage().instance().set(&DataKey::Role(new_admin.clone(), ContractRole::Admin), &true);
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.events().publish(
@@ -9474,6 +9859,7 @@ impl EscrowContract {
         if admin_list.contains(&new_co_admin) {
             return Err(EscrowError::AdminAlreadyExists);
         }
+        env.storage().instance().set(&DataKey::Role(new_co_admin.clone(), ContractRole::Admin), &true);
         admin_list.push_back(new_co_admin);
         env.storage()
             .instance()
@@ -10110,7 +10496,7 @@ impl EscrowContract {
     /// Set or clear the admin pause flag for new escrow creation. Admin-only.
     pub fn set_create_paused(env: Env, admin: Address, paused: bool) -> Result<bool, EscrowError> {
         admin.require_auth();
-        if !Self::is_admin(env.clone(), admin.clone()) {
+        if Self::require_role(&env, &admin, ContractRole::Pauser).is_err() {
             return Err(EscrowError::Unauthorized);
         }
         let pause_state = EscrowPauseState {
@@ -10142,7 +10528,7 @@ impl EscrowContract {
         duration_ledgers: u32,
     ) -> Result<bool, EscrowError> {
         admin.require_auth();
-        if !Self::is_admin(env.clone(), admin.clone()) {
+        if Self::require_role(&env, &admin, ContractRole::Pauser).is_err() {
             return Err(EscrowError::Unauthorized);
         }
         let current_ledger = env.ledger().sequence();
@@ -10629,6 +11015,7 @@ impl EscrowContract {
         }
         Self::assert_value_conservation_invariant(&record, total, 0)?;
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
 
         let mut total_fee: i128 = 0;
@@ -10942,20 +11329,50 @@ impl EscrowContract {
         }
     }
 
-    pub fn is_admin(env: Env, address: Address) -> bool {
-        let primary_admin: Address = match env.storage().instance().get(&DataKey::Admin) {
-            Some(addr) => addr,
-            None => return false,
-        };
-        if address == primary_admin {
-            return true;
+    /// Check whether `address` has a role. Admin grants every operational role.
+    pub fn has_role(env: Env, address: Address, role: ContractRole) -> bool {
+        if role == ContractRole::Admin {
+            let role_key = DataKey::Role(address.clone(), role);
+            if env.storage().instance().has(&role_key) {
+                return env.storage().instance().get(&role_key).unwrap_or(false);
+            }
+            // Existing deployments predate the role map; infer their old admin
+            // set until each account receives an explicit role entry.
+            if env.storage().instance().get::<_, Address>(&DataKey::Admin) == Some(address.clone()) {
+                return true;
+            }
+            let admins: soroban_sdk::Vec<Address> = env.storage().instance().get(&DataKey::AdminList)
+                .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+            return admins.contains(&address);
         }
-        let admin_list: soroban_sdk::Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AdminList)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-        admin_list.contains(&address)
+        Self::has_role(env.clone(), address.clone(), ContractRole::Admin)
+            || env.storage().instance().get(&DataKey::Role(address, role)).unwrap_or(false)
+    }
+
+    fn require_role(env: &Env, address: &Address, role: ContractRole) -> Result<(), EscrowError> {
+        if Self::has_role(env.clone(), address.clone(), role) { Ok(()) } else { Err(EscrowError::Unauthorized) }
+    }
+
+    /// Grant an independent administrative capability. Only an Admin may manage roles.
+    pub fn grant_role(env: Env, admin: Address, account: Address, role: ContractRole) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        Self::require_role(&env, &admin, ContractRole::Admin)?;
+        env.storage().instance().set(&DataKey::Role(account.clone(), role), &true);
+        env.events().publish((symbol_short!("admin"), symbol_short!("role_add")), (admin, account, role, env.ledger().timestamp()));
+        Ok(true)
+    }
+
+    /// Revoke an independent administrative capability without transferring Admin.
+    pub fn revoke_role(env: Env, admin: Address, account: Address, role: ContractRole) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        Self::require_role(&env, &admin, ContractRole::Admin)?;
+        env.storage().instance().set(&DataKey::Role(account.clone(), role), &false);
+        env.events().publish((symbol_short!("admin"), symbol_short!("role_del")), (admin, account, role, env.ledger().timestamp()));
+        Ok(true)
+    }
+
+    pub fn is_admin(env: Env, address: Address) -> bool {
+        Self::has_role(env, address, ContractRole::Admin)
     }
 
     /// Configured upgrade threshold, defaulting to [`MIN_UPGRADE_THRESHOLD`].
@@ -11344,6 +11761,7 @@ impl EscrowContract {
         env.storage().persistent().set(&escrow_key, &record);
 
         // Transfer funds directly to recovery destination
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         token_client.transfer(
             &env.current_contract_address(),
@@ -16347,6 +16765,41 @@ mod min_fee_floor_tests {
         assert_eq!(f.balance(&f.seller), 28);
     }
 }
+#[cfg(test)]
+mod upgrade_proposal_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn propose_upgrade_stores_hash_and_rejects_duplicate_pending_proposal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0,
+            treasury: Address::generate(&env),
+            min_amount: 1,
+            max_amount: 1_000,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
+        let wasm_hash = BytesN::from_array(&env, &[0x42; 32]);
+
+        assert!(client.propose_upgrade(&admin, &wasm_hash));
+
+        let proposal = client.get_upgrade_proposal().unwrap();
+        assert_eq!(proposal.new_wasm_hash, wasm_hash);
+        assert_eq!(proposal.approvals.len(), 1);
+        assert_eq!(proposal.approvals.get(0), Some(admin));
+        assert!(!proposal.executed);
+        assert_eq!(
+            client.try_propose_upgrade(&admin, &BytesN::from_array(&env, &[0x24; 32])),
+            Err(Ok(EscrowError::AlreadyInitialized))
+        );
+    }
+}
+
 #[cfg(test)]
 mod lending_pool_delegation_tests {
     use super::*;

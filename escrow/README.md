@@ -433,3 +433,68 @@ This review policy covers escrow fee and token-contract whitelist configuration.
 Existing upgrade quorum/timelock and operational emergency-pause controls remain
 separate. Veto cancels a pending change; it does not undo an already executed
 change. Reversing an executed setting requires another reviewed proposal.
+# Opt-in Blend yield (issue #490)
+
+Use `create` -> `configure_blend_yield` -> `fund` for a yield-bearing escrow.
+The existing one-call `deposit` and batch creation APIs remain liquid custody
+flows; they do not silently invest buyer funds.
+
+`configure_blend_yield(env, escrow_id, admin, config)` requires both the
+administrator and that escrow's buyer to authorize the invocation. It accepts
+only a `Created` escrow without legacy APR-based yield configuration. The
+recipient must be the buyer or the current primary fee treasury. Configuration
+cannot subsequently be replaced, and legacy `set_yield_config` cannot be mixed
+with Blend yield.
+
+```text
+YieldBearingEscrowConfig {
+    lending_pool_contract: approved Blend V2 pool address,
+    b_token_address: same pool address,
+    accrued_yield_stroops: 0,
+    yield_recipient: buyer or primary fee treasury
+}
+```
+
+Blend's bTokens are non-transferable positions inside the pool, not separately
+deployed SAC tokens. For that reason, `b_token_address` identifies the pool's
+receipt ledger and must equal `lending_pool_contract`. The underlying reserve
+asset is always the escrow's token (for example, USDC).
+
+Funding uses Blend `submit` with a non-collateral Supply request. Each escrow
+records only the increase in its own tracked shares. It authorizes the exact
+nested token transfer without granting a standing allowance. No Borrow or
+SupplyCollateral request is issued.
+
+`release_funds(env, escrow_id, caller)` delegates to existing release validation,
+seller payment and platform fee rules. Existing release/refund/dispute/swap/
+rescue payout paths also redeem the position before using its principal.
+The first payout (including a partial payout or keeper bounty) unwinds the
+entire position; any remaining principal stays liquid for later payouts.
+Realized interest goes to the configured recipient at this first redemption.
+`get_blend_yield_config` reports this realized amount, not an APR estimate.
+The old `get_accrued_yield` API remains the legacy simulated-yield view.
+
+Redemption reads Blend V2's twelve-decimal `b_rate`, rounds the escrow's share
+value down, checks the exact receipt-share decrease, and measures tokens
+actually received. It aborts atomically if the pool fails or returns less than
+the original principal. Other escrows' cash cannot cover that shortfall.
+Funding and settlement emit `bl_supply` and `bl_redeem` escrow events.
+
+**Limits:** lending is not risk-free or insured. Pool insolvency, paused
+withdrawals or unavailable liquidity can delay settlement. Supply rounding may
+also leave a sub-unit shortfall until interest accrues; the contract rejects
+that settlement rather than silently reducing principal. Admin and buyer must
+approve a trusted, compatible pool. This integration does not repair unrelated
+legacy payout-accounting defects.
+
+Focused module tests: `cargo test -p delego-interfaces --test blend_yield`.
+They compile the actual `escrow/src/blend_yield.rs` through a small harness,
+without patching the module or importing the legacy escrow contract. They
+exercise an ABI-compatible mock, **not a deployed Blend pool**.
+Full escrow lifecycle tests and deployable WASM verification remain blocked by
+the existing malformed upstream escrow/marketplace/permissions sources.
+
+References:
+- [Blend integration guide](https://docs.blend.capital/tech-docs/integrations/integrate-pool)
+- [Blend V2 request ABI](https://github.com/blend-capital/blend-contracts-v2/blob/ba22b487b2c5057a4ecc28b05b5193c28e4bd117/pool/src/pool/actions.rs)
+- [Blend V2 reserve conversions](https://github.com/blend-capital/blend-contracts-v2/blob/ba22b487b2c5057a4ecc28b05b5193c28e4bd117/pool/src/pool/reserve.rs)

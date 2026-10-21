@@ -2510,6 +2510,8 @@ fn test_propose_spend_validates_grant_policy() {
         client.try_propose_spend(&t.agent, &outsider, &100),
         Ok(Ok(1))
     );
+}
+
 /// 10 concurrent transactions executing across different channels (issue #367).
 /// Each channel has an independent nonce, so spends on channel A do not block
 /// or interfere with channel B. Nonce replay protection holds independently

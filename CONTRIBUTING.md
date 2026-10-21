@@ -46,7 +46,7 @@ Before you begin contributing, ensure you have the following installed:
    cargo test --workspace
    ```
 
-The workspace contains four crates: `delego-escrow`, `delego-permissions`, `delego-delegation-registry`, and `delego-cross-contract-tests`.
+The workspace contains four crates: `delego-escrow`, `delego-permissions`, `delego-delegation-registry`, and `delego-tests`.
 
 ## Development Workflow
 
@@ -188,7 +188,7 @@ delego-contracts/
 ├── escrow/                 # Escrow contract (delego-escrow)
 ├── permissions/            # Permissions contract (delego-permissions)
 ├── delegation_registry/    # Delegation registry contract (delego-delegation-registry)
-├── tests/                  # Cross-contract integration tests (delego-cross-contract-tests)
+├── tests/                  # Cross-contract integration tests (delego-tests)
 ├── docs/architecture/      # Architecture documentation
 └── Cargo.toml              # Workspace manifest
 ```

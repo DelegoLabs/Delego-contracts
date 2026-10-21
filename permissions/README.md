@@ -41,6 +41,39 @@ pause/resume, and permission transfers.
 | `recheck_merchant_verification` | — | Dynamic check whether a merchant meets the current verification policy |
 | `revalidate_merchant_status` | any | Re-evaluate a merchant against the current policy, applying the grace period |
 
+## Recurring delegation quotas
+
+After creating an unused, active persistent permission, the owner can call
+`configure_recurring_quota(owner, delegate, epoch_duration_ledgers,
+per_epoch_quota_stroops, lifetime_hard_cap_stroops)`. Durations and amounts must
+be positive; the epoch quota cannot exceed the permission's total limit.
+For example, with 120,960 ledgers per epoch, a quota of 100 stroops and a
+lifetime cap of 250, the delegate can spend 100, 100, then only 50 across three
+epochs. Ledger durations are explicit; their wall-clock length varies.
+
+The epoch index is `ledger_sequence / epoch_duration_ledgers`, aligned to
+ledger zero, not to grant creation. Queries calculate the effective renewed
+allowance without writing storage. The first successful spend in a later
+epoch persists the renewal. Unused quota never accumulates, even if multiple
+epochs are skipped. `get_recurring_quota` returns the effective epoch and
+the cumulative lifetime spend. Remaining-allowance and preview/status views
+also apply the lifetime ceiling.
+
+Direct, scoped, relayed and channel spends use the same accounting. A child
+spend consumes its configured ancestors' quotas too. Existing expiry,
+pause/revocation, merchant, per-transaction and velocity checks still apply.
+`("perm", "quota_cfg", owner, delegate)` records configuration; successful
+quota debits emit `("perm", "quota", owner, delegate)` with the updated
+`RecurringQuotaConfig`.
+
+Configuration is immutable per owner/delegate pair. Re-granting, increasing
+the allowance or renewing expiry cannot raise or reset the lifetime budget.
+Quota state is retained when permission records are pruned. Transferring a
+configured permission, transferring into a configured pair, and replacing it
+with an ephemeral session are rejected to avoid splitting or bypassing the
+cap. Multi-owner grants and ephemeral sessions retain their separate existing
+accounting. Permissions without recurring configuration retain legacy behavior.
+
 ## Ephemeral delegated sessions
 
 `grant_ephemeral_session(owner, SessionKeyConfig)` authorizes `session_key` to

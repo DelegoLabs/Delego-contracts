@@ -79,6 +79,9 @@ jobs:
       - name: Run cross-contract integration benchmark
         run: cargo test --workspace --test cross_contract -- --nocapture
 
+      - name: Run reentrancy fuzz suite
+        run: cargo test --workspace --test reentrancy_fuzz -- --nocapture
+
       - name: Check Marketplace Version Consistency
         run: bash scripts/check_version.sh
 
@@ -139,6 +142,12 @@ jobs:
           set -euo pipefail
           cargo test --workspace --test cross_contract -- --nocapture --test-threads=1 \
             | tee benchmark-output.txt
+
+      - name: Run reentrancy fuzz benchmark suite
+        run: |
+          set -euo pipefail
+          cargo test --workspace --test reentrancy_fuzz -- --nocapture --test-threads=1 \
+            | tee -a benchmark-output.txt
 
       - name: Upload benchmark output
         if: always()

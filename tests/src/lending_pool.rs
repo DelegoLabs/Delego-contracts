@@ -2,6 +2,7 @@
 
 use delego_escrow::{EscrowConfig, EscrowContract, EscrowContractClient};
 use delego_interfaces::{LendingPoolClient, MockLendingPool, MockLendingPoolClient};
+use delego_tests::fixtures::create_mock_token_contract;
 use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{token, Address, BytesN, Env};
 
@@ -20,7 +21,7 @@ fn escrow_delegates_yield_to_lending_pool() {
     let treasury = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract(token_admin);
+    let (token, _token_client) = create_mock_token_contract(&env, &token_admin);
     let token_client = token::StellarAssetClient::new(&env, &token);
     token_client.mint(&buyer, &10_000i128);
 
@@ -81,7 +82,7 @@ fn escrow_falls_back_when_pool_paused() {
     let treasury = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract(token_admin);
+    let (token, _token_client) = create_mock_token_contract(&env, &token_admin);
     let token_client = token::StellarAssetClient::new(&env, &token);
     token_client.mint(&buyer, &10_000i128);
 
@@ -136,7 +137,7 @@ fn escrow_falls_back_when_pool_reports_zero() {
     let treasury = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract(token_admin);
+    let (token, _token_client) = create_mock_token_contract(&env, &token_admin);
     let token_client = token::StellarAssetClient::new(&env, &token);
     token_client.mint(&buyer, &10_000i128);
 

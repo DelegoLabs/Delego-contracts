@@ -20,6 +20,10 @@ will reject the change.
 
 ### Unreleased
 
+- `create_delegation` and `create_scoped_delegation` now reject a zero `owner` or `permissions_contract`
+  address with the new `DelegationError::InvalidParam` (4020), mirroring the escrow `is_zero_address`
+  guard (issue #92).
+
 - Add dynamic platform fee tiering based on merchant settled volume (issue #328): admin-configured
   `FeeTier` ladder, per-merchant volume accumulation on every successful release, tier-aware fee
   computation on escrow release, and a `MerchantVolumeTierUpdatedEvent` emitted when a merchant
@@ -61,7 +65,7 @@ will reject the change.
   record. The shared `EscrowIds` and `BuyerEscrowAt` indexes are left intact and
   the paginated listers already skip ids whose record is gone, so an archived
   escrow reads back as `NotFound` rather than panicking an index lookup. Emits
-  `EscrowArchivedEvent` on the `(escrow, archived, escrow_id)` topic *before*
+  `EscrowArchivedEvent` on the `(escrow, archived, escrow_id)` topic _before_
   the removals, and reports the reclaimed entry count. New
   `EscrowError::ArchivalRetentionNotElapsed` for a sweep that arrives
   before the window has passed.

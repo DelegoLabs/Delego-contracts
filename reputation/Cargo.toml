@@ -2,28 +2,14 @@
 name = "delego-reputation"
 version = "0.0.1"
 edition = "2021"
-publish = false
-
-[lib]
-crate-type = ["cdylib", "rlib"]
-
-[profile.release]
-opt-level = "z"
-overflow-checks = true
-lvm-lto = true
-codegen-units = 1
-strip = "symbols"
-
-panic = "abort"
-
-[hook.build-script]
-path = "src/build.rs"
 
 [dependencies]
 soroban-sdk = { workspace = true }
+delego-interfaces = { path = "../interfaces" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+ed25519-dalek = "2"
 
 [features]
 testutils = ["soroban-sdk/testutils"]

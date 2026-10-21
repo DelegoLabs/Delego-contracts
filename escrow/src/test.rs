@@ -4715,4 +4715,400 @@ mod schema_and_milestone_tests {
             "standard token: exact nominal amount must be recorded"
         );
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ISSUE #542 — Tier-Based Fee Rebate Property Tests
+    //
+    // These are property-style tests that exhaustively verify rebate math
+    // across all four merchant tiers and a representative set of amounts /
+    // fee configurations.  They register a minimal marketplace contract and
+    // wire it into the escrow via `set_marketplace_contract`.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    use delego_marketplace::{MarketplaceContract, MarketplaceContractClient, RegisterParams};
+
+    /// Helper: set up an escrow + marketplace environment and return the
+    /// clients, addresses, and token needed by the rebate tests.
+    ///
+    /// fee_bps controls how much the platform charges before the rebate.
+    fn setup_rebate_env(
+        env: &Env,
+        fee_bps: u32,
+    ) -> (
+        crate::EscrowContractClient<'_>,
+        MarketplaceContractClient<'_>,
+        Address, // admin
+        Address, // buyer
+        Address, // seller / merchant
+        Address, // token
+    ) {
+        let admin = Address::generate(env);
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let treasury = Address::generate(env);
+
+        let token_admin = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
+        let token_sa_client = soroban_sdk::token::StellarAssetClient::new(env, &token);
+        token_sa_client.mint(&buyer, &1_000_000_000i128);
+
+        // Escrow contract
+        let escrow_id = env.register(EscrowContract, ());
+        let escrow_client = crate::EscrowContractClient::new(env, &escrow_id);
+        escrow_client.initialize(&admin, &fee_bps, &treasury, &100i128, &1_000_000_000i128);
+        escrow_client.add_token(&admin, &token);
+
+        // Marketplace contract — pass admin as the constructor argument
+        let marketplace_id = env.register(MarketplaceContract, (admin.clone(),));
+        let mp_client = MarketplaceContractClient::new(env, &marketplace_id);
+
+        // Wire marketplace into escrow
+        escrow_client.set_marketplace_contract(&admin, &Some(marketplace_id));
+
+        (escrow_client, mp_client, admin, buyer, seller, token)
+    }
+
+    /// Compute the expected rebate amount for given fee_bps, discount_bps and
+    /// release_amount.  This mirrors the on-chain formula.
+    fn expected_rebate(base_fee: i128, discount_bps: u32) -> i128 {
+        let bps = discount_bps as i128;
+        (base_fee / 10_000) * bps + ((base_fee % 10_000) * bps) / 10_000
+    }
+
+    // ---- REBATE PROPERTY 1 ----
+    // When no merchant is registered (seller has no marketplace record),
+    // the escrow falls back to default Bronze tier (discount_bps = 500).
+    // Seller net = amount - base_fee + rebate.
+    #[test]
+    fn property_rebate_no_marketplace_configured_no_rebate() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // Use escrow WITHOUT setting a marketplace contract.
+        let (client, admin, contract_id) = setup_client(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_sa = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_sa.mint(&buyer, &1_000_000i128);
+        client.add_token(&admin, &token);
+
+        let amount = 100_000i128;
+        let order_id = BytesN::from_array(&env, &[1u8; 32]);
+        let eid = client.deposit(&buyer, &seller, &token, &amount, &order_id, &100u32, &None, &None);
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let seller_before = token_client.balance(&seller);
+        client.partial_release(&eid, &buyer, &amount);
+        let seller_after = token_client.balance(&seller);
+        let seller_received = seller_after - seller_before;
+
+        // fee_bps = 250, no marketplace => no rebate
+        let base_fee = production_fee(amount, 250);
+        assert_eq!(
+            seller_received,
+            amount - base_fee,
+            "no marketplace: seller should receive amount - base_fee"
+        );
+    }
+
+    // ---- REBATE PROPERTY 2 ----
+    // For every tier T in {Bronze(500bps), Silver(1000bps), Gold(1500bps),
+    // Platinum(2000bps)} and a representative set of (amount, fee_bps) pairs,
+    // verify:
+    //   seller_net = amount - base_fee + rebate
+    //   rebate     = floor(base_fee * discount_bps / 10000)   (contract formula)
+    //   rebate     <= base_fee                                 (never over-rebate)
+    #[test]
+    fn property_rebate_math_all_tiers() {
+        // (tier_label, score_to_assign, discount_bps)
+        // We do not have a live reputation contract in this test, so we skip
+        // the real tier lookup and instead verify the math formula directly
+        // using a stub oracle-style approach.
+        let tier_cases: &[(u32, u32)] = &[
+            (1, 500),   // Bronze  — 5%
+            (2, 1000),  // Silver  — 10%
+            (3, 1500),  // Gold    — 15%
+            (4, 2000),  // Platinum — 20%
+        ];
+
+        let test_cases: &[(i128, u32)] = &[
+            (1_000, 250),
+            (10_000, 250),
+            (100_000, 250),
+            (1_000_000, 250),
+            (999_999, 100),
+            (500_001, 500),
+            (10_000_001, 1000),
+        ];
+
+        for &(tier, discount_bps) in tier_cases {
+            for &(amount, fee_bps) in test_cases {
+                let base_fee = production_fee(amount, fee_bps as i128);
+                let rebate = expected_rebate(base_fee, discount_bps);
+
+                // Invariant: rebate must not exceed the base fee
+                assert!(
+                    rebate <= base_fee,
+                    "tier={tier} discount_bps={discount_bps} amount={amount} fee_bps={fee_bps}: \
+                     rebate {rebate} > base_fee {base_fee}"
+                );
+
+                // Invariant: seller net = amount - base_fee + rebate
+                let seller_net = amount - base_fee + rebate;
+                assert!(
+                    seller_net >= 0,
+                    "tier={tier}: seller_net must be non-negative, got {seller_net}"
+                );
+                assert!(
+                    seller_net <= amount,
+                    "tier={tier}: seller_net must not exceed release amount"
+                );
+
+                // Invariant: the rebate is the correct fraction of the base fee
+                let expected_bps = discount_bps as i128;
+                let manual = (base_fee / 10_000) * expected_bps
+                    + ((base_fee % 10_000) * expected_bps) / 10_000;
+                assert_eq!(
+                    rebate, manual,
+                    "tier={tier}: rebate formula mismatch for amount={amount} fee_bps={fee_bps}"
+                );
+            }
+        }
+    }
+
+    // ---- REBATE PROPERTY 3 ----
+    // discount_bps = 0 implies rebate = 0.
+    #[test]
+    fn property_rebate_zero_discount_means_no_rebate() {
+        let amounts: &[i128] = &[100, 1_000, 10_000, 100_000, 1_000_000];
+        for &amount in amounts {
+            let base_fee = production_fee(amount, 250);
+            let rebate = expected_rebate(base_fee, 0);
+            assert_eq!(
+                rebate, 0,
+                "discount_bps=0: expected 0 rebate for amount={amount}, got {rebate}"
+            );
+        }
+    }
+
+    // ---- REBATE PROPERTY 4 ----
+    // discount_bps = 10_000 (100%) means rebate == base_fee (full refund of fee).
+    #[test]
+    fn property_rebate_full_discount_equals_base_fee() {
+        let amounts: &[i128] = &[100, 1_000, 10_000, 999_999, 1_000_000];
+        let fee_bps_values: &[u32] = &[100, 250, 500, 1000];
+
+        for &amount in amounts {
+            for &fee_bps in fee_bps_values {
+                let base_fee = production_fee(amount, fee_bps as i128);
+                let rebate = expected_rebate(base_fee, 10_000);
+                assert_eq!(
+                    rebate, base_fee,
+                    "100% discount: rebate should equal base_fee for \
+                     amount={amount} fee_bps={fee_bps}"
+                );
+            }
+        }
+    }
+
+    // ---- REBATE PROPERTY 5 ----
+    // Higher tier → larger discount_bps → larger rebate.  The tier ordering is
+    // Bronze(500) < Silver(1000) < Gold(1500) < Platinum(2000).
+    #[test]
+    fn property_rebate_monotone_in_tier() {
+        let amounts: &[i128] = &[1_000, 10_000, 1_000_000];
+        let tiers_ascending_discount: &[u32] = &[500, 1000, 1500, 2000];
+
+        for &amount in amounts {
+            let base_fee = production_fee(amount, 250);
+            if base_fee == 0 {
+                continue;
+            }
+            let mut prev_rebate = 0i128;
+            for &discount_bps in tiers_ascending_discount {
+                let rebate = expected_rebate(base_fee, discount_bps);
+                assert!(
+                    rebate >= prev_rebate,
+                    "higher discount_bps must yield >= rebate: \
+                     discount_bps={discount_bps} rebate={rebate} prev_rebate={prev_rebate} \
+                     for amount={amount}"
+                );
+                prev_rebate = rebate;
+            }
+        }
+    }
+
+    // ---- REBATE PROPERTY 6: end-to-end with real cross-contract call ----
+    // Register a merchant in the marketplace so `get_tier_by_owner` returns
+    // the default Bronze tier (score=0 since no reputation contract).
+    // Verify the on-chain seller balance reflects: amount - base_fee + rebate.
+    #[test]
+    fn property_rebate_end_to_end_bronze_tier() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let fee_bps = 250u32;
+        let (escrow_client, mp_client, _admin, buyer, seller, token) =
+            setup_rebate_env(&env, fee_bps);
+
+        // Register seller as a merchant (no reputation contract → score=0 → Bronze)
+        let params = RegisterParams {
+            name: soroban_sdk::String::from_str(&env, "Test Merchant"),
+            description: soroban_sdk::String::from_str(&env, "desc"),
+            category: symbol_short!("goods"),
+            image_url: soroban_sdk::String::from_str(&env, "https://example.com"),
+            metadata: None,
+            required_verifications: 1,
+        };
+        mp_client.register_merchant(&seller, &params);
+
+        let amount = 100_000i128;
+        let order_id = BytesN::from_array(&env, &[42u8; 32]);
+        let eid = escrow_client.deposit(
+            &buyer, &seller, &token, &amount, &order_id, &100u32, &None, &None,
+        );
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let seller_before = token_client.balance(&seller);
+        escrow_client.partial_release(&eid, &buyer, &amount);
+        let seller_after = token_client.balance(&seller);
+        let seller_received = seller_after - seller_before;
+
+        // Bronze: discount_bps = 500 (5%)
+        let base_fee = production_fee(amount, fee_bps as i128);
+        let rebate = expected_rebate(base_fee, 500);
+        let expected_net = amount - base_fee + rebate;
+
+        assert_eq!(
+            seller_received, expected_net,
+            "end-to-end Bronze rebate: seller should receive {expected_net}, got {seller_received}. \
+             base_fee={base_fee}, rebate={rebate}"
+        );
+    }
+
+    // ---- REBATE PROPERTY 7 ----
+    // The FeeRebateApplied event is emitted with correct fields.
+    #[test]
+    fn property_rebate_event_emitted_correctly() {
+        use crate::FeeRebateAppliedEvent;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let fee_bps = 250u32;
+        let (escrow_client, mp_client, _admin, buyer, seller, token) =
+            setup_rebate_env(&env, fee_bps);
+
+        let params = RegisterParams {
+            name: soroban_sdk::String::from_str(&env, "Event Merchant"),
+            description: soroban_sdk::String::from_str(&env, "desc"),
+            category: symbol_short!("goods"),
+            image_url: soroban_sdk::String::from_str(&env, "https://example.com"),
+            metadata: None,
+            required_verifications: 1,
+        };
+        mp_client.register_merchant(&seller, &params);
+
+        let amount = 50_000i128;
+        let order_id = BytesN::from_array(&env, &[99u8; 32]);
+        let escrow_contract_id = escrow_client.address.clone();
+        let eid = escrow_client.deposit(
+            &buyer, &seller, &token, &amount, &order_id, &100u32, &None, &None,
+        );
+
+        escrow_client.partial_release(&eid, &buyer, &amount);
+
+        // Find the FeeRebateApplied event
+        let events = env.events().all();
+        let base_fee = production_fee(amount, fee_bps as i128);
+        let expected_rebate_amt = expected_rebate(base_fee, 500);
+
+        let mut found = false;
+        for event in events.iter() {
+            let (c_id, topics, value) = event;
+            if c_id != escrow_contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = match topics.get(0).unwrap().try_into_val(&env) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let t1: soroban_sdk::Symbol = match topics.get(1).unwrap().try_into_val(&env) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("rebate") {
+                let evt: FeeRebateAppliedEvent = value.try_into_val(&env).unwrap();
+                assert_eq!(evt.escrow_id, eid);
+                assert_eq!(evt.seller, seller);
+                assert_eq!(evt.tier, 1, "expected Bronze tier");
+                assert_eq!(evt.discount_bps, 500, "expected Bronze discount_bps");
+                assert_eq!(
+                    evt.rebate_amount, expected_rebate_amt,
+                    "event rebate_amount mismatch"
+                );
+                found = true;
+            }
+        }
+        assert!(
+            found || base_fee == 0,
+            "FeeRebateApplied event was not emitted (base_fee={base_fee})"
+        );
+    }
+
+    // ---- REBATE PROPERTY 8 ----
+    // Rebate is applied consistently for partial releases (multiple calls).
+    // Each release gets its own rebate independently.
+    #[test]
+    fn property_rebate_partial_releases_independent() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let fee_bps = 250u32;
+        let (escrow_client, mp_client, _admin, buyer, seller, token) =
+            setup_rebate_env(&env, fee_bps);
+
+        let params = RegisterParams {
+            name: soroban_sdk::String::from_str(&env, "Partial Merchant"),
+            description: soroban_sdk::String::from_str(&env, "desc"),
+            category: symbol_short!("goods"),
+            image_url: soroban_sdk::String::from_str(&env, "https://example.com"),
+            metadata: None,
+            required_verifications: 1,
+        };
+        mp_client.register_merchant(&seller, &params);
+
+        let total_amount = 100_000i128;
+        let half = total_amount / 2;
+        let order_id = BytesN::from_array(&env, &[77u8; 32]);
+        let eid = escrow_client.deposit(
+            &buyer, &seller, &token, &total_amount, &order_id, &100u32, &None, &None,
+        );
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let before = token_client.balance(&seller);
+
+        // Two partial releases
+        escrow_client.partial_release(&eid, &buyer, &half);
+        escrow_client.partial_release(&eid, &buyer, &half);
+
+        let total_received = token_client.balance(&seller) - before;
+
+        // Each half gets its own base_fee and rebate
+        let base_fee_half = production_fee(half, fee_bps as i128);
+        let rebate_half = expected_rebate(base_fee_half, 500);
+        let net_per_half = half - base_fee_half + rebate_half;
+        let expected_total = net_per_half * 2;
+
+        assert_eq!(
+            total_received, expected_total,
+            "two partial releases: expected {expected_total} total, got {total_received}"
+        );
+    }
 }

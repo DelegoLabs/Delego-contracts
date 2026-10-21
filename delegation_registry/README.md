@@ -7,6 +7,7 @@ The Delegation Registry is a Soroban smart contract that manages delegation reco
 ## Features
 
 ### Core Delegation Management
+
 - **Create Delegations**: Create delegations with full or scoped permissions
 - **Lifecycle Management**: Pause, resume, and revoke delegations
 - **Admin Controls**: Emergency pause/resume/revoke by admin
@@ -17,24 +18,29 @@ The Delegation Registry is a Soroban smart contract that manages delegation reco
 ### Advanced Features
 
 #### Nonce-Invalidating Key Revocation
+
 Lightweight key revocation mechanism that invalidates compromised keys without affecting delegation configuration.
 
 **Key Functions:**
+
 - `revoke_delegation_key()`: Increment nonce to invalidate all prior authorizations
 - `get_delegation_nonce()`: Get current nonce value
 - `is_authorized_with_nonce()`: Authorization check with nonce verification
 - `is_authorized_for_with_nonce()`: Permission flag check with nonce verification
 
 **Use Cases:**
+
 - Security incident response (compromised keys)
 - Periodic credential rotation
 - Temporary authorization invalidation
 - Key generation management
 
 #### Delegation Sub-Accounts
+
 Virtual isolated accounts for dedicated micro-payment agent operations.
 
 **Key Functions:**
+
 - `create_sub_account()`: Create a new sub-account tied to a delegation
 - `deactivate_sub_account()`: Temporarily disable a sub-account
 - `reactivate_sub_account()`: Re-enable a deactivated sub-account
@@ -43,6 +49,7 @@ Virtual isolated accounts for dedicated micro-payment agent operations.
 - `get_sub_accounts_by_delegation()`: List sub-accounts for a specific delegation
 
 **Use Cases:**
+
 - Isolated payment flows per agent
 - Fine-grained accounting and auditing
 - Blast radius limitation for compromised agents
@@ -53,7 +60,9 @@ Virtual isolated accounts for dedicated micro-payment agent operations.
 ### Data Types
 
 #### `DelegationRecord`
+
 Main delegation record containing:
+
 - Basic info: id, owner, agent_id, permissions_contract
 - Status: Active, Paused, Revoked, Expired
 - Timestamps: created_at, updated_at
@@ -63,14 +72,18 @@ Main delegation record containing:
 - **New**: `nonce` for key revocation tracking
 
 #### `SubAccountRecord`
+
 Sub-account record containing:
+
 - Basic info: id, owner, sub_account_address
 - Association: delegation_id
 - Metadata: label, created_at
 - Status: is_active
 
 #### `PermissionBitmask`
+
 Bitmasked capabilities:
+
 - `PERM_FLAG_SPEND` (1 << 0): Move funds
 - `PERM_FLAG_REFUND` (1 << 1): Claim refunds
 - `PERM_FLAG_DISPUTE` (1 << 2): Open disputes
@@ -81,6 +94,7 @@ Bitmasked capabilities:
 All events include timestamped details for audit trails.
 
 #### Core Events
+
 - `DelegationCreatedEvent`: New delegation created
 - `DelegationPausedEvent`: Delegation paused
 - `DelegationResumedEvent`: Delegation resumed
@@ -89,6 +103,7 @@ All events include timestamped details for audit trails.
 - `PermissionFlagsChangedEvent`: Permission scope changed
 
 #### New Events
+
 - `DelegationKeyRevokedEvent`: Key revoked via nonce increment
 - `SubAccountCreatedEvent`: Sub-account created
 - `SubAccountDeactivatedEvent`: Sub-account deactivated
@@ -97,27 +112,28 @@ All events include timestamped details for audit trails.
 
 Allocated range: 4000-4999
 
-| Code | Error | Description |
-|------|-------|-------------|
-| 4001 | NotFound | Delegation not found |
-| 4002 | NotActive | Delegation not active |
-| 4003 | NotPaused | Delegation not paused |
-| 4004 | Expired | Delegation expired |
-| 4005 | AlreadyInitialized | Registry already initialized |
-| 4006 | InvalidVersion | Invalid version |
-| 4007 | VersionNotLower | Target version not lower |
-| 4008 | SnapshotNotFound | Snapshot not found |
-| 4009 | InvalidAgentId | Invalid agent ID |
-| 4010 | IdExhausted | No more IDs available |
-| 4011 | NoPendingAdmin | No pending admin |
-| 4012 | NotInitialized | Registry not initialized |
-| 4013 | InvalidTtl | Invalid TTL value |
-| 4014 | NotAuthorized | Not authorized |
-| 4015 | InvalidPermissionFlag | Invalid permission flag |
-| 4016 | InvalidBatchSize | Invalid batch size |
-| 4017 | SubAccountNotFound | Sub-account not found |
-| 4018 | SubAccountNotActive | Sub-account not active |
-| 4019 | DelegationMismatch | Delegation mismatch |
+| Code | Error                 | Description                                    |
+| ---- | --------------------- | ---------------------------------------------- |
+| 4001 | NotFound              | Delegation not found                           |
+| 4002 | NotActive             | Delegation not active                          |
+| 4003 | NotPaused             | Delegation not paused                          |
+| 4004 | Expired               | Delegation expired                             |
+| 4005 | AlreadyInitialized    | Registry already initialized                   |
+| 4006 | InvalidVersion        | Invalid version                                |
+| 4007 | VersionNotLower       | Target version not lower                       |
+| 4008 | SnapshotNotFound      | Snapshot not found                             |
+| 4009 | InvalidAgentId        | Invalid agent ID                               |
+| 4010 | IdExhausted           | No more IDs available                          |
+| 4011 | NoPendingAdmin        | No pending admin                               |
+| 4012 | NotInitialized        | Registry not initialized                       |
+| 4013 | InvalidTtl            | Invalid TTL value                              |
+| 4014 | NotAuthorized         | Not authorized                                 |
+| 4015 | InvalidPermissionFlag | Invalid permission flag                        |
+| 4016 | InvalidBatchSize      | Invalid batch size                             |
+| 4017 | SubAccountNotFound    | Sub-account not found                          |
+| 4018 | SubAccountNotActive   | Sub-account not active                         |
+| 4019 | DelegationMismatch    | Delegation mismatch                            |
+| 4020 | InvalidParam          | Zero `owner` or `permissions_contract` address |
 
 ## Usage Examples
 
@@ -253,6 +269,7 @@ assert!(!DelegationRegistry::is_authorized_for_with_nonce(
 ## Storage Policy
 
 All persistent storage follows the contract's TTL policy:
+
 - **Bump Threshold**: 17,280 ledgers (~1 day)
 - **Bump Amount**: 518,400 ledgers (~30 days)
 - Read paths automatically extend TTLs to keep active data alive
@@ -260,11 +277,13 @@ All persistent storage follows the contract's TTL policy:
 ## Testing
 
 Run tests with:
+
 ```bash
 cargo test
 ```
 
 The test suite covers:
+
 - Core delegation lifecycle
 - Permission flag management
 - Version history and rollback
@@ -276,6 +295,7 @@ The test suite covers:
 ## Documentation
 
 Additional documentation:
+
 - [Architecture Overview](../docs/architecture/contracts.md)
 - [Nonce Revocation and Sub-Accounts](../docs/architecture/nonce_revocation_and_sub_accounts.md)
 
