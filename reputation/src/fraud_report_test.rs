@@ -1,16 +1,23 @@
-#![cfg(test)]
-
 use crate::*;
-use soroban_sdk::{testutils::Address as TestAddress, BytesN, Env};
+use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
+
+fn setup(
+    env: &Env,
+    admin: &Address,
+    config: ReputationConfig,
+) -> ReputationContractClient<'static> {
+    let contract_id = env.register(ReputationContract, (admin.clone(), config));
+    ReputationContractClient::new(env, &contract_id)
+}
 
 #[test]
 fn test_file_fraud_report_success() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin = TestAddress::random(&env);
-    let reporter = TestAddress::random(&env);
-    let target = TestAddress::random(&env);
+    let admin = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    let target = Address::generate(&env);
 
     let config = ReputationConfig {
         decay_window_seconds: 2_592_000,
@@ -19,24 +26,18 @@ fn test_file_fraud_report_success() {
         freeze_threshold_flags: 3,
     };
 
-    ReputationContract::__constructor(&env, admin.clone(), config).unwrap();
+    let client = setup(&env, &admin, config);
 
     let bond = 500_000_000i128; // 50 USDC minimum
-    let evidence_hash = BytesN::<32>::from_array(&env, [7u8; 32]);
+    let evidence_hash = BytesN::<32>::from_array(&env, &[7u8; 32]);
 
-    let report_id = ReputationContract::file_fraud_report(
-        &env,
-        reporter.clone(),
-        target.clone(),
-        evidence_hash.clone(),
-        bond,
-    )
-    .expect("Should file fraud report");
+    let report_id = client.file_fraud_report(&reporter, &target, &evidence_hash, &bond);
 
     assert_eq!(report_id, 0); // First report gets id 0
 
     // Retrieve the report
-    let report = ReputationContract::get_fraud_report(&env, report_id)
+    let report = client
+        .get_fraud_report(&report_id)
         .expect("Should retrieve fraud report");
 
     assert_eq!(report.report_id, report_id);
@@ -52,9 +53,9 @@ fn test_file_fraud_report_insufficient_bond() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin = TestAddress::random(&env);
-    let reporter = TestAddress::random(&env);
-    let target = TestAddress::random(&env);
+    let admin = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    let target = Address::generate(&env);
 
     let config = ReputationConfig {
         decay_window_seconds: 2_592_000,
@@ -63,20 +64,15 @@ fn test_file_fraud_report_insufficient_bond() {
         freeze_threshold_flags: 3,
     };
 
-    ReputationContract::__constructor(&env, admin.clone(), config).unwrap();
+    let client = setup(&env, &admin, config);
 
     let insufficient_bond = 100_000_000i128; // Less than 50 USDC
-    let evidence_hash = BytesN::<32>::from_array(&env, [7u8; 32]);
+    let evidence_hash = BytesN::<32>::from_array(&env, &[7u8; 32]);
 
-    let result = ReputationContract::file_fraud_report(
-        &env,
-        reporter,
-        target,
-        evidence_hash,
-        insufficient_bond,
-    );
+    let result =
+        client.try_file_fraud_report(&reporter, &target, &evidence_hash, &insufficient_bond);
 
-    assert!(matches!(result, Err(ReputationError::InvalidFraudBond)));
+    assert_eq!(result, Err(Ok(ReputationError::InvalidFraudBond)));
 }
 
 #[test]
@@ -84,9 +80,9 @@ fn test_resolve_fraud_report_valid() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin = TestAddress::random(&env);
-    let reporter = TestAddress::random(&env);
-    let target = TestAddress::random(&env);
+    let admin = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    let target = Address::generate(&env);
 
     let config = ReputationConfig {
         decay_window_seconds: 2_592_000,
@@ -95,23 +91,15 @@ fn test_resolve_fraud_report_valid() {
         freeze_threshold_flags: 3,
     };
 
-    ReputationContract::__constructor(&env, admin.clone(), config).unwrap();
+    let client = setup(&env, &admin, config);
 
     // File report
     let bond = 500_000_000i128;
-    let evidence_hash = BytesN::<32>::from_array(&env, [7u8; 32]);
-    let report_id = ReputationContract::file_fraud_report(
-        &env,
-        reporter.clone(),
-        target.clone(),
-        evidence_hash,
-        bond,
-    )
-    .expect("Should file report");
+    let evidence_hash = BytesN::<32>::from_array(&env, &[7u8; 32]);
+    let report_id = client.file_fraud_report(&reporter, &target, &evidence_hash, &bond);
 
     // Resolve as valid
-    let resolved = ReputationContract::resolve_fraud_report(&env, admin.clone(), report_id, true)
-        .expect("Should resolve report");
+    let resolved = client.resolve_fraud_report(&admin, &report_id, &true);
 
     assert_eq!(resolved.status, symbol_short!("valid"));
     assert!(resolved.resolved_at.is_some());
@@ -122,9 +110,9 @@ fn test_resolve_fraud_report_invalid() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin = TestAddress::random(&env);
-    let reporter = TestAddress::random(&env);
-    let target = TestAddress::random(&env);
+    let admin = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    let target = Address::generate(&env);
 
     let config = ReputationConfig {
         decay_window_seconds: 2_592_000,
@@ -133,23 +121,15 @@ fn test_resolve_fraud_report_invalid() {
         freeze_threshold_flags: 3,
     };
 
-    ReputationContract::__constructor(&env, admin.clone(), config).unwrap();
+    let client = setup(&env, &admin, config);
 
     // File report
     let bond = 500_000_000i128;
-    let evidence_hash = BytesN::<32>::from_array(&env, [7u8; 32]);
-    let report_id = ReputationContract::file_fraud_report(
-        &env,
-        reporter,
-        target,
-        evidence_hash,
-        bond,
-    )
-    .expect("Should file report");
+    let evidence_hash = BytesN::<32>::from_array(&env, &[7u8; 32]);
+    let report_id = client.file_fraud_report(&reporter, &target, &evidence_hash, &bond);
 
     // Resolve as invalid (frivolous report)
-    let resolved = ReputationContract::resolve_fraud_report(&env, admin.clone(), report_id, false)
-        .expect("Should resolve report");
+    let resolved = client.resolve_fraud_report(&admin, &report_id, &false);
 
     assert_eq!(resolved.status, symbol_short!("invld"));
     assert!(resolved.resolved_at.is_some());
@@ -161,10 +141,10 @@ fn test_get_fraud_reports_by_target() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin = TestAddress::random(&env);
-    let reporter1 = TestAddress::random(&env);
-    let reporter2 = TestAddress::random(&env);
-    let target = TestAddress::random(&env);
+    let admin = Address::generate(&env);
+    let reporter1 = Address::generate(&env);
+    let reporter2 = Address::generate(&env);
+    let target = Address::generate(&env);
 
     let config = ReputationConfig {
         decay_window_seconds: 2_592_000,
@@ -173,32 +153,27 @@ fn test_get_fraud_reports_by_target() {
         freeze_threshold_flags: 3,
     };
 
-    ReputationContract::__constructor(&env, admin.clone(), config).unwrap();
+    let client = setup(&env, &admin, config);
 
     let bond = 500_000_000i128;
 
     // File multiple reports against same target
-    let _id1 = ReputationContract::file_fraud_report(
-        &env,
-        reporter1,
-        target.clone(),
-        BytesN::<32>::from_array(&env, [1u8; 32]),
-        bond,
-    )
-    .expect("Should file first report");
+    let _id1 = client.file_fraud_report(
+        &reporter1,
+        &target,
+        &BytesN::<32>::from_array(&env, &[1u8; 32]),
+        &bond,
+    );
 
-    let _id2 = ReputationContract::file_fraud_report(
-        &env,
-        reporter2,
-        target.clone(),
-        BytesN::<32>::from_array(&env, [2u8; 32]),
-        bond,
-    )
-    .expect("Should file second report");
+    let _id2 = client.file_fraud_report(
+        &reporter2,
+        &target,
+        &BytesN::<32>::from_array(&env, &[2u8; 32]),
+        &bond,
+    );
 
     // Retrieve all reports for target
-    let reports = ReputationContract::get_fraud_reports_by_target(&env, target, 0, 10)
-        .expect("Should get reports");
+    let reports = client.get_fraud_reports_by_target(&target, &0, &10);
 
     assert_eq!(reports.len(), 2);
 }
@@ -208,10 +183,10 @@ fn test_fraud_report_unique_ids() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin = TestAddress::random(&env);
-    let reporter = TestAddress::random(&env);
-    let target1 = TestAddress::random(&env);
-    let target2 = TestAddress::random(&env);
+    let admin = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    let target1 = Address::generate(&env);
+    let target2 = Address::generate(&env);
 
     let config = ReputationConfig {
         decay_window_seconds: 2_592_000,
@@ -220,27 +195,23 @@ fn test_fraud_report_unique_ids() {
         freeze_threshold_flags: 3,
     };
 
-    ReputationContract::__constructor(&env, admin.clone(), config).unwrap();
+    let client = setup(&env, &admin, config);
 
     let bond = 500_000_000i128;
 
-    let id1 = ReputationContract::file_fraud_report(
-        &env,
-        reporter.clone(),
-        target1,
-        BytesN::<32>::from_array(&env, [1u8; 32]),
-        bond,
-    )
-    .expect("Should file first report");
+    let id1 = client.file_fraud_report(
+        &reporter,
+        &target1,
+        &BytesN::<32>::from_array(&env, &[1u8; 32]),
+        &bond,
+    );
 
-    let id2 = ReputationContract::file_fraud_report(
-        &env,
-        reporter,
-        target2,
-        BytesN::<32>::from_array(&env, [2u8; 32]),
-        bond,
-    )
-    .expect("Should file second report");
+    let id2 = client.file_fraud_report(
+        &reporter,
+        &target2,
+        &BytesN::<32>::from_array(&env, &[2u8; 32]),
+        &bond,
+    );
 
     // Each report should have unique ID
     assert_ne!(id1, id2);

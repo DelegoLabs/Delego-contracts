@@ -49,7 +49,10 @@ pub fn aggregate_decayed_score(reviews: &[FeedbackReview], current_timestamp: u6
 /// Computes the decayed merchant score by weighting individual rating values and their ages.
 ///
 /// Takes pairs of (rating, review_timestamp) and aggregates them against `current_timestamp`.
-pub fn calculate_decayed_merchant_score<I>(ratings_with_timestamps: I, current_timestamp: u64) -> u32
+pub fn calculate_decayed_merchant_score<I>(
+    ratings_with_timestamps: I,
+    current_timestamp: u64,
+) -> u32
 where
     I: IntoIterator<Item = (u32, u64)>,
 {
@@ -140,7 +143,10 @@ mod tests {
 
         let decayed_score = aggregate_decayed_score(&reviews, now);
         assert_eq!(decayed_score, 4773);
-        assert!(decayed_score > 3000, "Recent positive feedback must dominate over aged negative feedback");
+        assert!(
+            decayed_score > 3000,
+            "Recent positive feedback must dominate over aged negative feedback"
+        );
 
         // Vice versa: merchant was good 2 years ago, but recent service is bad (1000 bps)
         let deteriorating_reviews = [
@@ -157,7 +163,10 @@ mod tests {
         let decayed_deteriorating = aggregate_decayed_score(&deteriorating_reviews, now);
         // (5000 * 6 + 1000 * 100) / 106 = (30_000 + 100_000) / 106 = 130_000 / 106 = 1226
         assert_eq!(decayed_deteriorating, 1226);
-        assert!(decayed_deteriorating < 3000, "Recent poor feedback must pull score down heavily despite good past");
+        assert!(
+            decayed_deteriorating < 3000,
+            "Recent poor feedback must pull score down heavily despite good past"
+        );
 
         // Verify calculate_decayed_merchant_score yields identical result
         let iterator_score = calculate_decayed_merchant_score(

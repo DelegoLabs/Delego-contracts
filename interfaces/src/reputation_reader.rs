@@ -1,12 +1,12 @@
 //! Cross-contract interface for reading merchant reputation from external DeFi contracts.
-//! 
+//!
 //! Allows third-party lending, insurance, and underwriting contracts to query merchant
 //! reputation scores, dispute ratios, and standing status for credit assessment.
 
 use soroban_sdk::{Address, Env};
 
 /// Reputation reader trait for external DeFi contracts.
-/// 
+///
 /// Implemented by the reputation contract to allow external contracts (lenders, insurers, etc.)
 /// to evaluate merchant creditworthiness using standardized queries.
 pub trait ReputationReaderTrait {
