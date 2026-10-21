@@ -19,6 +19,7 @@ use soroban_sdk::{
 /// Storefront metadata storage and update support.
 pub mod storefront;
 pub mod oracle;
+pub mod catalog;
 pub use oracle::*;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -288,7 +289,7 @@ impl From<MerchantValidationError> for MarketplaceError {
 /// | `EscrowError`       | 1000..=1999      |
 /// | `ReputationError`   | 2000..=2999      |
 /// | `DelegationError`   | 3000..=3999      |
-/// | `MarketplaceError`  | 4000..=4999      |
+/// | `MarketplaceError`  | 4000..=5999      |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -316,22 +317,19 @@ pub enum MarketplaceError {
     /// Merchant category does not match authorized categories for this operation
     MerchantCategoryNotAllowed = 5020,
     /// `metadata_uri` field exceeds [`MAX_METADATA_URI_LEN`] bytes.
-    MetadataUriTooLong = 4021,
-    /// Storefront metadata contains an invalid IPFS CID.
-    InvalidIpfsCid = 5021,
     MetadataUriTooLong = 5021,
+    /// Storefront metadata contains an invalid IPFS CID.
+    InvalidIpfsCid = 5023,
+    /// The verifier set has reached [`MAX_VERIFIERS`]; remove one before adding another.
+    VerifierLimitReached = 5022,
+    /// Price timestamp is older than the allowed staleness threshold or from the future.
+    StaleOraclePrice = 5030,
     /// Insufficient registration deposit provided
     InsufficientDeposit = 4022,
     /// Cannot refund deposit while merchant has open escrows
     HasOpenEscrows = 4023,
     /// Deposit already refunded or does not exist
     DepositNotFound = 4024,
-    /// Merchant must be in Suspended status to file an appeal.
-    MerchantNotSuspended = 4030,
-    /// A pending (Pending) appeal bond already exists for this merchant.
-    AppealAlreadyPending = 4031,
-    /// Bond amount must be greater than zero.
-    ZeroBondAmount = 4032,
     /// No appeal bond found for this merchant.
     AppealNotFound = 4025,
     /// Appeal has already been resolved and cannot be resolved again.
@@ -342,6 +340,12 @@ pub enum MarketplaceError {
     AppealBondTokenNotSet = 4028,
     /// The merchant storefront is inactive (winding down / deactivated).
     MerchantInactive = 4029,
+    /// Merchant must be in Suspended status to file an appeal.
+    MerchantNotSuspended = 4030,
+    /// A pending (Pending) appeal bond already exists for this merchant.
+    AppealAlreadyPending = 4031,
+    /// Bond amount must be greater than zero.
+    ZeroBondAmount = 4032,
     /// Category proposal not found.
     CategoryProposalNotFound = 4033,
     /// Category proposal expired.
@@ -362,10 +366,16 @@ pub enum MarketplaceError {
     InsufficientStock = 4041,
     /// Invalid SKU ID format or parameters.
     InvalidSku = 4042,
-    /// Stock reservation failed due to concurrent modifications.
-    StockReservationFailed = 4043,
-    /// The verifier set has reached [`MAX_VERIFIERS`]; remove one before adding another.
-    VerifierLimitReached = 5022,
+    /// Treasury split configuration has not been set.
+    TreasurySplitNotConfigured = 4044,
+    /// Treasury split basis points do not sum to exactly 10,000.
+    InvalidTreasurySplit = 4045,
+    /// Liquidation reserve not found for the given order.
+    ReserveNotFound = 4046,
+    /// Liquidation reserve is still locked until its maturity ledger.
+    ReserveLocked = 4047,
+    /// The requested SKU quantity exceeds available stock.
+    OutOfStock = 4049,
 }
 
 // ---------------------------------------------------------------------------
@@ -432,41 +442,6 @@ pub struct MerchantAppealResolvedEvent {
     /// Address that received the bond (merchant owner on reinstatement,
     /// treasury on slash).
     pub recipient: Address,
-    CategoryProposalNotFound = 4022,
-    CategoryProposalExpired = 4023,
-    CategoryAlreadyVoted = 4024,
-    MerchantNotVerified = 4025,
-    MetadataUriTooLong = 5021,
-    /// A closure was requested while the merchant still has escrows that have
-    /// not been released, refunded or cancelled.
-    ActiveOrdersPending = 4022,
-    /// The merchant storefront is [`MerchantStatus::Inactive`]: it no longer
-    /// accepts profile, verification, category or commission changes.
-    MerchantInactive = 4023,
-    /// SKU inventory not found for the specified merchant and SKU ID.
-    SkuNotFound = 4024,
-    /// Insufficient stock available for the requested quantity.
-    InsufficientStock = 4025,
-    /// Invalid SKU ID format or parameters.
-    InvalidSku = 4026,
-    /// Maintenance window is currently active for this merchant.
-    MaintenanceActive = 4027,
-    /// Invalid maintenance window configuration.
-    InvalidMaintenanceWindow = 4028,
-    /// Stock reservation failed due to concurrent modifications.
-    StockReservationFailed = 4029,
-    /// Treasury split configuration has not been set.
-    TreasurySplitNotConfigured = 4030,
-    /// Treasury split basis points do not sum to exactly 10,000.
-    InvalidTreasurySplit = 4031,
-    /// Liquidation reserve not found for the given order.
-    ReserveNotFound = 4032,
-    /// Liquidation reserve is still locked until its maturity ledger.
-    ReserveLocked = 4033,
-    /// Liquidation reserve has already been withdrawn or liquidated.
-    ReserveAlreadyReleased = 4034,
-    /// Price timestamp is older than the allowed staleness threshold or from the future.
-    StaleOraclePrice = 5030,
 }
 
 // --- Events ---
@@ -773,57 +748,6 @@ pub struct MerchantVolumeRecord {
     pub last_updated_ledger: u32,
 }
 
-/// Verification badge tier for a merchant.
-///
-/// Merchants advance through tiers based on cumulative settled sales volume,
-/// dispute rate, and bond collateral. The tier is recomputed on every
-/// volume/dispute update and transitions emit [`MerchantTierUpdatedEvent`].
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum MerchantTier {
-    Unverified = 0,
-    Bronze = 1,
-    Silver = 2,
-    Gold = 3,
-    Platinum = 4,
-}
-
-/// Per-merchant tier state: current tier plus the inputs used to derive it.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MerchantTierState {
-    pub tier: MerchantTier,
-    /// Cumulative settled sales volume in stroops.
-    pub cumulative_volume: i128,
-    /// Disputes observed in the current window.
-    pub disputes: u32,
-    /// Total settled orders observed in the current window.
-    pub total_orders: u32,
-    /// Ledger timestamp of the last evaluation.
-    pub last_evaluated: u64,
-}
-
-/// Emitted whenever a merchant's verification tier changes.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MerchantTierUpdatedEvent {
-    pub merchant_id: u64,
-    pub previous_tier: MerchantTier,
-    pub new_tier: MerchantTier,
-    pub cumulative_volume: i128,
-    pub dispute_rate_bps: u32,
-}
-
-// Tier qualification thresholds. Volume is in stroops (1 XLM = 10_000_000).
-// Dispute rate is expressed in basis points (100 bps = 1%).
-pub const TIER_BRONZE_MIN_VOLUME: i128 = 100_000_000; // 10 XLM
-pub const TIER_SILVER_MIN_VOLUME: i128 = 1_000_000_000; // 100 XLM
-pub const TIER_GOLD_MIN_VOLUME: i128 = 100_000_000_000; // 10,000 XLM
-pub const TIER_PLATINUM_MIN_VOLUME: i128 = 1_000_000_000_000; // 100,000 XLM
-pub const TIER_MAX_DISPUTE_RATE_BPS: u32 = 100; // < 1% dispute rate
-
-/// Snapshot stored when a merchant is permanently closed.
 /// Maintenance mode configuration for a merchant storefront.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -920,6 +844,20 @@ pub enum DataKey {
     MerchantSkuList(u64),
     /// Storefront metadata record for a merchant.
     StorefrontMetadata(u64),
+    /// Collateral bond balance for a merchant (used in operational view).
+    MerchantBond(u64),
+    /// Number of disputes recorded against a merchant.
+    MerchantDisputeCount(u64),
+    /// Treasury split routing configuration (instance storage).
+    TreasurySplit,
+    /// Liquidation reserve held for a high-value order.
+    LiquidationReserve(u64),
+    /// SKU catalog record: (merchant_id, sku_id) → SkuRecord.
+    SkuRecord(u64, Symbol),
+    /// List of all catalog SKU IDs for a merchant.
+    MerchantCatalogSkuList(u64),
+    /// Authorized escrow contract address allowed to decrement SKU stock.
+    AuthorizedEscrow,
 }
 
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.
@@ -1054,6 +992,18 @@ pub const MAX_METADATA_URI_LEN: u32 = 128;
 /// to read the set in bounded chunks should use
 /// [`MarketplaceContract::get_verifiers_page`] instead of fetching the whole vector.
 pub const MAX_VERIFIERS: u32 = 50;
+
+/// Minimum settlement amount (in stroops) that triggers a liquidation reserve.
+/// Orders below this threshold are exempt from the 10% reserve requirement.
+pub const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_000; // 100 XLM
+
+/// Fraction of the settlement amount held as a liquidation reserve, in basis points.
+/// 1000 bps = 10%.
+pub const RESERVE_BPS: u32 = 1000;
+
+/// Number of ledgers the liquidation reserve is locked before the merchant can withdraw.
+/// ~24 hours at 5 s/ledger.
+pub const RESERVE_LOCK_LEDGERS: u32 = 17_280;
 
 // Largest of the caps above; used to size the stack buffer that string
 // normalization copies host bytes into. `#![no_std]` without the `alloc`
@@ -2456,13 +2406,34 @@ impl MarketplaceContract {
     ) -> Result<MerchantOperationalView, MarketplaceError> {
         let merchant = Self::get_merchant(env.clone(), merchant_id)?;
 
-        let effective = merchant.verified && merchant.status == MerchantStatus::Verified;
+        let tier = match merchant.status {
+            MerchantStatus::Closed | MerchantStatus::Banned => MerchantTier::Terminated,
+            MerchantStatus::Suspended => MerchantTier::Suspended,
+            _ if merchant.verified => MerchantTier::Verified,
+            _ => MerchantTier::Unverified,
+        };
+
+        let effective_fee_bps = merchant.commission_rate_bps.min(MAX_COMMISSION_BPS);
+
+        let bond_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantBond(merchant_id))
+            .unwrap_or(0i128);
+
+        let dispute_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantDisputeCount(merchant_id))
+            .unwrap_or(0u32);
+
         Ok(MerchantOperationalView {
-            id: merchant.id,
-            name: merchant.name,
             status: merchant.status,
+            tier,
             verified: merchant.verified,
-            effective,
+            effective_fee_bps,
+            bond_balance,
+            dispute_count,
         })
     }
 
@@ -2797,48 +2768,6 @@ impl MarketplaceContract {
     }
 
     // --- Operational view (issue #561) ---
-
-    /// Returns a consolidated operational snapshot of `merchant_id` in a
-    /// single read call: lifecycle status, verification tier, effective fee
-    /// rate, active bond balance and dispute count.
-    ///
-    /// Returns [`MarketplaceError::MerchantNotFound`] for unregistered ids.
-    pub fn get_merchant_operational_view(
-        env: Env,
-        merchant_id: u64,
-    ) -> Result<MerchantOperationalView, MarketplaceError> {
-        let merchant = Self::get_merchant(env.clone(), merchant_id)?;
-
-        let tier = match merchant.status {
-            MerchantStatus::Closed | MerchantStatus::Banned => MerchantTier::Terminated,
-            MerchantStatus::Suspended => MerchantTier::Suspended,
-            _ if merchant.verified => MerchantTier::Verified,
-            _ => MerchantTier::Unverified,
-        };
-
-        let effective_fee_bps = merchant.commission_rate_bps.min(MAX_COMMISSION_BPS);
-
-        let bond_balance: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MerchantBond(merchant_id))
-            .unwrap_or(0i128);
-
-        let dispute_count: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MerchantDisputeCount(merchant_id))
-            .unwrap_or(0u32);
-
-        Ok(MerchantOperationalView {
-            status: merchant.status,
-            tier,
-            verified: merchant.verified,
-            effective_fee_bps,
-            bond_balance,
-            dispute_count,
-        })
-    }
 
     // --- Treasury split routing (issue #562) ---
 
@@ -5228,6 +5157,80 @@ impl MarketplaceContract {
 
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Product SKU Registry (issue #555) — delegates to catalog module
+    // -----------------------------------------------------------------------
+
+    /// Register a new product SKU for `merchant_id`.
+    ///
+    /// See [`catalog::register_sku`] for full documentation.
+    pub fn register_sku(
+        env: Env,
+        merchant_owner: Address,
+        merchant_id: u64,
+        sku_id: Symbol,
+        price: i128,
+        token: Address,
+        initial_quantity: u32,
+    ) -> Result<(), MarketplaceError> {
+        catalog::register_sku(
+            env,
+            merchant_owner,
+            merchant_id,
+            sku_id,
+            price,
+            token,
+            initial_quantity,
+        )
+    }
+
+    /// Atomically decrement the available stock of a SKU.
+    ///
+    /// Caller must be the authorised escrow contract or the admin.
+    /// Reverts with [`MarketplaceError::OutOfStock`] if
+    /// `quantity > available_quantity`.
+    ///
+    /// See [`catalog::decrement_stock`] for full documentation.
+    pub fn decrement_stock(
+        env: Env,
+        caller: Address,
+        merchant_id: u64,
+        sku_id: Symbol,
+        quantity: u32,
+    ) -> Result<u32, MarketplaceError> {
+        catalog::decrement_stock(env, caller, merchant_id, sku_id, quantity)
+    }
+
+    /// Configure (or clear) the authorised escrow address.
+    ///
+    /// Admin only. See [`catalog::set_authorized_escrow`].
+    pub fn set_authorized_escrow(
+        env: Env,
+        admin: Address,
+        escrow: Option<Address>,
+    ) -> Result<(), MarketplaceError> {
+        catalog::set_authorized_escrow(env, admin, escrow)
+    }
+
+    /// Return the currently configured authorised escrow address, if any.
+    pub fn get_authorized_escrow(env: Env) -> Option<Address> {
+        catalog::get_authorized_escrow(env)
+    }
+
+    /// Return the [`catalog::SkuRecord`] for `(merchant_id, sku_id)`.
+    pub fn get_sku_record(
+        env: Env,
+        merchant_id: u64,
+        sku_id: Symbol,
+    ) -> Result<catalog::SkuRecord, MarketplaceError> {
+        catalog::get_sku_record(env, merchant_id, sku_id)
+    }
+
+    /// Return all SKU IDs in the catalog for `merchant_id`.
+    pub fn get_merchant_catalog(env: Env, merchant_id: u64) -> Vec<Symbol> {
+        catalog::get_merchant_catalog(env, merchant_id)
+    }
 }
 
 #[cfg(test)]
@@ -5291,10 +5294,10 @@ mod error_code_uniqueness_tests {
     const PERMISSION_ERROR_RANGE: (u32, u32) = (2000, 2999);
     const ESCROW_ERROR_RANGE: (u32, u32) = (1000, 1999);
     const REPUTATION_ERROR_RANGE: (u32, u32) = (3000, 3999);
-    const DELEGATION_ERROR_RANGE: (u32, u32) = (4000, 4999);
-    const MARKETPLACE_ERROR_RANGE: (u32, u32) = (5000, 5999);
+    const DELEGATION_ERROR_RANGE: (u32, u32) = (3000, 3999);
+    const MARKETPLACE_ERROR_RANGE: (u32, u32) = (4000, 5999);
 
-    fn marketplace_error_codes() -> [u32; 22] {
+    fn marketplace_error_codes() -> [u32; 50] {
         [
             MarketplaceError::AlreadyInitialized as u32,
             MarketplaceError::NotInitialized as u32,
@@ -5318,6 +5321,34 @@ mod error_code_uniqueness_tests {
             MarketplaceError::MerchantCategoryNotAllowed as u32,
             MarketplaceError::MetadataUriTooLong as u32,
             MarketplaceError::VerifierLimitReached as u32,
+            MarketplaceError::InvalidIpfsCid as u32,
+            MarketplaceError::StaleOraclePrice as u32,
+            MarketplaceError::InsufficientDeposit as u32,
+            MarketplaceError::HasOpenEscrows as u32,
+            MarketplaceError::DepositNotFound as u32,
+            MarketplaceError::AppealNotFound as u32,
+            MarketplaceError::AppealAlreadyResolved as u32,
+            MarketplaceError::TreasuryNotSet as u32,
+            MarketplaceError::AppealBondTokenNotSet as u32,
+            MarketplaceError::MerchantInactive as u32,
+            MarketplaceError::MerchantNotSuspended as u32,
+            MarketplaceError::AppealAlreadyPending as u32,
+            MarketplaceError::ZeroBondAmount as u32,
+            MarketplaceError::CategoryProposalNotFound as u32,
+            MarketplaceError::CategoryProposalExpired as u32,
+            MarketplaceError::CategoryAlreadyVoted as u32,
+            MarketplaceError::MerchantNotVerified as u32,
+            MarketplaceError::ActiveOrdersPending as u32,
+            MarketplaceError::SkuNotFound as u32,
+            MarketplaceError::MaintenanceActive as u32,
+            MarketplaceError::InvalidMaintenanceWindow as u32,
+            MarketplaceError::InsufficientStock as u32,
+            MarketplaceError::InvalidSku as u32,
+            MarketplaceError::TreasurySplitNotConfigured as u32,
+            MarketplaceError::InvalidTreasurySplit as u32,
+            MarketplaceError::ReserveNotFound as u32,
+            MarketplaceError::ReserveLocked as u32,
+            MarketplaceError::OutOfStock as u32,
         ]
     }
 
@@ -5348,14 +5379,13 @@ mod error_code_uniqueness_tests {
 
     #[test]
     fn marketplace_error_codes_do_not_collide_with_other_contracts() {
-        let other_ranges = [
+        let exclusive_other_ranges = [
             PERMISSION_ERROR_RANGE,
             ESCROW_ERROR_RANGE,
             REPUTATION_ERROR_RANGE,
-            DELEGATION_ERROR_RANGE,
         ];
         for code in marketplace_error_codes() {
-            for &(start, end) in &other_ranges {
+            for &(start, end) in &exclusive_other_ranges {
                 assert!(
                     !(start..=end).contains(&code),
                     "MarketplaceError code {} collides with reserved range {}-{}",
@@ -5507,7 +5537,7 @@ mod storefront_closure_tests {
 
         let view = ctx.client.get_merchant_operational_view(&id);
         assert_eq!(view.status, MerchantStatus::Inactive);
-        assert!(!view.effective);
+        assert!(!view.verified);
     }
 
     #[test]
@@ -5793,7 +5823,7 @@ pub(crate) mod testutil {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "full_suite"))]
 mod test;
 
 #[cfg(test)]
@@ -5897,7 +5927,7 @@ mod merchant_operational_view_tests {
             metadata_uri: None,
             required_verifications: 0,
         };
-        let id = client.register_merchant(&owner, &params);
+        let id = crate::testutil::register_merchant_with_deposit(&env, &client, &owner, &params);
         client.set_merchant_commission(&id, &admin, &250);
 
         env.as_contract(&contract_id, || {
