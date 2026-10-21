@@ -7,5 +7,9 @@ pub enum ContractLifecycleState {
     /// Normal operations are enabled.
     Active,
     /// Emergency pause with the ledger and reason recorded for auditing.
-    Paused { paused_at_ledger: u32, reason: Symbol },
+    ///
+    /// The payload is a tuple rather than named fields because the
+    /// `#[contracttype]` derive in soroban-sdk 22 rejects enum variants with
+    /// named fields (`enum variant Paused has unsupported named fields`).
+    Paused(u32, Symbol),
 }

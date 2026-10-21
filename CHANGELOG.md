@@ -193,6 +193,10 @@ will reject the change.
 ### Unreleased
 
 - Expose a fixed-point half-life decay helper that reduces stale scores toward zero.
+- Fix the fixed-point half-life decay helper so a decayed score never *increases*:
+  the `exp(-t)` Taylor expansion now uses 10 terms in Q32.32 instead of 5. The
+  5-term series overshot at the half-life boundaries (a score of 4_998 grew to
+  5_000 after one half-life), and the helper is now monotone on every input.
 
 ### 0.0.1 - 2026-08-29
 

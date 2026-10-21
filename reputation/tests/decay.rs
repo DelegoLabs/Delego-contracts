@@ -16,8 +16,11 @@ fn score_halves_at_each_half_life_and_converges_to_zero() {
 }
 
 #[test]
-fn zero_half_life_preserves_the_historical_score() {
-    assert_eq!(calculate_decayed_score(u32::MAX, 100, 0), u32::MAX);
+fn zero_half_life_preserves_the_normalized_score() {
+    // A zero half-life disables decay, but the result is still normalized into
+    // the legal `0..=10_000` score band (see `normalize_score_i128`).
+    assert_eq!(calculate_decayed_score(u32::MAX, 100, 0), 10_000);
+    assert_eq!(calculate_decayed_score(10_000, 100, 0), 10_000);
 }
 
 #[test]
@@ -36,6 +39,19 @@ fn fixed_point_decay_is_monotonic_and_converges() {
         previous = score;
     }
     assert_eq!(previous, 0);
+}
+
+#[test]
+fn fixed_point_decay_never_increases_across_half_life_boundaries() {
+    // Regression: a coarse exponential approximation reports 4_998 one ledger
+    // before a half-life and 5_000 at the half-life itself, i.e. the score
+    // would increase across the boundary.
+    let mut previous = compute_fixed_point_decay(10_000, 0);
+    for elapsed in 1..=(4 * 518_400u32) {
+        let score = compute_fixed_point_decay(10_000, elapsed);
+        assert!(score <= previous, "score increased at ledger {elapsed}");
+        previous = score;
+    }
 }
 
 #[test]

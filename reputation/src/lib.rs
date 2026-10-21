@@ -14,21 +14,19 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN,
-    ConversionError, Env, EnvBase, IntoVal, InvokeError, MapObject, String, Symbol, TryFromVal,
-    TryIntoVal, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    IntoVal, InvokeError, String, Symbol, Vec,
 };
 
 pub mod algorithm;
 #[cfg(test)]
-mod rehabilitation_test;
-#[cfg(test)]
 mod blinded_review_test;
 #[cfg(test)]
 mod fraud_report_test;
+mod oracle_proof;
+mod rehabilitation_test;
 #[cfg(test)]
 mod reputation_reader_test;
-mod oracle_proof;
 pub use oracle_proof::{CarrierProof, CarrierProofVerifiedEvent};
 pub mod scoring;
 pub use scoring::{
@@ -37,9 +35,7 @@ pub use scoring::{
 };
 
 pub mod antisybil;
-pub use antisybil::{
-    calculate_reviewer_weight, get_buyer_completed_orders, EscrowListPageMirror,
-};
+pub use antisybil::{calculate_reviewer_weight, get_buyer_completed_orders, EscrowListPageMirror};
 
 /// Half-life of the reputation decay curve, in ledgers (~30 days at 5s/ledger).
 pub const DECAY_HALF_LIFE_LEDGERS: u32 = 518_400;
@@ -63,7 +59,9 @@ const DECAY_ONE: u64 = 1u64 << 32;
 ///    right shift (each half-life halves the score exactly).
 /// 2. The fractional part is evaluated with a truncated Taylor series of
 ///    `2^(-x) = exp(-x * ln 2)` using fixed-point constants, giving better
-///    than 0.1% accuracy across the full `[0, 1)` exponent range.
+///    than 0.1% accuracy across the full `[0, 1)` exponent range while
+///    keeping the curve monotonic: a longer elapsed time never yields a
+///    higher score, not even across a half-life boundary.
 ///
 /// Returns `0` when `initial_score` is `0` or when the elapsed time is large
 /// enough that the decayed score rounds below one basis point.
@@ -91,14 +89,21 @@ pub fn compute_fixed_point_decay(initial_score: u32, elapsed_ledgers: u32) -> u3
     let t: u64 = ((x as u128 * LN2_Q32 as u128) >> 32) as u64;
 
     // Truncated Taylor series for exp(-t):
-    //   exp(-t) ~= 1 - t + t^2/2 - t^3/6 + t^4/24 - t^5/120
+    //   exp(-t) ~= 1 - t + t^2/2 - t^3/6 + ... - t^10/10!
     // All terms are evaluated in Q32.32 with u128 intermediates to avoid
-    // overflow, then summed. The truncation error over t in [0, ln 2) is
-    // below 1e-6, comfortably inside the 0.1% tolerance.
+    // overflow, then summed. Ten terms keep the truncation error over
+    // t in [0, ln 2) below 1e-9 relative, comfortably inside the 0.1%
+    // tolerance and - more importantly - accurate enough to keep the curve
+    // monotonic (see `exp_neg_q32`).
     let t2: u128 = (t as u128 * t as u128) >> 32;
     let t3: u128 = (t2 * t as u128) >> 32;
     let t4: u128 = (t3 * t as u128) >> 32;
     let t5: u128 = (t4 * t as u128) >> 32;
+    let t6: u128 = (t5 * t as u128) >> 32;
+    let t7: u128 = (t6 * t as u128) >> 32;
+    let t8: u128 = (t7 * t as u128) >> 32;
+    let t9: u128 = (t8 * t as u128) >> 32;
+    let t10: u128 = (t9 * t as u128) >> 32;
 
     let one: i128 = DECAY_ONE as i128;
     let term1: i128 = t as i128;
@@ -106,8 +111,14 @@ pub fn compute_fixed_point_decay(initial_score: u32, elapsed_ledgers: u32) -> u3
     let term3: i128 = (t3 / 6) as i128;
     let term4: i128 = (t4 / 24) as i128;
     let term5: i128 = (t5 / 120) as i128;
+    let term6: i128 = (t6 / 720) as i128;
+    let term7: i128 = (t7 / 5040) as i128;
+    let term8: i128 = (t8 / 40320) as i128;
+    let term9: i128 = (t9 / 362880) as i128;
+    let term10: i128 = (t10 / 3628800) as i128;
 
-    let factor: i128 = one - term1 + term2 - term3 + term4 - term5;
+    let factor: i128 =
+        one - term1 + term2 - term3 + term4 - term5 + term6 - term7 + term8 - term9 + term10;
     let factor: u64 = if factor < 0 { 0 } else { factor as u64 };
 
     // Apply the fractional factor, then the whole half-life shifts.
@@ -545,39 +556,36 @@ pub enum ReputationError {
     /// `order_hash`, or `rater`/`entity` are not its buyer/seller pair
     /// (issue #286).
     UnverifiedOrder = 3012,
-    /// Reporter did not flag the entity.
-    NotFlagReporter = 3011,
     /// Review commitment already exists for this escrow_id.
-    DuplicateReviewCommitment = 3012,
+    DuplicateReviewCommitment = 3013,
     /// Caller is not the buyer for this escrow.
-    NotBuyer = 3013,
+    NotBuyer = 3014,
     /// Escrow is not in settled state.
-    EscrowNotSettled = 3014,
+    EscrowNotSettled = 3015,
     /// Quorum threshold not reached for dispute verdict.
-    QuorumNotReached = 3015,
+    QuorumNotReached = 3016,
     /// Invalid dispute verdict symbol.
-    InvalidVerdictSymbol = 3016,
+    InvalidVerdictSymbol = 3017,
     /// Merchant is not eligible for rehabilitation (not previously penalised/frozen).
-    NotEligibleForRehabilitation = 3012,
+    NotEligibleForRehabilitation = 3018,
     /// Rehabilitation program not found for merchant.
-    RehabilitationNotFound = 3013,
+    RehabilitationNotFound = 3019,
     /// Probation orders requirement not yet met for graduation.
-    ProbationNotComplete = 3014,
+    ProbationNotComplete = 3020,
     /// Invalid collateral amount (must be positive).
-    InvalidCollateralAmount = 3015,
+    InvalidCollateralAmount = 3021,
     /// Blinded review verification failed.
-    BlindedReviewVerificationFailed = 3016,
+    BlindedReviewVerificationFailed = 3022,
     /// Blinded receipt already used (double-submission prevented).
-    BlindedReceiptAlreadyUsed = 3017,
+    BlindedReceiptAlreadyUsed = 3023,
     /// Fraud report not found.
-    FraudReportNotFound = 3018,
+    FraudReportNotFound = 3024,
     /// Invalid fraud bond amount.
-    InvalidFraudBond = 3019,
+    InvalidFraudBond = 3025,
     /// Fraud report resolution invalid state.
-    InvalidReportStatus = 3020,
-    UnverifiedOrder = 3012,
+    InvalidReportStatus = 3026,
     /// A carrier proof was submitted by an oracle that is not registered.
-    CarrierOracleNotAuthorized = 3013,
+    CarrierOracleNotAuthorized = 3027,
 }
 
 #[cfg(test)]
@@ -600,6 +608,20 @@ mod error_code_allocation {
             ReputationError::NoActiveFlag as u32,
             ReputationError::NotFlagReporter as u32,
             ReputationError::UnverifiedOrder as u32,
+            ReputationError::DuplicateReviewCommitment as u32,
+            ReputationError::NotBuyer as u32,
+            ReputationError::EscrowNotSettled as u32,
+            ReputationError::QuorumNotReached as u32,
+            ReputationError::InvalidVerdictSymbol as u32,
+            ReputationError::NotEligibleForRehabilitation as u32,
+            ReputationError::RehabilitationNotFound as u32,
+            ReputationError::ProbationNotComplete as u32,
+            ReputationError::InvalidCollateralAmount as u32,
+            ReputationError::BlindedReviewVerificationFailed as u32,
+            ReputationError::BlindedReceiptAlreadyUsed as u32,
+            ReputationError::FraudReportNotFound as u32,
+            ReputationError::InvalidFraudBond as u32,
+            ReputationError::InvalidReportStatus as u32,
             ReputationError::CarrierOracleNotAuthorized as u32,
         ];
         for code in codes {
@@ -767,11 +789,6 @@ pub struct ReputationCursor {
 /// `(score_bps, merchant_id)` pair of the last record on the page, with
 /// `has_more` telling the caller whether to resume from it.
 #[contracttype]
-/// This type intentionally does not derive `contracttype`: it contains
-/// `Option<ReputationCursor>`, and the SDK's `testutils` expansion cannot
-/// convert `Option<UDT>` to `ScVal` (it requires `Into<ScVal>` for the inner
-/// type while contract types only get a `TryFrom` impl). The hand-written
-/// `Val` conversions below are the equivalent of the derive output.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RankedMerchantPage {
     pub merchants: Vec<MerchantView>,
@@ -794,43 +811,7 @@ impl RankedMerchantPage {
         Some(ReputationCursor {
             last_score_bps: self.next_last_score_bps,
             last_merchant_id: self.next_last_merchant_id,
-impl TryFromVal<Env, Val> for RankedMerchantPage {
-    type Error = ConversionError;
-
-    fn try_from_val(env: &Env, val: &Val) -> Result<Self, Self::Error> {
-        const KEYS: [&'static str; 3] = ["merchants", "next_cursor", "total_count"];
-        let mut vals: [Val; 3] = [Val::VOID.to_val(); 3];
-        let map: MapObject = val.try_into().map_err(|_| ConversionError)?;
-        env.map_unpack_to_slice(map, &KEYS, &mut vals)
-            .map_err(|_| ConversionError)?;
-        Ok(Self {
-            merchants: vals[0].try_into_val(env).map_err(|_| ConversionError)?,
-            next_cursor: vals[1].try_into_val(env).map_err(|_| ConversionError)?,
-            total_count: vals[2].try_into_val(env).map_err(|_| ConversionError)?,
         })
-    }
-}
-
-impl TryFromVal<Env, RankedMerchantPage> for Val {
-    type Error = ConversionError;
-
-    fn try_from_val(env: &Env, val: &RankedMerchantPage) -> Result<Self, Self::Error> {
-        const KEYS: [&'static str; 3] = ["merchants", "next_cursor", "total_count"];
-        let vals: [Val; 3] = [
-            (&val.merchants)
-                .try_into_val(env)
-                .map_err(|_| ConversionError)?,
-            (&val.next_cursor)
-                .try_into_val(env)
-                .map_err(|_| ConversionError)?,
-            (&val.total_count)
-                .try_into_val(env)
-                .map_err(|_| ConversionError)?,
-        ];
-        Ok(env
-            .map_new_from_slices(&KEYS, &vals)
-            .map_err(|_| ConversionError)?
-            .into())
     }
 }
 
@@ -900,7 +881,7 @@ pub enum DataKey {
     DisputePenalty(Address), // Maps merchant -> DisputePenaltyRecord
     /// Counts dispute-free orders for penalty recovery.
     DisputeFreeOrderCount(Address), // Maps merchant -> u32
-    
+
     /// Rehabilitation program by merchant address
     RehabilitationProgram(Address),
     /// Counter for fraud reports (report_id generator)
@@ -1181,10 +1162,7 @@ impl ReputationContract {
 
     /// Verify a courier-signed delivery/loss proof against the authorized
     /// carrier oracle registry.
-    pub fn verify_carrier_proof(
-        env: Env,
-        proof: CarrierProof,
-    ) -> Result<(), ReputationError> {
+    pub fn verify_carrier_proof(env: Env, proof: CarrierProof) -> Result<(), ReputationError> {
         oracle_proof::verify_carrier_proof(&env, &proof)
     }
 
@@ -1624,6 +1602,9 @@ impl ReputationContract {
             expired,
             score_matches,
             current,
+        }
+    }
+
     /// Classifies `entity` as either a merchant or buyer agent. Admin-only;
     /// the role determines which domain metrics are relevant for risk
     /// assessment (fulfillment for merchants, payment timeliness and dispute
@@ -2356,10 +2337,7 @@ impl ReputationContract {
 
         env.events().publish(
             (symbol_short!("reput"), symbol_short!("cfg_upd")),
-            ConfigUpdatedEvent {
-                old,
-                new: config,
-            },
+            ConfigUpdatedEvent { old, new: config },
         );
 
         Ok(())
@@ -2554,6 +2532,8 @@ impl ReputationContract {
             certified_at_ledger,
             expires_at_ledger: certified_at_ledger.saturating_add(ATTESTATION_VALIDITY_LEDGERS),
         }
+    }
+
     /// Accumulated fraud penalty for `entity`, in basis points, as applied by
     /// every score recomputation.
     fn accumulated_fraud_penalty_bps(env: &Env, entity: &Address) -> i128 {
@@ -2820,14 +2800,12 @@ impl ReputationContract {
         } else {
             0
         };
-        let penalty = accumulator.disputed_recent * (config.dispute_penalty_bps as i128);
         // Route the raw (possibly negative) result through the single bounded
         // normalization helper; `i128` arithmetic cannot overflow here and the
         // helper clamps the final value into `0..=10_000`.
-        rep.score = normalize_score_i128(base_score.saturating_sub(penalty));
         let penalty = accumulator.disputed_recent * (config.dispute_penalty_bps as i128)
             + Self::accumulated_fraud_penalty_bps(env, entity);
-        rep.score = (base_score - penalty).clamp(0, BPS_SCALE) as u32;
+        rep.score = normalize_score_i128(base_score.saturating_sub(penalty));
         rep.avg_rating = if accumulator.rating_weight_sum > 0 {
             normalize_score_i128(accumulator.rating_weighted_sum / accumulator.rating_weight_sum)
         } else {
@@ -3191,12 +3169,10 @@ impl ReputationContract {
         let raw_rep = Self::get_reputation(env.clone(), merchant.clone())?;
 
         // Apply sigmoid normalization (steepness k=1, midpoint at 5000 bps)
-        let sigmoid_score =
-            algorithm::compute_sigmoid_normalized_score(raw_rep.score, 1, 5_000);
+        let sigmoid_score = algorithm::compute_sigmoid_normalized_score(raw_rep.score, 1, 5_000);
 
         // Compute confidence score based on review count
-        let confidence =
-            algorithm::compute_confidence_score(raw_rep.total_transactions, 10);
+        let confidence = algorithm::compute_confidence_score(raw_rep.total_transactions, 10);
 
         let normalized_score = NormalizedReputationScore {
             merchant: merchant.clone(),
@@ -3251,11 +3227,10 @@ impl ReputationContract {
         penalty_record.last_dispute_ledger = env.ledger().sequence();
 
         // Compute exponential multiplier: 2^min(losses, 4)
-        penalty_record.active_penalty_multiplier =
-            algorithm::compute_dispute_penalty_multiplier(
-                penalty_record.consecutive_lost_disputes,
-                MAX_DISPUTE_PENALTY_MULTIPLIER,
-            );
+        penalty_record.active_penalty_multiplier = algorithm::compute_dispute_penalty_multiplier(
+            penalty_record.consecutive_lost_disputes,
+            MAX_DISPUTE_PENALTY_MULTIPLIER,
+        );
 
         env.storage()
             .persistent()
@@ -3277,11 +3252,7 @@ impl ReputationContract {
         escrow_id: u64,
     ) -> Result<(), ReputationError> {
         let free_count_key = DataKey::DisputeFreeOrderCount(merchant.clone());
-        let mut count: u32 = env
-            .storage()
-            .persistent()
-            .get(&free_count_key)
-            .unwrap_or(0);
+        let mut count: u32 = env.storage().persistent().get(&free_count_key).unwrap_or(0);
 
         count = count.saturating_add(1);
 
@@ -3316,9 +3287,7 @@ impl ReputationContract {
             count = 0;
         }
 
-        env.storage()
-            .persistent()
-            .set(&free_count_key, &count);
+        env.storage().persistent().set(&free_count_key, &count);
         env.storage().persistent().extend_ttl(
             &free_count_key,
             PERSISTENT_BUMP_THRESHOLD,
@@ -3372,7 +3341,8 @@ mod config_parity_test {
     }
 }
 
-
+#[contractimpl]
+impl ReputationContract {
     // --- Rehabilitation Program ---
 
     /// Enter a rehabilitation program by posting collateral. A frozen or penalised merchant
@@ -3384,21 +3354,27 @@ mod config_parity_test {
         collateral_amount: i128,
     ) -> Result<RehabilitationProgram, ReputationError> {
         merchant.require_auth();
-        
+
         if collateral_amount <= 0 {
             return Err(ReputationError::InvalidCollateralAmount);
         }
 
-        // Merchant must have been penalised (frozen or low score) to be eligible
+        // Merchant must have been penalised (frozen or low score) to be eligible.
+        // A merchant without any reputation record has never been penalised, so
+        // it cannot use rehabilitation to bootstrap a score from scratch.
         let rep = Self::load_or_default_reputation(&env, &merchant);
-        if !Self::is_frozen(env.clone(), merchant.clone()) && rep.score > 5_000 {
+        let has_history = env
+            .storage()
+            .persistent()
+            .has(&DataKey::Reputation(merchant.clone()));
+        if !Self::is_frozen(env.clone(), merchant.clone()) && (!has_history || rep.score > 5_000) {
             // Entity is not frozen and has good standing, cannot enter rehab
             return Err(ReputationError::NotEligibleForRehabilitation);
         }
 
         let baseline_score = rep.score;
         let probation_orders_required = 10_u32; // Hardcoded for MVP; could be configurable
-        
+
         let program = RehabilitationProgram {
             merchant: merchant.clone(),
             collateral_staked_stroops: collateral_amount,
@@ -3412,20 +3388,14 @@ mod config_parity_test {
         env.storage()
             .persistent()
             .set(&DataKey::RehabilitationProgram(merchant.clone()), &program);
-        env.storage()
-            .persistent()
-            .extend_ttl(
-                &DataKey::RehabilitationProgram(merchant.clone()),
-                PERSISTENT_BUMP_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
+        env.storage().persistent().extend_ttl(
+            &DataKey::RehabilitationProgram(merchant.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         env.events().publish(
-            (
-                symbol_short!("reput"),
-                symbol_short!("rehab_start"),
-                merchant,
-            ),
+            (symbol_short!("reput"), symbol_short!("rehab_str"), merchant),
             program.clone(),
         );
 
@@ -3453,8 +3423,7 @@ mod config_parity_test {
             return Err(ReputationError::InvalidReportStatus);
         }
 
-        program.probation_orders_completed =
-            program.probation_orders_completed.saturating_add(1);
+        program.probation_orders_completed = program.probation_orders_completed.saturating_add(1);
 
         // Incrementally restore reputation: each completed order restores a fraction
         // of the gap between baseline at entry and max score (10_000)
@@ -3470,39 +3439,30 @@ mod config_parity_test {
         env.storage()
             .persistent()
             .set(&DataKey::Reputation(merchant.clone()), &rep);
-        env.storage()
-            .persistent()
-            .extend_ttl(
-                &DataKey::Reputation(merchant.clone()),
-                PERSISTENT_BUMP_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
+        env.storage().persistent().extend_ttl(
+            &DataKey::Reputation(merchant.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         // Check if probation is complete
         if program.probation_orders_completed >= program.probation_orders_required {
             program.status = symbol_short!("gradu");
         }
 
-        env.storage()
-            .persistent()
-            .set(&program_key, &program);
-        env.storage()
-            .persistent()
-            .extend_ttl(
-                &program_key,
-                PERSISTENT_BUMP_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
+        env.storage().persistent().set(&program_key, &program);
+        env.storage().persistent().extend_ttl(
+            &program_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         Ok(program)
     }
 
     /// Graduate from rehabilitation. Called by merchant after completing all probation orders.
     /// Returns staked collateral and unlocks the merchant if previously frozen.
-    pub fn graduate_rehabilitation(
-        env: Env,
-        merchant: Address,
-    ) -> Result<i128, ReputationError> {
+    pub fn graduate_rehabilitation(env: Env, merchant: Address) -> Result<i128, ReputationError> {
         merchant.require_auth();
 
         let program_key = DataKey::RehabilitationProgram(merchant.clone());
@@ -3517,9 +3477,7 @@ mod config_parity_test {
         }
 
         program.status = symbol_short!("compl");
-        env.storage()
-            .persistent()
-            .set(&program_key, &program);
+        env.storage().persistent().set(&program_key, &program);
 
         // Unfreeze the merchant if frozen
         if Self::is_frozen(env.clone(), merchant.clone()) {
@@ -3531,11 +3489,7 @@ mod config_parity_test {
         let collateral_returned = program.collateral_staked_stroops;
 
         env.events().publish(
-            (
-                symbol_short!("reput"),
-                symbol_short!("rehab_grad"),
-                merchant,
-            ),
+            (symbol_short!("reput"), symbol_short!("rehab_grd"), merchant),
             program,
         );
 
@@ -3570,20 +3524,17 @@ mod config_parity_test {
         for i in 0..8 {
             commitment_bytes[i] = escrow_bytes[i];
         }
-        let escrow_id_commitment = BytesN::<32>::from_array(&env, commitment_bytes);
+        let escrow_id_commitment = BytesN::<32>::from_array(&env, &commitment_bytes);
 
         let receipt = BlindedReviewReceipt {
             escrow_id_commitment: escrow_id_commitment.clone(),
             blinded_public_key,
-            blind_signature: BytesN::<64>::from_array(&env, [0u8; 64]), // Placeholder
+            blind_signature: BytesN::<64>::from_array(&env, &[0u8; 64]), // Placeholder
             issued_at: env.ledger().timestamp(),
         };
 
         env.events().publish(
-            (
-                symbol_short!("reput"),
-                symbol_short!("blind_token"),
-            ),
+            (symbol_short!("reput"), symbol_short!("blind_tok")),
             receipt.clone(),
         );
 
@@ -3615,16 +3566,12 @@ mod config_parity_test {
         }
 
         // Mark nullifier as used
-        env.storage()
-            .persistent()
-            .set(&nullifier_key, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(
-                &nullifier_key,
-                PERSISTENT_BUMP_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
+        env.storage().persistent().set(&nullifier_key, &true);
+        env.storage().persistent().extend_ttl(
+            &nullifier_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         // In production: verify blind Ed25519 signature on (escrow_id_commitment, rating)
         // For MVP: accept receipt as-is. Production would call external crypto verification.
@@ -3637,47 +3584,47 @@ mod config_parity_test {
 
         // Apply the review to the entity's average rating
         let mut rep = Self::load_or_default_reputation(&env, &entity);
-        
+
         // Update avg_rating with the new blinded review
         if rep.avg_rating == 0 {
             rep.avg_rating = rating;
         } else {
             // Weighted average: (old_avg * tx_count + new_rating) / (tx_count + 1)
-            let weighted_sum = (rep.avg_rating as i128) * (rep.total_transactions as i128) + (rating as i128);
-            rep.avg_rating = (weighted_sum / ((rep.total_transactions + 1) as i128)).clamp(0, BPS_SCALE) as u32;
+            let weighted_sum =
+                (rep.avg_rating as i128) * (rep.total_transactions as i128) + (rating as i128);
+            rep.avg_rating =
+                (weighted_sum / ((rep.total_transactions + 1) as i128)).clamp(0, BPS_SCALE) as u32;
         }
 
         rep.last_updated = env.ledger().timestamp();
         env.storage()
             .persistent()
             .set(&DataKey::Reputation(entity.clone()), &rep);
-        env.storage()
-            .persistent()
-            .extend_ttl(
-                &DataKey::Reputation(entity.clone()),
-                PERSISTENT_BUMP_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
+        env.storage().persistent().extend_ttl(
+            &DataKey::Reputation(entity.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         env.events().publish(
             (
                 symbol_short!("reput"),
-                symbol_short!("blind_review"),
-                entity,
+                symbol_short!("blind_rev"),
+                entity.clone(),
             ),
             EntityRatedEvent {
                 rater: env.current_contract_address(), // Anonymous reviewer
                 entity,
                 rating,
                 escrow_id: u64::from_le_bytes([
-                    receipt.escrow_id_commitment.get(0) as u8,
-                    receipt.escrow_id_commitment.get(1) as u8,
-                    receipt.escrow_id_commitment.get(2) as u8,
-                    receipt.escrow_id_commitment.get(3) as u8,
-                    receipt.escrow_id_commitment.get(4) as u8,
-                    receipt.escrow_id_commitment.get(5) as u8,
-                    receipt.escrow_id_commitment.get(6) as u8,
-                    receipt.escrow_id_commitment.get(7) as u8,
+                    receipt.escrow_id_commitment.get(0).unwrap_or(0),
+                    receipt.escrow_id_commitment.get(1).unwrap_or(0),
+                    receipt.escrow_id_commitment.get(2).unwrap_or(0),
+                    receipt.escrow_id_commitment.get(3).unwrap_or(0),
+                    receipt.escrow_id_commitment.get(4).unwrap_or(0),
+                    receipt.escrow_id_commitment.get(5).unwrap_or(0),
+                    receipt.escrow_id_commitment.get(6).unwrap_or(0),
+                    receipt.escrow_id_commitment.get(7).unwrap_or(0),
                 ]),
             },
         );
@@ -3706,15 +3653,9 @@ mod config_parity_test {
 
         // Generate unique report_id
         let counter_key = DataKey::FraudReportCounter;
-        let report_id: u64 = env
-            .storage()
-            .instance()
-            .get(&counter_key)
-            .unwrap_or(0);
+        let report_id: u64 = env.storage().instance().get(&counter_key).unwrap_or(0);
         let next_report_id = report_id.saturating_add(1);
-        env.storage()
-            .instance()
-            .set(&counter_key, &next_report_id);
+        env.storage().instance().set(&counter_key, &next_report_id);
 
         let report = FraudReport {
             report_id,
@@ -3728,16 +3669,12 @@ mod config_parity_test {
         };
 
         let report_key = DataKey::FraudReport(report_id);
-        env.storage()
-            .persistent()
-            .set(&report_key, &report);
-        env.storage()
-            .persistent()
-            .extend_ttl(
-                &report_key,
-                PERSISTENT_BUMP_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
+        env.storage().persistent().set(&report_key, &report);
+        env.storage().persistent().extend_ttl(
+            &report_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         // Index by target for quick lookup
         let target_key = DataKey::FraudReportsByTarget(target_entity.clone());
@@ -3747,22 +3684,15 @@ mod config_parity_test {
             .get(&target_key)
             .unwrap_or_else(|| Vec::new(&env));
         report_ids.push_back(report_id);
-        env.storage()
-            .persistent()
-            .set(&target_key, &report_ids);
-        env.storage()
-            .persistent()
-            .extend_ttl(
-                &target_key,
-                PERSISTENT_BUMP_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
+        env.storage().persistent().set(&target_key, &report_ids);
+        env.storage().persistent().extend_ttl(
+            &target_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         env.events().publish(
-            (
-                symbol_short!("reput"),
-                symbol_short!("fraud_filed"),
-            ),
+            (symbol_short!("reput"), symbol_short!("fraudfile")),
             report.clone(),
         );
 
@@ -3798,16 +3728,11 @@ mod config_parity_test {
         };
         report.resolved_at = Some(env.ledger().timestamp());
 
-        env.storage()
-            .persistent()
-            .set(&report_key, &report);
+        env.storage().persistent().set(&report_key, &report);
 
         // Event emits outcome: valid reports get bounty, invalid reports lose bond
         env.events().publish(
-            (
-                symbol_short!("reput"),
-                symbol_short!("fraud_resol"),
-            ),
+            (symbol_short!("reput"), symbol_short!("fraudresl")),
             report.clone(),
         );
 
@@ -3819,10 +3744,7 @@ mod config_parity_test {
     }
 
     /// Get a fraud report by ID.
-    pub fn get_fraud_report(
-        env: Env,
-        report_id: u64,
-    ) -> Option<FraudReport> {
+    pub fn get_fraud_report(env: Env, report_id: u64) -> Option<FraudReport> {
         env.storage()
             .persistent()
             .get(&DataKey::FraudReport(report_id))
@@ -3861,68 +3783,6 @@ mod config_parity_test {
     }
 }
 
-// --- Helper methods ---
-
-impl ReputationContract {
-    fn require_admin(env: &Env) -> Result<Address, ReputationError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(ReputationError::NotInitialized)
-    }
-
-    fn require_caller_is_admin(env: &Env, caller: &Address) -> Result<(), ReputationError> {
-        let admin = Self::require_admin(env)?;
-        if caller != &admin {
-            Err(ReputationError::Unauthorized)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn bump_entity(env: &Env, entity: &Address) {
-        if let Ok(rep_key) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            DataKey::Reputation(entity.clone())
-        })) {
-            let _ = env.storage().persistent().extend_ttl(
-                &rep_key,
-                PERSISTENT_BUMP_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
-        }
-    }
-
-    fn has_transacted_with(env: &Env, entity: &Address, counterparty: &Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Transacted(entity.clone(), counterparty.clone()))
-            .unwrap_or(false)
-    }
-
-    fn load_or_default_reputation(env: &Env, entity: &Address) -> ReputationScore {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Reputation(entity.clone()))
-            .unwrap_or_else(|| ReputationScore {
-                entity: entity.clone(),
-                score: 0,
-                total_transactions: 0,
-                successful_transactions: 0,
-                disputed_transactions: 0,
-                avg_rating: 0,
-                last_updated: 0,
-            })
-    }
-
-    fn validate_config(config: &ReputationConfig) -> Result<(), ReputationError> {
-        if config.min_transactions_threshold > SCORE_WINDOW as u64 {
-            return Err(ReputationError::InvalidParam);
-        }
-        Ok(())
-    }
-}
-
-
 // --- ReputationReaderTrait Implementation for Cross-Contract Access ---
 
 use delego_interfaces::ReputationReaderTrait;
@@ -3953,7 +3813,7 @@ impl ReputationReaderTrait for ReputationContract {
         if Self::is_frozen(env.clone(), merchant.clone()) {
             return Ok(false);
         }
-        
+
         match Self::get_reputation(env, merchant) {
             Ok(rep) => {
                 // Good standing: not frozen, score >= 5000 (50%), and active

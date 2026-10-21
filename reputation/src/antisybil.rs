@@ -4,9 +4,7 @@
 //! Reviews from accounts younger than 30 days or with fewer than 3 completed escrows
 //! must be discounted by 80%.
 
-use soroban_sdk::{
-    contracttype, vec, Address, Env, IntoVal, InvokeError, Symbol,
-};
+use soroban_sdk::{contracttype, vec, Address, Env, IntoVal, InvokeError, Symbol};
 
 use crate::EscrowRecordMirror;
 
@@ -21,9 +19,9 @@ pub fn calculate_reviewer_weight(account_age_ledgers: u32, completed_orders: u32
     if account_age_ledgers > 500_000 && completed_orders >= 5 {
         100 // Full weight
     } else if completed_orders >= 2 {
-        50  // Half weight
+        50 // Half weight
     } else {
-        20  // 20% weight for brand new accounts
+        20 // 20% weight for brand new accounts
     }
 }
 
@@ -31,8 +29,11 @@ pub fn calculate_reviewer_weight(account_age_ledgers: u32, completed_orders: u32
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowListPageMirror {
+    /// Escrow records contained in this page.
     pub items: soroban_sdk::Vec<EscrowRecordMirror>,
+    /// Total number of escrow records available.
     pub total: u32,
+    /// Offset to pass to fetch the next page, if any.
     pub next_offset: Option<u32>,
 }
 
@@ -57,9 +58,15 @@ pub fn get_buyer_completed_orders(
             page_limit.into_val(env),
         ];
 
-        let page: EscrowListPageMirror = env
-            .try_invoke_contract(escrow_contract, &Symbol::new(env, "list_escrows_by_buyer"), args)?
-            .map_err(|_| InvokeError::Contract(0))?;
+        let call_result = env.try_invoke_contract::<EscrowListPageMirror, InvokeError>(
+            escrow_contract,
+            &Symbol::new(env, "list_escrows_by_buyer"),
+            args,
+        );
+        let page: EscrowListPageMirror = match call_result {
+            Ok(Ok(p)) => p,
+            _ => return Err(InvokeError::Contract(0)),
+        };
 
         for record in page.items.iter() {
             if record.status == crate::EscrowStatusMirror::Released {
