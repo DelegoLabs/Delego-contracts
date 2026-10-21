@@ -28,6 +28,13 @@ mod blinded_review_test;
 mod fraud_report_test;
 #[cfg(test)]
 mod reputation_reader_test;
+pub mod flags;
+pub use flags::{
+    FlagReportingTrait, ReviewFlagRecord, ReviewFlagResolved, ReviewFlagStatus, FLAG_BOUNTY_BPS,
+    MIN_FLAG_BOND,
+};
+#[cfg(test)]
+mod flags_test;
 mod oracle_proof;
 pub use oracle_proof::{CarrierProof, CarrierProofVerifiedEvent};
 pub mod scoring;
@@ -545,39 +552,42 @@ pub enum ReputationError {
     /// `order_hash`, or `rater`/`entity` are not its buyer/seller pair
     /// (issue #286).
     UnverifiedOrder = 3012,
-    /// Reporter did not flag the entity.
-    NotFlagReporter = 3011,
     /// Review commitment already exists for this escrow_id.
-    DuplicateReviewCommitment = 3012,
+    DuplicateReviewCommitment = 3013,
     /// Caller is not the buyer for this escrow.
-    NotBuyer = 3013,
+    NotBuyer = 3014,
     /// Escrow is not in settled state.
-    EscrowNotSettled = 3014,
+    EscrowNotSettled = 3015,
     /// Quorum threshold not reached for dispute verdict.
-    QuorumNotReached = 3015,
+    QuorumNotReached = 3016,
     /// Invalid dispute verdict symbol.
-    InvalidVerdictSymbol = 3016,
+    InvalidVerdictSymbol = 3017,
     /// Merchant is not eligible for rehabilitation (not previously penalised/frozen).
-    NotEligibleForRehabilitation = 3012,
+    NotEligibleForRehabilitation = 3018,
     /// Rehabilitation program not found for merchant.
-    RehabilitationNotFound = 3013,
+    RehabilitationNotFound = 3019,
     /// Probation orders requirement not yet met for graduation.
-    ProbationNotComplete = 3014,
+    ProbationNotComplete = 3020,
     /// Invalid collateral amount (must be positive).
-    InvalidCollateralAmount = 3015,
+    InvalidCollateralAmount = 3021,
     /// Blinded review verification failed.
-    BlindedReviewVerificationFailed = 3016,
+    BlindedReviewVerificationFailed = 3022,
     /// Blinded receipt already used (double-submission prevented).
-    BlindedReceiptAlreadyUsed = 3017,
+    BlindedReceiptAlreadyUsed = 3023,
     /// Fraud report not found.
-    FraudReportNotFound = 3018,
+    FraudReportNotFound = 3024,
     /// Invalid fraud bond amount.
-    InvalidFraudBond = 3019,
+    InvalidFraudBond = 3025,
     /// Fraud report resolution invalid state.
-    InvalidReportStatus = 3020,
-    UnverifiedOrder = 3012,
+    InvalidReportStatus = 3026,
     /// A carrier proof was submitted by an oracle that is not registered.
-    CarrierOracleNotAuthorized = 3013,
+    CarrierOracleNotAuthorized = 3027,
+    /// Review targeted by flag was not found.
+    ReviewNotFound = 3028,
+    /// Flag record was not found.
+    FlagNotFound = 3029,
+    /// Flag has already been resolved.
+    FlagAlreadyResolved = 3030,
 }
 
 #[cfg(test)]
@@ -600,7 +610,24 @@ mod error_code_allocation {
             ReputationError::NoActiveFlag as u32,
             ReputationError::NotFlagReporter as u32,
             ReputationError::UnverifiedOrder as u32,
+            ReputationError::DuplicateReviewCommitment as u32,
+            ReputationError::NotBuyer as u32,
+            ReputationError::EscrowNotSettled as u32,
+            ReputationError::QuorumNotReached as u32,
+            ReputationError::InvalidVerdictSymbol as u32,
+            ReputationError::NotEligibleForRehabilitation as u32,
+            ReputationError::RehabilitationNotFound as u32,
+            ReputationError::ProbationNotComplete as u32,
+            ReputationError::InvalidCollateralAmount as u32,
+            ReputationError::BlindedReviewVerificationFailed as u32,
+            ReputationError::BlindedReceiptAlreadyUsed as u32,
+            ReputationError::FraudReportNotFound as u32,
+            ReputationError::InvalidFraudBond as u32,
+            ReputationError::InvalidReportStatus as u32,
             ReputationError::CarrierOracleNotAuthorized as u32,
+            ReputationError::ReviewNotFound as u32,
+            ReputationError::FlagNotFound as u32,
+            ReputationError::FlagAlreadyResolved as u32,
         ];
         for code in codes {
             assert!(
@@ -923,6 +950,20 @@ pub enum DataKey {
     FraudPenalty(Address),
     /// Ed25519 public key registered for a carrier oracle address.
     CarrierOracle(Address),
+    /// Monotonic counter for review flags (issue #580).
+    ReviewFlagCounter,
+    /// Stored flag report for a review, keyed by flag_id.
+    ReviewFlag(u64),
+    /// List of flag_ids targeting a specific review_id.
+    ReviewFlagsByReview(u64),
+    /// Active pending flag marker per (reporter, review_id).
+    ReporterActiveReviewFlag(Address, u64),
+    /// Tombstone marker for reviews removed via upheld flag ruling.
+    RemovedReview(u64),
+    /// Accumulated bond amounts slashed from frivolous review flag reports.
+    TotalSlashedReviewBonds,
+    /// Accumulated rewards (refunded bond + bounty) credited to a reporter.
+    ReporterRewardBalance(Address),
 }
 
 /// Maximum basis points value (100.00%), used both for ratings/scores and
@@ -3859,6 +3900,102 @@ mod config_parity_test {
         }
         Ok(result)
     }
+
+    // --- Sybil Flag Reporting with Slashing (issue #580) ---
+
+    /// Flag a suspicious review by staking a collateral bond.
+    pub fn flag_review(
+        env: Env,
+        reporter: Address,
+        review_id: u64,
+        bond_amount: i128,
+    ) -> Result<bool, ReputationError> {
+        flags::flag_review(env, reporter, review_id, bond_amount)
+    }
+
+    /// Resolve a flagged review. Upheld flags remove fraudulent review and reward reporter.
+    /// Frivolous reports result in bond forfeiture.
+    pub fn resolve_flag(
+        env: Env,
+        arbiter: Address,
+        flag_id: u64,
+        upheld: bool,
+    ) -> Result<bool, ReputationError> {
+        flags::resolve_flag(env, arbiter, flag_id, upheld)
+    }
+
+    /// Retrieve a review flag report by flag_id.
+    pub fn get_review_flag(env: Env, flag_id: u64) -> Option<ReviewFlagRecord> {
+        flags::get_review_flag(env, flag_id)
+    }
+
+    /// Retrieve all flag IDs targeting a review.
+    pub fn get_review_flags_by_review(env: Env, review_id: u64) -> Vec<u64> {
+        flags::get_review_flags_by_review(env, review_id)
+    }
+
+    /// Check if a review was removed as fraudulent.
+    pub fn is_review_removed(env: Env, review_id: u64) -> bool {
+        flags::is_review_removed(env, review_id)
+    }
+
+    /// Get total rewards (refunded bonds + bounties) credited to a reporter.
+    pub fn get_reporter_reward(env: Env, reporter: Address) -> i128 {
+        flags::get_reporter_reward(env, reporter)
+    }
+
+    /// Get total cumulative slashed bonds from frivolous flags.
+    pub fn get_total_slashed_bonds(env: Env) -> i128 {
+        flags::get_total_slashed_bonds(env)
+    }
+
+    /// Record a review commitment directly (used for verified reviews and testing).
+    pub fn record_review(
+        env: Env,
+        reviewer: Address,
+        merchant: Address,
+        review_id: u64,
+        rating: u32,
+        content_hash: BytesN<32>,
+    ) -> Result<(), ReputationError> {
+        reviewer.require_auth();
+        if rating < MIN_RATING || rating > MAX_RATING {
+            return Err(ReputationError::InvalidRating);
+        }
+        let commitment_key = DataKey::ReviewCommitment(review_id);
+        if env.storage().persistent().has(&commitment_key) {
+            return Err(ReputationError::DuplicateReviewCommitment);
+        }
+        let commitment = ReviewCommitment {
+            escrow_id: review_id,
+            reviewer: reviewer.clone(),
+            merchant: merchant.clone(),
+            rating,
+            content_hash,
+            submitted_ledger: env.ledger().sequence(),
+        };
+        env.storage().persistent().set(&commitment_key, &commitment);
+        env.storage().persistent().extend_ttl(
+            &commitment_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let merchant_reviews_key = DataKey::MerchantReviewCommitments(merchant.clone());
+        let mut review_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&merchant_reviews_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        review_ids.push_back(review_id);
+        env.storage().persistent().set(&merchant_reviews_key, &review_ids);
+        env.storage().persistent().extend_ttl(
+            &merchant_reviews_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
 }
 
 // --- Helper methods ---
@@ -3975,5 +4112,27 @@ impl ReputationReaderTrait for ReputationContract {
             Ok(rep) => Ok(rep.avg_rating),
             Err(_) => Err(0),
         }
+    }
+}
+
+// --- FlagReportingTrait Implementation for Trait-Based Access (issue #580) ---
+
+impl FlagReportingTrait for ReputationContract {
+    fn flag_review(
+        env: Env,
+        reporter: Address,
+        review_id: u64,
+        bond_amount: i128,
+    ) -> Result<bool, ReputationError> {
+        flags::flag_review(env, reporter, review_id, bond_amount)
+    }
+
+    fn resolve_flag(
+        env: Env,
+        arbiter: Address,
+        flag_id: u64,
+        upheld: bool,
+    ) -> Result<bool, ReputationError> {
+        flags::resolve_flag(env, arbiter, flag_id, upheld)
     }
 }

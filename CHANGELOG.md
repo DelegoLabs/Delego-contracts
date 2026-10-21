@@ -193,6 +193,7 @@ will reject the change.
 ### Unreleased
 
 - Expose a fixed-point half-life decay helper that reduces stale scores toward zero.
+- Implement Sybil flag reporting with bond staking and slashing for fraudulent review reporters (issue #580).
 
 ### 0.0.1 - 2026-08-29
 
