@@ -28,6 +28,8 @@ pub enum AdminAction {
     AddCourier(BytesN<32>),
     /// Revoke a courier public key.
     RemoveCourier(BytesN<32>),
+    /// Replace the tiered fee table used for volume-based discounts.
+    FeeTiers(Vec<FeeTierConfig>),
 }
 
 /// Public commitment and review state for a queued administrative change.
@@ -65,6 +67,7 @@ enum AdminActionKey {
     Current(BytesN<32>),
     Courier(BytesN<32>),
     CourierCount,
+    FeeTiers,
 }
 
 fn commitment(env: &Env, action: &AdminAction) -> BytesN<32> {
@@ -81,6 +84,7 @@ fn action_type(action: &AdminAction) -> Symbol {
         AdminAction::Guardian(_) => symbol_short!("guardian"),
         AdminAction::AddCourier(_) => symbol_short!("cour_add"),
         AdminAction::RemoveCourier(_) => symbol_short!("cour_del"),
+        AdminAction::FeeTiers(_) => symbol_short!("fee_tier"),
     }
 }
 
@@ -109,6 +113,24 @@ fn validate(env: &Env, action: &AdminAction) -> Result<(), EscrowError> {
                 return Err(EscrowError::InvalidFeeBps);
             }
         }
+        AdminAction::FeeTiers(tiers) => {
+            if tiers.len() == 0 {
+                return Err(EscrowError::InvalidFeeBps);
+            }
+            let mut last_threshold: i128 = -1;
+            for tier in tiers.iter() {
+                if tier.volume_threshold_stroops < 0 {
+                    return Err(EscrowError::InvalidFeeBps);
+                }
+                if tier.fee_basis_points > 1000 {
+                    return Err(EscrowError::InvalidFeeBps);
+                }
+                if tier.volume_threshold_stroops <= last_threshold {
+                    return Err(EscrowError::InvalidFeeBps);
+                }
+                last_threshold = tier.volume_threshold_stroops;
+            }
+        }
         _ => {}
     }
     match action {
@@ -124,6 +146,7 @@ fn validate(env: &Env, action: &AdminAction) -> Result<(), EscrowError> {
             let _ = key;
             Ok(())
         }
+        AdminAction::FeeTiers(_) => Ok(()),
         _ => Ok(()),
     }
 }
@@ -206,6 +229,8 @@ impl EscrowContract {
         admin.require_auth();
         let authorized = match &action {
             AdminAction::Fee(_) | AdminAction::FeeConfig(_, _) | AdminAction::FeeDistribution(_) =>
+                Self::has_role(env.clone(), admin.clone(), ContractRole::FeeManager),
+            AdminAction::FeeTiers(_) =>
                 Self::has_role(env.clone(), admin.clone(), ContractRole::FeeManager),
             _ => Self::is_admin(env.clone(), admin.clone()),
         };
@@ -301,6 +326,8 @@ impl EscrowContract {
         let authorized = match &proposal.action {
             AdminAction::Fee(_) | AdminAction::FeeConfig(_, _) | AdminAction::FeeDistribution(_) =>
                 Self::has_role(env.clone(), admin.clone(), ContractRole::FeeManager),
+            AdminAction::FeeTiers(_) =>
+                Self::has_role(env.clone(), admin.clone(), ContractRole::FeeManager),
             _ => Self::is_admin(env.clone(), admin.clone()),
         };
         if !authorized {
@@ -349,6 +376,12 @@ impl EscrowContract {
                 admin.require_auth();
                 consume(&env, proposal.action)?;
                 Self::remove_courier(env, key);
+                Ok(true)
+            }
+            AdminAction::FeeTiers(tiers) => {
+                admin.require_auth();
+                consume(&env, proposal.action)?;
+                Self::set_fee_tiers(env, tiers);
                 Ok(true)
             }
         }
@@ -406,5 +439,67 @@ impl EscrowContract {
             .persistent()
             .get::<_, bool>(&AdminActionKey::Courier(key))
             .unwrap_or(false)
+    }
+
+    /// Persist the tiered fee table used for volume-based commission discounts.
+    /// Tiers must be strictly ascending by threshold; the first tier is the
+    /// baseline applied to merchants below any higher threshold.
+    pub(super) fn set_fee_tiers(env: Env, tiers: Vec<FeeTierConfig>) {
+        env.storage()
+            .instance()
+            .set(&AdminActionKey::FeeTiers, &tiers);
+        env.events()
+            .publish((symbol_short!("admin"), symbol_short!("fee_tier")), tiers);
+    }
+
+    /// Current tiered fee table, if configured.
+    pub fn get_fee_tiers(env: Env) -> Vec<FeeTierConfig> {
+        env.storage()
+            .instance()
+            .get(&AdminActionKey::FeeTiers)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Resolve the applicable fee basis points for a merchant given their
+    /// lifetime settled volume. Falls back to the flat `FeeConfig` rate when
+    /// no tier table is configured. Uses checked arithmetic throughout and
+    /// never divides, so zero-volume merchants are handled safely.
+    pub fn resolve_fee_bps(env: Env, lifetime_settled_stroops: i128) -> u32 {
+        let tiers: Vec<FeeTierConfig> = env
+            .storage()
+            .instance()
+            .get(&AdminActionKey::FeeTiers)
+            .unwrap_or(Vec::new(&env));
+        if tiers.len() == 0 {
+            return Self::get_fee_config(env).fee_bps;
+        }
+        let mut selected: u32 = tiers.get(0).unwrap().fee_basis_points;
+        for tier in tiers.iter() {
+            if lifetime_settled_stroops >= tier.volume_threshold_stroops {
+                selected = tier.fee_basis_points;
+            } else {
+                break;
+            }
+        }
+        selected
+    }
+
+    /// Compute the commission for an amount using the merchant's resolved
+    /// tier. Scaling is done with i128 checked math and a single division by
+    /// 10_000 (basis-point denominator), avoiding any zero-division risk.
+    pub fn compute_tiered_fee(
+        env: Env,
+        amount_stroops: i128,
+        lifetime_settled_stroops: i128,
+    ) -> Result<i128, EscrowError> {
+        if amount_stroops < 0 {
+            return Err(EscrowError::InvalidAmount);
+        }
+        let bps = Self::resolve_fee_bps(env, lifetime_settled_stroops);
+        let scaled = amount_stroops
+            .checked_mul(bps as i128)
+            .ok_or(EscrowError::AdminActionOverflow)?;
+        let fee = scaled / 10_000i128;
+        Ok(fee)
     }
 }

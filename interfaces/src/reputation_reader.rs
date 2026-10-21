@@ -1,14 +1,14 @@
 //! Cross-contract interface for reading merchant reputation from external DeFi contracts.
-//! 
-//! Allows third-party lending, insurance, and underwriting contracts to query merchant
-//! reputation scores, dispute ratios, and standing status for credit assessment.
+// 
+// Allows third-party lending, insurance, and underwriting contracts to query merchant
+// reputation scores, dispute ratios, and standing status for credit assessment.
 
 use soroban_sdk::{Address, Env};
 
 /// Reputation reader trait for external DeFi contracts.
-/// 
-/// Implemented by the reputation contract to allow external contracts (lenders, insurers, etc.)
-/// to evaluate merchant creditworthiness using standardized queries.
+// 
+// Implemented by the reputation contract to allow external contracts (lenders, insurers, etc.)
+// to evaluate merchant creditworthiness using standardized queries.
 pub trait ReputationReaderTrait {
     /// Get merchant's current reputation rating (0-10000 basis points).
     ///
@@ -59,4 +59,17 @@ pub trait ReputationReaderTrait {
     /// # Returns
     /// Average rating in basis points, or error if merchant not found
     fn get_merchant_average_rating(env: Env, merchant: Address) -> Result<u32, u32>;
+
+    /// Get merchant's lifetime total settled volume in stroops.
+    ///
+    /// Used by the escrow contract to determine the applicable fee tier for
+    /// high-volume merchants (e.g. standard/silver/gold commission rates).
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `merchant` - Address of merchant to query
+    ///
+    /// # Returns
+    /// Lifetime settled volume in stroops, or error if merchant not found
+    fn get_merchant_settled_volume(env: Env, merchant: Address) -> Result<i128, u32>;
 }
