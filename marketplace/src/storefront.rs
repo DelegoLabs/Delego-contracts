@@ -23,6 +23,14 @@ pub struct StorefrontMetadataUpdatedEvent {
     pub metadata: StorefrontMetadata,
 }
 
+/// Event emitted when a merchant is auto-suspended for exceeding the dispute threshold.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantAutoSuspendedEvent {
+    pub merchant_id: u64,
+    pub dispute_bps: u32,
+}
+
 /// Stores a validated IPFS CID and its SHA-256 digest for the merchant.
 pub fn set_storefront_metadata(
     env: Env,
@@ -71,6 +79,56 @@ pub fn set_storefront_metadata(
             metadata,
         },
     );
+
+    Ok(())
+}
+
+/// Evaluates whether the dispute rate exceeds 5% given a minimum sample of 20 orders.
+pub fn evaluate_dispute_threshold(total_orders: u32, disputed_orders: u32) -> bool {
+    if total_orders >= 20 {
+        let dispute_bps = (disputed_orders as u64 * 10000) / (total_orders as u64);
+        return dispute_bps > 500; // > 5.0%
+    }
+    false
+}
+
+/// Handles a `DisputeOpened` cross-contract notification, updating counters and
+/// auto-suspending the merchant if the dispute rate exceeds the threshold.
+pub fn handle_dispute_opened(
+    env: Env,
+    merchant_id: u64,
+    total_orders: u32,
+    disputed_orders: u32,
+) -> Result<(), MarketplaceError> {
+    let mut merchant: Merchant = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Merchant(merchant_id))
+        .ok_or(MarketplaceError::MerchantNotFound)?;
+
+    if evaluate_dispute_threshold(total_orders, disputed_orders) {
+        merchant.frozen = true;
+        let key = DataKey::Merchant(merchant_id);
+        env.storage().persistent().set(&key, &merchant);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let dispute_bps = ((disputed_orders as u64 * 10000) / (total_orders as u64)) as u32;
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("auto_susp"),
+                merchant_id,
+            ),
+            MerchantAutoSuspendedEvent {
+                merchant_id,
+                dispute_bps,
+            },
+        );
+    }
 
     Ok(())
 }

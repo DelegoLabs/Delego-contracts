@@ -585,6 +585,15 @@ pub struct MerchantSuspendedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+pub struct MerchantAutoSuspendedEvent {
+    pub merchant_id: u64,
+    pub total_orders: u32,
+    pub disputed_orders: u32,
+    pub dispute_rate_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
 pub struct MerchantBannedEvent {
     pub merchant_id: u64,
     pub banned_by: Address,
@@ -920,6 +929,12 @@ pub enum DataKey {
     MerchantSkuList(u64),
     /// Storefront metadata record for a merchant.
     StorefrontMetadata(u64),
+    /// Total orders observed for a merchant (rolling window, capped at
+    /// [`DISPUTE_WINDOW_SIZE`]).
+    MerchantOrderCount(u64),
+    /// Disputed orders observed for a merchant (rolling window, capped at
+    /// [`DISPUTE_WINDOW_SIZE`]).
+    MerchantDisputeCount(u64),
 }
 
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.
@@ -965,6 +980,14 @@ const CATEGORY_VOTING_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
 pub const PAYOUT_CHANGE_COOLDOWN_LEDGERS: u32 = 17_280; // ~24 hours
+
+/// Minimum number of orders required before the dispute-rate auto-suspension
+/// threshold is evaluated.
+pub const DISPUTE_MIN_SAMPLE_SIZE: u32 = 20;
+/// Dispute-rate threshold in basis points (500 bps = 5.0%).
+pub const DISPUTE_RATE_THRESHOLD_BPS: u32 = 500;
+/// Rolling window size for dispute-rate tracking.
+pub const DISPUTE_WINDOW_SIZE: u32 = 100;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

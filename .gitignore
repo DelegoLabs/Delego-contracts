@@ -16,13 +16,13 @@ target/
 
 # IDE
 .idea/
-.vscode/
 *.swp
 *.swo
 .DS_Store
 
 # Logs
 logs/
+temp_auto_push.bat
 *.log
 npm-debug.log*
 pnpm-debug.log*
@@ -47,3 +47,5 @@ docker-data/
 # Misc
 *.tsbuildinfo
 .turbo/
+.gitignore
+branch_structure.json
