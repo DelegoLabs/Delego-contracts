@@ -192,6 +192,28 @@ will reject the change.
 
 ### Unreleased
 
+- Add a merchant review appeal mechanism with a collateralized bond (issue #583).
+  A merchant whose reputation is damaged by a demonstrably false review can
+  challenge it by staking a bond: `file_appeal` transfers the bond tokens from
+  the merchant into the contract, so the stake is really escrowed while the
+  appeal is on the docket and filing an appeal is not free. Registered
+  arbiters vote on the appeal within a ledger-bounded window
+  (`configure_appeals`, `register_arbiter`, `vote_appeal`): an upheld appeal
+  hides the review — it disappears from the merchant's visible review index and
+  its rating is removed from the rating pool the average rating is computed
+  from — and returns the bond, a rejected one forfeits the bond to the
+  configured charity, and an expired or withdrawn appeal returns the bond so a
+  merchant is never punished for the arbiters' inaction. The settlement the
+  review was filed under keeps counting towards the merchant's score: a false
+  review is a false statement about a transaction, not proof that the
+  transaction never happened. New entry points: `configure_appeals`,
+  `get_appeal_config`, `register_arbiter`, `deregister_arbiter`, `is_arbiter`,
+  `file_appeal`, `vote_appeal`, `expire_appeal`, `withdraw_appeal`,
+  `get_appeal`, `get_appeal_votes`, `get_appeal_outcome`, `is_review_hidden`,
+  `get_hidden_review_ids`, `get_visible_review_ids`,
+  `get_escrowed_appeal_bond`, `get_escrowed_bond_balance`, and
+  `get_charity_balance`, with new `ReputationError` codes (3028–3040).
+
 - Expose a fixed-point half-life decay helper that reduces stale scores toward zero.
 - Fix the fixed-point half-life decay helper so a decayed score never *increases*:
   the `exp(-t)` Taylor expansion now uses 10 terms in Q32.32 instead of 5. The
