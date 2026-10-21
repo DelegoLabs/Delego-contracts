@@ -14,6 +14,16 @@ const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400;
 pub const MAX_SWEEP_BATCH_SIZE: u32 = 50;
 
+/// Storage schema version describing the delegation key layout this build
+/// reads and writes (issue #574).
+///
+/// * `1` — legacy layout: one delegation record per owner, keyed only by the
+///   owner address under [`DataKey::DelegationV1`].
+/// * `2` — current layout: each record keyed by its unique delegation id under
+///   [`DataKey::Delegation`], with the per-owner id index in
+///   [`DataKey::UserDelegations`].
+pub const STORAGE_SCHEMA_VERSION: u32 = 2;
+
 /// Represents the lifecycle status of a delegation.
 /// Contract version information for deployment scripts and runtime compatibility checks.
 #[contracttype]
@@ -385,6 +395,16 @@ pub enum DataKey {
     NextSubAccountId(Address),
     /// Sub-account ids associated with an owner.
     OwnerSubAccounts(Address),
+    /// Legacy V1 delegation record, keyed only by the owner address
+    /// (issue #574). Deployments predating id-based addressing stored a
+    /// single record under this key; it is rewritten into the V2 layout
+    /// ([`DataKey::Delegation`] plus the [`DataKey::UserDelegations`] index)
+    /// the first time the owner's delegations are accessed.
+    DelegationV1(Address),
+    /// Storage schema version for the delegation key layout, written by
+    /// [`initialize`](DelegationRegistry::initialize) and readable through
+    /// [`get_storage_schema_version`](DelegationRegistry::get_storage_schema_version).
+    SchemaVersion,
 }
 
 /// Errors for delegation registry operations.
@@ -467,7 +487,23 @@ impl DelegationRegistry {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::NextId, &1u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &STORAGE_SCHEMA_VERSION);
         Ok(true)
+    }
+
+    /// Returns the storage schema version this deployment's delegation keys
+    /// conform to (issue #574).
+    ///
+    /// Deployments initialized before the version marker existed report the
+    /// current [`STORAGE_SCHEMA_VERSION`]: their records already live in the
+    /// id-keyed layout, so a missing marker is not evidence of the V1 schema.
+    pub fn get_storage_schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(STORAGE_SCHEMA_VERSION)
     }
 
     /// Returns the configured admin address.
@@ -639,6 +675,11 @@ impl DelegationRegistry {
         if agent_id == BytesN::from_array(&env, &[0u8; 32]) {
             return Err(DelegationError::InvalidAgentId);
         }
+
+        // A write against an owner's delegations also upgrades any legacy V1
+        // record to the V2 layout (issue #574) before the new id is issued, so
+        // both records end up consistently id-keyed and indexed.
+        Self::migrate_delegation_keys(&env, &owner);
 
         let id = env
             .storage()
@@ -1039,6 +1080,9 @@ impl DelegationRegistry {
 
     /// Returns a page of the delegations owned by `owner`.
     ///
+    /// Legacy V1 records are migrated into the id-keyed layout before paging
+    /// (issue #574), so they count toward `total` and appear on the page.
+    ///
     /// `offset` is clamped to the number of delegations the owner has and
     /// `limit` is clamped to MAX_PAGE_LIMIT. `next_offset` is `None` once the
     /// final page has been returned.
@@ -1048,6 +1092,8 @@ impl DelegationRegistry {
         offset: u32,
         limit: u32,
     ) -> DelegationPage {
+        Self::migrate_delegation_keys(&env, &owner);
+
         let user_dels: Vec<u64> = env
             .storage()
             .persistent()
@@ -1284,7 +1330,13 @@ impl DelegationRegistry {
     }
 
     /// Returns all delegations owned by the given address.
+    ///
+    /// Any legacy V1 record still keyed by the owner address alone is migrated
+    /// into the id-keyed layout first (issue #574), so it appears in the
+    /// result alongside delegations already stored under V2 keys.
     pub fn get_delegations_by_owner(env: Env, owner: Address) -> Vec<DelegationRecord> {
+        Self::migrate_delegation_keys(&env, &owner);
+
         let user_dels_key = DataKey::UserDelegations(owner.clone());
         let user_dels: Vec<u64> = env
             .storage()
@@ -1630,6 +1682,8 @@ impl DelegationRegistry {
     /// already updated its stored status — this lets callers discover sweep
     /// candidates as well as already-swept delegations in one call.
     pub fn get_expired_delegations(env: Env, owner: Address) -> Vec<DelegationRecord> {
+        Self::migrate_delegation_keys(&env, &owner);
+
         let current_ledger = env.ledger().sequence();
         let user_dels = env
             .storage()
@@ -1862,11 +1916,7 @@ impl DelegationRegistry {
 
         // Get or initialize the next sub-account id for this owner
         let next_id_key = DataKey::NextSubAccountId(owner.clone());
-        let id = env
-            .storage()
-            .persistent()
-            .get(&next_id_key)
-            .unwrap_or(1u64);
+        let id = env.storage().persistent().get(&next_id_key).unwrap_or(1u64);
         let next_id = id.checked_add(1).ok_or(DelegationError::IdExhausted)?;
         env.storage().persistent().set(&next_id_key, &next_id);
         env.storage().persistent().extend_ttl(
@@ -2087,10 +2137,7 @@ impl DelegationRegistry {
     }
 
     /// Returns all sub-accounts associated with a specific delegation.
-    pub fn get_sub_accounts_by_delegation(
-        env: Env,
-        delegation_id: u64,
-    ) -> Vec<SubAccountRecord> {
+    pub fn get_sub_accounts_by_delegation(env: Env, delegation_id: u64) -> Vec<SubAccountRecord> {
         // First verify the delegation exists
         let delegation: DelegationRecord = match env
             .storage()
@@ -2143,6 +2190,92 @@ impl DelegationRegistry {
             .persistent()
             .set(&DataKey::DelegationVersion(delegation_id), &new_version);
         new_version
+    }
+
+    /// Lazily migrates an owner's legacy V1 delegation record into the V2
+    /// id-keyed layout (issue #574).
+    ///
+    /// The V1 schema keyed a single record by the owner address alone
+    /// ([`DataKey::DelegationV1`]); the V2 schema keys every record by a unique
+    /// delegation id ([`DataKey::Delegation`]) and tracks the owner's ids in
+    /// [`DataKey::UserDelegations`]. This helper bridges the two: on first
+    /// access to an owner's delegations it reads the V1 record, assigns it the
+    /// next delegation id, rewrites it under the V2 keys (record, version
+    /// counter, initial history snapshot and owner index), and consumes the V1
+    /// entry so later accesses find only the V2 layout.
+    ///
+    /// Migration preserves the record's identity and grant fields verbatim —
+    /// `status`, `agent_id`, `permissions`, `nonce`, `permissions_contract`,
+    /// timestamps, `label` and `version` — so an active delegation keeps
+    /// authorizing the same agent with the same capabilities and no grant has
+    /// to be re-signed. Only `id` (unassigned in V1) and `owner` (normalised
+    /// to the key that owns the index entry) are rewritten.
+    ///
+    /// Returns `true` when a V1 record was migrated and `false` when there was
+    /// nothing to migrate. Idempotent: the V1 entry is removed once consumed,
+    /// so subsequent accesses are no-ops. When the delegation id counter is
+    /// exhausted the record is deliberately left in V1 — reads of the owner's
+    /// delegations stay panic-free and the unmigrated record remains intact.
+    fn migrate_delegation_keys(env: &Env, owner: &Address) -> bool {
+        let v1_key = DataKey::DelegationV1(owner.clone());
+        let mut record: DelegationRecord = match env.storage().persistent().get(&v1_key) {
+            Some(r) => r,
+            None => return false,
+        };
+
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
+        let next_id = match id.checked_add(1) {
+            Some(n) => n,
+            None => return false,
+        };
+        env.storage().instance().set(&DataKey::NextId, &next_id);
+
+        record.id = id;
+        record.owner = owner.clone();
+        if record.version < 1 {
+            record.version = 1;
+        }
+
+        let delegation_key = DataKey::Delegation(id);
+        env.storage().persistent().set(&delegation_key, &record);
+        env.storage().persistent().extend_ttl(
+            &delegation_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegationVersion(id), &record.version);
+        env.storage().persistent().extend_ttl(
+            &DataKey::DelegationVersion(id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let user_dels_key = DataKey::UserDelegations(owner.clone());
+        let mut user_dels: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&user_dels_key)
+            .unwrap_or(Vec::new(env));
+        user_dels.push_back(id);
+        env.storage().persistent().set(&user_dels_key, &user_dels);
+        env.storage().persistent().extend_ttl(
+            &user_dels_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Self::store_snapshot(env, id, &record);
+
+        env.storage().persistent().remove(&v1_key);
+
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        true
     }
 
     fn migrate_snapshot_keys(env: &Env, delegation_id: u64) {

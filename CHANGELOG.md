@@ -212,6 +212,15 @@ will reject the change.
   reserved and zero bits so a delegation can never carry capabilities the
   contract cannot interpret.
 
+- Added a lazy V1→V2 delegation storage-key migration (issue #574). Deployments
+  that stored a delegation under `DataKey::DelegationV1(owner)` are rewritten
+  into the current id-keyed layout (`DataKey::Delegation(id)` plus the
+  `UserDelegations` index) the first time the owner's delegations are accessed,
+  preserving status, agent, permissions, nonce, timestamps and version so no
+  grant has to be re-signed. The new `DataKey::SchemaVersion` marker and
+  `get_storage_schema_version` expose the layout generation
+  (`STORAGE_SCHEMA_VERSION = 2`).
+
 ### 0.0.1 - 2026-08-29
 
 - Initial tracked release for this contract. No on-chain `version()` entry point,

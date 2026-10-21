@@ -1007,6 +1007,280 @@ fn test_snapshot_key_migration_preserves_legacy_history() {
     });
 }
 
+/// Seeds a legacy V1 delegation record keyed only by the owner address, i.e.
+/// the layout a pre-id-schema deployment stored under `DelegationV1`.
+#[allow(clippy::too_many_arguments)]
+fn seed_legacy_v1_delegation(
+    env: &Env,
+    contract_id: &Address,
+    owner: &Address,
+    agent_id: &BytesN<32>,
+    permissions_contract: &Address,
+    version: u32,
+    nonce: u64,
+) {
+    let record = DelegationRecord {
+        id: 0,
+        owner: owner.clone(),
+        agent_id: agent_id.clone(),
+        permissions_contract: permissions_contract.clone(),
+        status: DelegationStatus::Active,
+        label: Symbol::new(env, "Legacy_Agt"),
+        created_at: 1_000,
+        updated_at: 2_000,
+        expires_at_ledger: 10_000,
+        version,
+        permissions: PermissionBitmask::all(),
+        nonce,
+    };
+
+    env.as_contract(contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegationV1(owner.clone()), &record);
+    });
+}
+
+#[test]
+fn test_storage_schema_version_is_reported() {
+    let (_env, client, _, _, _, _) = setup();
+
+    assert_eq!(STORAGE_SCHEMA_VERSION, 2);
+    assert_eq!(client.get_storage_schema_version(), STORAGE_SCHEMA_VERSION);
+}
+
+/// Reading an owner's delegations must transparently rewrite a legacy V1
+/// record into the id-keyed V2 layout without losing any field.
+#[test]
+fn test_v1_delegation_migrated_on_owner_read() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(100);
+
+    seed_legacy_v1_delegation(
+        &env,
+        &client.address,
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        3,
+        2,
+    );
+
+    let records = client.get_delegations_by_owner(&owner);
+    assert_eq!(records.len(), 1);
+
+    let migrated = records.get(0).unwrap();
+    assert_eq!(migrated.id, 1);
+    assert_eq!(migrated.owner, owner);
+    assert_eq!(migrated.agent_id, agent_id);
+    assert_eq!(migrated.permissions_contract, permissions_contract);
+    assert_eq!(migrated.status, DelegationStatus::Active);
+    assert_eq!(migrated.permissions, PermissionBitmask::all());
+    assert_eq!(migrated.nonce, 2);
+    assert_eq!(migrated.version, 3);
+    assert_eq!(migrated.created_at, 1_000);
+    assert_eq!(migrated.updated_at, 2_000);
+    assert_eq!(migrated.expires_at_ledger, 10_000);
+
+    env.as_contract(&client.address, || {
+        // The V1 entry is consumed and every V2 key is populated.
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&DataKey::DelegationV1(owner.clone())));
+
+        let stored: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(1))
+            .unwrap();
+        assert_eq!(stored.id, 1);
+
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserDelegations(owner.clone()))
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids.get(0), Some(1));
+
+        let version: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegationVersion(1))
+            .unwrap();
+        assert_eq!(version, 3);
+
+        // A rollback-capable history snapshot is seeded for the new id.
+        assert!(env.storage().persistent().has(&DataKey::Snapshot(1, 3)));
+    });
+}
+
+/// A migrated delegation must keep authorizing the same agent and capabilities
+/// without the owner re-signing any grant.
+#[test]
+fn test_v1_migration_preserves_authorization_without_resigning() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(100);
+
+    seed_legacy_v1_delegation(
+        &env,
+        &client.address,
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        1,
+        5,
+    );
+
+    let records = client.get_delegations_by_owner(&owner);
+    let id = records.get(0).unwrap().id;
+
+    assert!(client.is_authorized(&id, &agent_id));
+    assert!(client.is_authorized_for(&id, &agent_id, &PERM_FLAG_SPEND));
+    assert!(client.is_authorized_with_nonce(&id, &agent_id, &5u64));
+    assert!(!client.is_authorized_with_nonce(&id, &agent_id, &4u64));
+}
+
+/// Once migrated, mutating entry points write straight to the V2 record and
+/// leave no V1 entry behind.
+#[test]
+fn test_v1_migration_then_write_updates_v2_record() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(100);
+
+    seed_legacy_v1_delegation(
+        &env,
+        &client.address,
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        3,
+        2,
+    );
+
+    let id = client.get_delegations_by_owner(&owner).get(0).unwrap().id;
+
+    assert!(client.pause_delegation(&id));
+
+    let paused = client.get_delegation(&id);
+    assert_eq!(paused.status, DelegationStatus::Paused);
+    assert_eq!(paused.version, 4);
+
+    env.as_contract(&client.address, || {
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&DataKey::DelegationV1(owner.clone())));
+
+        let stored: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(id))
+            .unwrap();
+        assert_eq!(stored.status, DelegationStatus::Paused);
+        assert_eq!(stored.version, 4);
+    });
+}
+
+/// A legacy record can coexist with delegations already created under V2 keys,
+/// and repeated reads never duplicate the migrated entry.
+#[test]
+fn test_v1_migration_coexists_with_v2_delegations_and_is_idempotent() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(100);
+
+    let first = client.create_delegation(
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &symbol_short!("First"),
+        &1_000,
+    );
+    assert_eq!(first, 1);
+
+    seed_legacy_v1_delegation(
+        &env,
+        &client.address,
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        1,
+        0,
+    );
+
+    let records = client.get_delegations_by_owner(&owner);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records.get(0).unwrap().id, 1);
+    assert_eq!(records.get(1).unwrap().id, 2);
+
+    // A second read finds the V1 key gone and must not add another record.
+    let again = client.get_delegations_by_owner(&owner);
+    assert_eq!(again.len(), 2);
+
+    env.as_contract(&client.address, || {
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserDelegations(owner.clone()))
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids.get(0), Some(1));
+        assert_eq!(ids.get(1), Some(2));
+    });
+}
+
+/// Reads must stay panic-free when an owner has no legacy record at all.
+#[test]
+fn test_v1_migration_is_noop_without_legacy_record() {
+    let (_env, client, _, owner, _, _) = setup();
+
+    assert_eq!(client.get_delegations_by_owner(&owner).len(), 0);
+    assert_eq!(
+        client
+            .get_delegations_by_owner_paged(&owner, &0u32, &MAX_PAGE_LIMIT)
+            .total,
+        0
+    );
+    assert_eq!(client.get_expired_delegations(&owner).len(), 0);
+}
+
+/// When the id counter is exhausted the migration leaves the V1 record intact
+/// rather than panicking, so reads still return safely.
+#[test]
+fn test_v1_migration_skips_gracefully_when_ids_exhausted() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    seed_legacy_v1_delegation(
+        &env,
+        &client.address,
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        1,
+        0,
+    );
+
+    env.as_contract(&client.address, || {
+        env.storage().instance().set(&DataKey::NextId, &u64::MAX);
+    });
+
+    let records = client.get_delegations_by_owner(&owner);
+    assert_eq!(records.len(), 0);
+
+    env.as_contract(&client.address, || {
+        assert!(env
+            .storage()
+            .persistent()
+            .has(&DataKey::DelegationV1(owner.clone())));
+    });
+}
+
 /// Delegation IDs must be strictly increasing even when created by
 /// different owners.
 #[test]
