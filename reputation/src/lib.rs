@@ -545,39 +545,40 @@ pub enum ReputationError {
     /// `order_hash`, or `rater`/`entity` are not its buyer/seller pair
     /// (issue #286).
     UnverifiedOrder = 3012,
-    /// Reporter did not flag the entity.
-    NotFlagReporter = 3011,
     /// Review commitment already exists for this escrow_id.
-    DuplicateReviewCommitment = 3012,
+    DuplicateReviewCommitment = 3013,
     /// Caller is not the buyer for this escrow.
-    NotBuyer = 3013,
+    NotBuyer = 3014,
     /// Escrow is not in settled state.
-    EscrowNotSettled = 3014,
+    EscrowNotSettled = 3015,
     /// Quorum threshold not reached for dispute verdict.
-    QuorumNotReached = 3015,
+    QuorumNotReached = 3016,
     /// Invalid dispute verdict symbol.
-    InvalidVerdictSymbol = 3016,
+    InvalidVerdictSymbol = 3017,
     /// Merchant is not eligible for rehabilitation (not previously penalised/frozen).
-    NotEligibleForRehabilitation = 3012,
+    NotEligibleForRehabilitation = 3018,
     /// Rehabilitation program not found for merchant.
-    RehabilitationNotFound = 3013,
+    RehabilitationNotFound = 3019,
     /// Probation orders requirement not yet met for graduation.
-    ProbationNotComplete = 3014,
+    ProbationNotComplete = 3020,
     /// Invalid collateral amount (must be positive).
-    InvalidCollateralAmount = 3015,
+    InvalidCollateralAmount = 3021,
     /// Blinded review verification failed.
-    BlindedReviewVerificationFailed = 3016,
+    BlindedReviewVerificationFailed = 3022,
     /// Blinded receipt already used (double-submission prevented).
-    BlindedReceiptAlreadyUsed = 3017,
+    BlindedReceiptAlreadyUsed = 3023,
     /// Fraud report not found.
-    FraudReportNotFound = 3018,
+    FraudReportNotFound = 3024,
     /// Invalid fraud bond amount.
-    InvalidFraudBond = 3019,
+    InvalidFraudBond = 3025,
     /// Fraud report resolution invalid state.
-    InvalidReportStatus = 3020,
-    UnverifiedOrder = 3012,
+    InvalidReportStatus = 3026,
     /// A carrier proof was submitted by an oracle that is not registered.
-    CarrierOracleNotAuthorized = 3013,
+    CarrierOracleNotAuthorized = 3027,
+    /// No matching precedent rule for the supplied dispute reason code.
+    NoMatchingPrecedentRule = 3028,
+    /// The supplied carrier attestation did not match the rule's required status.
+    PrecedentAttestationMismatch = 3029,
 }
 
 #[cfg(test)]
