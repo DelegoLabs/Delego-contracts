@@ -19,6 +19,12 @@ use soroban_sdk::{
 };
 
 pub mod algorithm;
+pub mod appeals;
+pub use appeals::{
+    AppealConfig, AppealOutcome, AppealStatus, AppealVote, AppealedReview, ReviewAppeal,
+};
+#[cfg(test)]
+mod appeals_test;
 #[cfg(test)]
 mod blinded_review_test;
 #[cfg(test)]
@@ -586,6 +592,33 @@ pub enum ReputationError {
     InvalidReportStatus = 3026,
     /// A carrier proof was submitted by an oracle that is not registered.
     CarrierOracleNotAuthorized = 3027,
+    /// No review appeal exists for the given review id.
+    ReviewAppealNotFound = 3028,
+    /// A review appeal has already been filed for this review id.
+    ReviewAppealAlreadyExists = 3029,
+    /// Invalid appeal bond amount (must be positive).
+    InvalidAppealBond = 3030,
+    /// The review appeal has already been resolved and cannot change again.
+    AppealAlreadyResolved = 3031,
+    /// Caller is not a party to the appeal (neither merchant nor arbiter).
+    NotAppealParty = 3032,
+    /// The review being appealed does not exist.
+    ReviewNotFound = 3033,
+    /// The review being appealed targets a different merchant.
+    AppealMerchantMismatch = 3034,
+    /// The appeal bond does not match the configured bond amount.
+    AppealBondMismatch = 3035,
+    /// The appeal has already been voted on by this arbiter.
+    AppealAlreadyVoted = 3036,
+    /// The arbiter is not registered for the reputation contract.
+    ArbiterNotRegistered = 3037,
+    /// The arbiter vote is not a valid approve/deny verdict.
+    InvalidAppealVerdict = 3038,
+    /// The review appeal voting window has expired.
+    AppealWindowExpired = 3039,
+    /// The review appeal voting window is still open, so the appeal cannot be
+    /// expired yet.
+    AppealWindowNotExpired = 3040,
 }
 
 #[cfg(test)]
@@ -623,6 +656,19 @@ mod error_code_allocation {
             ReputationError::InvalidFraudBond as u32,
             ReputationError::InvalidReportStatus as u32,
             ReputationError::CarrierOracleNotAuthorized as u32,
+            ReputationError::ReviewAppealNotFound as u32,
+            ReputationError::ReviewAppealAlreadyExists as u32,
+            ReputationError::InvalidAppealBond as u32,
+            ReputationError::AppealAlreadyResolved as u32,
+            ReputationError::NotAppealParty as u32,
+            ReputationError::ReviewNotFound as u32,
+            ReputationError::AppealMerchantMismatch as u32,
+            ReputationError::AppealBondMismatch as u32,
+            ReputationError::AppealAlreadyVoted as u32,
+            ReputationError::ArbiterNotRegistered as u32,
+            ReputationError::InvalidAppealVerdict as u32,
+            ReputationError::AppealWindowExpired as u32,
+            ReputationError::AppealWindowNotExpired as u32,
         ];
         for code in codes {
             assert!(
@@ -904,6 +950,25 @@ pub enum DataKey {
     FraudPenalty(Address),
     /// Ed25519 public key registered for a carrier oracle address.
     CarrierOracle(Address),
+
+    // --- Review appeals (issue #583) ---
+    /// Configuration of the review appeal mechanism (bond, quorum, voting
+    /// window, charity). Set by the admin.
+    AppealConfig,
+    /// The appeal filed against a review, keyed by review id.
+    ReviewAppeal(u64),
+    /// Ledger at which the voting window of an appeal closes.
+    AppealDeadline(u64),
+    /// Arbiter votes cast on an appeal.
+    AppealVotes(u64),
+    /// Hidden flag of an appealed review.
+    AppealedReview(u64),
+    /// Appeal bond currently escrowed for a merchant, in stroops.
+    AppealBond(Address),
+    /// Registry of addresses allowed to vote on appeals.
+    AppealArbiter(Address),
+    /// Bond forfeited to a charity address, in stroops.
+    AppealCharityBalance(Address),
 }
 
 /// Maximum basis points value (100.00%), used both for ratings/scores and
@@ -3748,6 +3813,401 @@ impl ReputationContract {
         env.storage()
             .persistent()
             .get(&DataKey::FraudReport(report_id))
+    }
+
+    // --- Review Appeals (issue #583) ---
+
+    /// Configures the review appeal mechanism. Admin-only.
+    ///
+    /// `bond_stroops` is the stake a merchant has to escrow to file an
+    /// appeal, `quorum` the number of arbiter votes that resolve it,
+    /// `window_ledgers` the length of the voting window, and `charity` the
+    /// address that collects bonds forfeited by denied appeals.
+    pub fn configure_appeals(
+        env: Env,
+        admin: Address,
+        bond_stroops: i128,
+        quorum: u32,
+        window_ledgers: u64,
+        charity: Address,
+    ) -> Result<AppealConfig, ReputationError> {
+        admin.require_auth();
+        Self::require_caller_is_admin(&env, &admin)?;
+
+        if bond_stroops <= 0 {
+            return Err(ReputationError::InvalidAppealBond);
+        }
+        if quorum == 0 || window_ledgers == 0 {
+            return Err(ReputationError::InvalidParam);
+        }
+
+        let config = AppealConfig {
+            bond_stroops,
+            quorum,
+            window_ledgers,
+            charity,
+        };
+        appeals::store_config(&env, &config);
+
+        env.events().publish(
+            (symbol_short!("reput"), symbol_short!("ap_conf")),
+            config.clone(),
+        );
+
+        Ok(config)
+    }
+
+    /// Returns the appeal configuration, if the admin configured one.
+    pub fn get_appeal_config(env: Env) -> Option<AppealConfig> {
+        appeals::load_config(&env)
+    }
+
+    /// Registers `arbiter` as an address allowed to vote on appeals.
+    /// Admin-only. Registering an arbiter twice is a no-op.
+    pub fn register_arbiter(
+        env: Env,
+        admin: Address,
+        arbiter: Address,
+    ) -> Result<(), ReputationError> {
+        admin.require_auth();
+        Self::require_caller_is_admin(&env, &admin)?;
+
+        appeals::register_arbiter(&env, &arbiter);
+
+        env.events()
+            .publish((symbol_short!("reput"), symbol_short!("arb_reg")), arbiter);
+
+        Ok(())
+    }
+
+    /// Removes `arbiter` from the arbiter registry. Admin-only.
+    pub fn deregister_arbiter(
+        env: Env,
+        admin: Address,
+        arbiter: Address,
+    ) -> Result<(), ReputationError> {
+        admin.require_auth();
+        Self::require_caller_is_admin(&env, &admin)?;
+
+        appeals::deregister_arbiter(&env, &arbiter);
+
+        env.events()
+            .publish((symbol_short!("reput"), symbol_short!("arb_drg")), arbiter);
+
+        Ok(())
+    }
+
+    /// Returns `true` when `arbiter` may vote on appeals.
+    pub fn is_arbiter(env: Env, arbiter: Address) -> bool {
+        appeals::is_arbiter(&env, &arbiter)
+    }
+
+    /// Files an appeal against a review the merchant received.
+    ///
+    /// The merchant stakes `bond_stroops` — it has to match the configured
+    /// bond exactly — which the contract escrows for the duration of the
+    /// voting window. `justification_hash` is the hash of the off-chain
+    /// evidence that the review is false, so the appeal can be audited
+    /// without storing the evidence itself on-chain.
+    ///
+    /// The review must exist and have to be a review *of* the caller, and a
+    /// review can only be appealed once.
+    pub fn file_appeal(
+        env: Env,
+        merchant: Address,
+        review_id: u64,
+        bond_stroops: i128,
+        justification_hash: BytesN<32>,
+    ) -> Result<ReviewAppeal, ReputationError> {
+        merchant.require_auth();
+
+        let config = appeals::load_config(&env).ok_or(ReputationError::InvalidParam)?;
+
+        if bond_stroops <= 0 {
+            return Err(ReputationError::InvalidAppealBond);
+        }
+        if bond_stroops != config.bond_stroops {
+            return Err(ReputationError::AppealBondMismatch);
+        }
+
+        // The appeal has to target an existing review of this merchant.
+        let review: ReviewCommitment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReviewCommitment(review_id))
+            .ok_or(ReputationError::ReviewNotFound)?;
+        if review.merchant != merchant {
+            return Err(ReputationError::AppealMerchantMismatch);
+        }
+
+        if appeals::load_appeal(&env, review_id).is_some() {
+            return Err(ReputationError::ReviewAppealAlreadyExists);
+        }
+        if appeals::is_hidden(&env, review_id) {
+            return Err(ReputationError::AppealAlreadyResolved);
+        }
+
+        // Escrow the bond: it stays locked until the appeal is resolved.
+        let escrowed = appeals::escrowed_bond(&env, &merchant) + bond_stroops;
+        appeals::set_escrowed_bond(&env, &merchant, escrowed);
+
+        let appeal = ReviewAppeal {
+            review_id,
+            merchant: merchant.clone(),
+            appeal_bond_stroops: bond_stroops,
+            justification_hash,
+            status: AppealStatus::Pending,
+        };
+        appeals::store_appeal(&env, &appeal);
+        appeals::store_deadline(
+            &env,
+            review_id,
+            env.ledger().sequence() as u64 + config.window_ledgers,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("reput"),
+                symbol_short!("ap_filed"),
+                merchant.clone(),
+            ),
+            appeal.clone(),
+        );
+
+        Ok(appeal)
+    }
+
+    /// Casts an arbiter vote on a pending appeal.
+    ///
+    /// Only registered arbiters may vote, and only once per appeal. As soon
+    /// as a quorum of approvals is reached the review is hidden and the bond
+    /// is returned to the merchant; a quorum of rejections forfeits the bond
+    /// to the platform charity.
+    pub fn vote_appeal(
+        env: Env,
+        arbiter: Address,
+        review_id: u64,
+        verdict: Symbol,
+    ) -> Result<AppealOutcome, ReputationError> {
+        arbiter.require_auth();
+
+        let config = appeals::load_config(&env).ok_or(ReputationError::InvalidParam)?;
+
+        if !appeals::is_arbiter(&env, &arbiter) {
+            return Err(ReputationError::ArbiterNotRegistered);
+        }
+        if !appeals::is_valid_verdict(&verdict) {
+            return Err(ReputationError::InvalidAppealVerdict);
+        }
+
+        let mut appeal =
+            appeals::load_appeal(&env, review_id).ok_or(ReputationError::ReviewAppealNotFound)?;
+        if appeal.status != AppealStatus::Pending {
+            return Err(ReputationError::AppealAlreadyResolved);
+        }
+
+        let deadline =
+            appeals::load_deadline(&env, review_id).ok_or(ReputationError::ReviewAppealNotFound)?;
+        if env.ledger().sequence() as u64 > deadline {
+            return Err(ReputationError::AppealWindowExpired);
+        }
+
+        let mut votes = appeals::load_votes(&env, review_id);
+        if votes.iter().any(|v| v.arbiter == arbiter) {
+            return Err(ReputationError::AppealAlreadyVoted);
+        }
+        votes.push_back(AppealVote {
+            arbiter: arbiter.clone(),
+            verdict: verdict.clone(),
+            voted_at: env.ledger().timestamp(),
+        });
+        appeals::store_votes(&env, review_id, &votes);
+
+        let approvals = votes
+            .iter()
+            .filter(|v| v.verdict == appeals::approve_verdict())
+            .count() as u32;
+        let rejections = votes
+            .iter()
+            .filter(|v| v.verdict == appeals::deny_verdict())
+            .count() as u32;
+
+        if approvals >= config.quorum {
+            // The appeal is upheld: the review is hidden and the bond goes
+            // back to the merchant.
+            appeal.status = AppealStatus::Approved;
+            appeals::store_appeal(&env, &appeal);
+            appeals::set_hidden(&env, review_id, true);
+
+            let refunded =
+                appeals::escrowed_bond(&env, &appeal.merchant) - appeal.appeal_bond_stroops;
+            appeals::set_escrowed_bond(&env, &appeal.merchant, refunded);
+
+            env.events().publish(
+                (
+                    symbol_short!("reput"),
+                    symbol_short!("ap_ok"),
+                    appeal.merchant.clone(),
+                ),
+                appeal.clone(),
+            );
+        } else if rejections >= config.quorum {
+            // The appeal is rejected: the bond is forfeited to the charity.
+            appeal.status = AppealStatus::Denied;
+            appeals::store_appeal(&env, &appeal);
+
+            let forfeited =
+                appeals::escrowed_bond(&env, &appeal.merchant) - appeal.appeal_bond_stroops;
+            appeals::set_escrowed_bond(&env, &appeal.merchant, forfeited);
+            appeals::credit_charity(&env, &config.charity, appeal.appeal_bond_stroops);
+
+            env.events().publish(
+                (
+                    symbol_short!("reput"),
+                    symbol_short!("ap_no"),
+                    appeal.merchant.clone(),
+                ),
+                appeal.clone(),
+            );
+        }
+
+        Ok(appeals::outcome(&env, appeal, &votes))
+    }
+
+    /// Dismisses an appeal whose voting window closed without a quorum and
+    /// returns the bond to the merchant. Permissionless: anybody may clean
+    /// up an expired appeal.
+    pub fn expire_appeal(
+        env: Env,
+        caller: Address,
+        review_id: u64,
+    ) -> Result<AppealOutcome, ReputationError> {
+        caller.require_auth();
+
+        let mut appeal =
+            appeals::load_appeal(&env, review_id).ok_or(ReputationError::ReviewAppealNotFound)?;
+        if appeal.status != AppealStatus::Pending {
+            return Err(ReputationError::AppealAlreadyResolved);
+        }
+
+        let deadline =
+            appeals::load_deadline(&env, review_id).ok_or(ReputationError::ReviewAppealNotFound)?;
+        if env.ledger().sequence() as u64 <= deadline {
+            return Err(ReputationError::AppealWindowNotExpired);
+        }
+
+        appeal.status = AppealStatus::Expired;
+        appeals::store_appeal(&env, &appeal);
+
+        let refunded = appeals::escrowed_bond(&env, &appeal.merchant) - appeal.appeal_bond_stroops;
+        appeals::set_escrowed_bond(&env, &appeal.merchant, refunded);
+
+        env.events().publish(
+            (
+                symbol_short!("reput"),
+                symbol_short!("ap_exp"),
+                appeal.merchant.clone(),
+            ),
+            appeal.clone(),
+        );
+
+        let votes = appeals::load_votes(&env, review_id);
+        Ok(appeals::outcome(&env, appeal, &votes))
+    }
+
+    /// Withdraws a pending appeal and returns the bond to the merchant. Only
+    /// the merchant that filed the appeal may withdraw it.
+    pub fn withdraw_appeal(
+        env: Env,
+        caller: Address,
+        review_id: u64,
+    ) -> Result<AppealOutcome, ReputationError> {
+        caller.require_auth();
+
+        let mut appeal =
+            appeals::load_appeal(&env, review_id).ok_or(ReputationError::ReviewAppealNotFound)?;
+        if appeal.status != AppealStatus::Pending {
+            return Err(ReputationError::AppealAlreadyResolved);
+        }
+        if appeal.merchant != caller {
+            return Err(ReputationError::NotAppealParty);
+        }
+
+        appeal.status = AppealStatus::Withdrawn;
+        appeals::store_appeal(&env, &appeal);
+
+        let refunded = appeals::escrowed_bond(&env, &appeal.merchant) - appeal.appeal_bond_stroops;
+        appeals::set_escrowed_bond(&env, &appeal.merchant, refunded);
+
+        env.events().publish(
+            (
+                symbol_short!("reput"),
+                symbol_short!("ap_wdrw"),
+                appeal.merchant.clone(),
+            ),
+            appeal.clone(),
+        );
+
+        let votes = appeals::load_votes(&env, review_id);
+        Ok(appeals::outcome(&env, appeal, &votes))
+    }
+
+    /// Returns the appeal filed for `review_id`, if any.
+    pub fn get_appeal(env: Env, review_id: u64) -> Option<ReviewAppeal> {
+        appeals::load_appeal(&env, review_id)
+    }
+
+    /// Returns the arbiter votes cast on `review_id`.
+    pub fn get_appeal_votes(env: Env, review_id: u64) -> Vec<AppealVote> {
+        appeals::load_votes(&env, review_id)
+    }
+
+    /// Returns the appeal together with the votes cast on it, if any.
+    pub fn get_appeal_outcome(env: Env, review_id: u64) -> Option<AppealOutcome> {
+        let appeal = appeals::load_appeal(&env, review_id)?;
+        let votes = appeals::load_votes(&env, review_id);
+        Some(appeals::outcome(&env, appeal, &votes))
+    }
+
+    /// Returns `true` when the review `review_id` is hidden, i.e. an appeal
+    /// against it was upheld.
+    pub fn is_review_hidden(env: Env, review_id: u64) -> bool {
+        appeals::is_hidden(&env, review_id)
+    }
+
+    /// Returns the appeal bond currently escrowed for `merchant`, in stroops.
+    pub fn get_escrowed_appeal_bond(env: Env, merchant: Address) -> i128 {
+        appeals::escrowed_bond(&env, &merchant)
+    }
+
+    /// Returns the bond forfeited to `charity` so far, in stroops.
+    pub fn get_charity_balance(env: Env, charity: Address) -> i128 {
+        appeals::charity_balance(&env, &charity)
+    }
+
+    /// Returns the review commitment filed under `review_id`, if any.
+    pub fn get_review_commitment(env: Env, review_id: u64) -> Option<ReviewCommitment> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReviewCommitment(review_id))
+    }
+
+    /// Returns the ids of the merchant's reviews that are still visible,
+    /// i.e. every review commitment that was not hidden by an upheld appeal.
+    pub fn get_visible_review_ids(env: Env, merchant: Address) -> Vec<u64> {
+        let review_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantReviewCommitments(merchant.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut visible = Vec::new(&env);
+        for review_id in review_ids.iter() {
+            if !appeals::is_hidden(&env, review_id) {
+                visible.push_back(review_id);
+            }
+        }
+        visible
     }
 
     /// Get all fraud reports targeting an entity.

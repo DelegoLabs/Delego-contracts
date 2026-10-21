@@ -197,6 +197,17 @@ will reject the change.
   the `exp(-t)` Taylor expansion now uses 10 terms in Q32.32 instead of 5. The
   5-term series overshot at the half-life boundaries (a score of 4_998 grew to
   5_000 after one half-life), and the helper is now monotone on every input.
+- Add the merchant review appeal mechanism with a collateralized bond (issue #583). A merchant
+  whose reputation is damaged by a demonstrably false review can challenge that review by staking
+  a bond: `file_appeal` escrows the configured bond for the whole voting window, registered
+  arbiters then cast `approve`/`deny` verdicts through `vote_appeal`, and a quorum of approvals
+  hides the review and returns the bond while a quorum of rejections forfeits it to the platform
+  charity. An appeal whose window closes without a quorum can be dismissed with `expire_appeal`
+  (bond returned) or withdrawn by the merchant with `withdraw_appeal`. Adds the admin-only
+  `configure_appeals`, `register_arbiter` and `deregister_arbiter` entry points, the
+  `get_appeal`, `get_appeal_votes`, `get_appeal_outcome`, `is_review_hidden`,
+  `get_visible_review_ids`, `get_escrowed_appeal_bond` and `get_charity_balance` views, and the
+  new `AppealConfig`, `ReviewAppeal`, `AppealVote`, `AppealOutcome` and `AppealStatus` types.
 
 ### 0.0.1 - 2026-08-29
 
