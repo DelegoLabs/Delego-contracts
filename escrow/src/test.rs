@@ -5111,4 +5111,166 @@ mod schema_and_milestone_tests {
             "two partial releases: expected {expected_total} total, got {total_received}"
         );
     }
+
+    // ================================================================
+    // cancel_mutual tests (issue #487)
+    // ================================================================
+
+    /// Helper: create + fund an escrow and return (escrow_id, buyer, seller,
+    /// token address, token admin address).
+    fn setup_funded_escrow(
+        env: &Env,
+        client: &EscrowContractClient,
+        admin: &Address,
+    ) -> (u64, Address, Address, Address, Address) {
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let token_admin = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(admin, &token);
+        let order_id = BytesN::from_array(env, &[42u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &100u32, &None, &None,
+        );
+        (escrow_id, buyer, seller, token, token_admin)
+    }
+
+    /// Happy path: buyer + merchant cancel a funded escrow; full deposit goes
+    /// back to buyer, status becomes CancelledByMutualConsent.
+    #[test]
+    fn test_cancel_mutual_happy_path() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let (escrow_id, buyer, seller, token, _) = setup_funded_escrow(&env, &client, &admin);
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let buyer_balance_before = token_client.balance(&buyer);
+
+        let reason = symbol_short!("no_stock");
+        let result = client.cancel_mutual(&escrow_id, &buyer, &seller, &reason);
+        assert!(result);
+
+        // Full refund received by buyer (no platform fee).
+        let buyer_balance_after = token_client.balance(&buyer);
+        assert_eq!(buyer_balance_after - buyer_balance_before, 1_000i128);
+
+        // Status is CancelledByMutualConsent.
+        let record = client.get_escrow(&escrow_id);
+        assert_eq!(
+            record.status,
+            crate::EscrowStatus::CancelledByMutualConsent
+        );
+    }
+
+    /// Cancellation fails when a shipment proof has already been recorded.
+    #[test]
+    fn test_cancel_mutual_after_shipped_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let (escrow_id, buyer, seller, _token, _) = setup_funded_escrow(&env, &client, &admin);
+
+        // Advance the ledger timestamp so shipped_at is valid.
+        env.ledger().with_mut(|l| l.timestamp = 100);
+
+        // Record a shipment proof.
+        let tracking = BytesN::from_array(&env, &[1u8; 32]);
+        client.record_shipment_proof(
+            &escrow_id,
+            &seller,
+            &symbol_short!("dhl"),
+            &tracking,
+            &100u64,
+        );
+
+        let reason = symbol_short!("changed");
+        let result = client.try_cancel_mutual(&escrow_id, &buyer, &seller, &reason);
+        assert_eq!(result, Err(Ok(EscrowError::AlreadyShipped)));
+    }
+
+    /// Cancellation fails when the escrow is already in a terminal state.
+    #[test]
+    fn test_cancel_mutual_already_cancelled_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let (escrow_id, buyer, seller, _token, _) = setup_funded_escrow(&env, &client, &admin);
+
+        let reason = symbol_short!("no_stock");
+        // First cancellation succeeds.
+        client.cancel_mutual(&escrow_id, &buyer, &seller, &reason);
+
+        // Second attempt must be rejected.
+        let result = client.try_cancel_mutual(&escrow_id, &buyer, &seller, &reason);
+        assert_eq!(result, Err(Ok(EscrowError::AlreadyCancelled)));
+    }
+
+    /// Cancellation fails when the escrow is disputed.
+    #[test]
+    fn test_cancel_mutual_when_disputed_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let (escrow_id, buyer, seller, _token, _) = setup_funded_escrow(&env, &client, &admin);
+
+        // Put the escrow into Disputed state.
+        client.dispute(&escrow_id, &buyer);
+
+        let reason = symbol_short!("oops");
+        let result = client.try_cancel_mutual(&escrow_id, &buyer, &seller, &reason);
+        assert_eq!(result, Err(Ok(EscrowError::InvalidStatus)));
+    }
+
+    /// Cancellation fails when called with a wrong buyer address.
+    #[test]
+    fn test_cancel_mutual_wrong_buyer_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let (escrow_id, _buyer, seller, _token, _) = setup_funded_escrow(&env, &client, &admin);
+
+        let impostor = Address::generate(&env);
+        let reason = symbol_short!("oops");
+        let result = client.try_cancel_mutual(&escrow_id, &impostor, &seller, &reason);
+        assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
+    }
+
+    /// Cancellation fails when called with a wrong merchant address.
+    #[test]
+    fn test_cancel_mutual_wrong_merchant_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let (escrow_id, buyer, _seller, _token, _) = setup_funded_escrow(&env, &client, &admin);
+
+        let impostor = Address::generate(&env);
+        let reason = symbol_short!("oops");
+        let result = client.try_cancel_mutual(&escrow_id, &buyer, &impostor, &reason);
+        assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
+    }
+
+    /// Cancellation fails when the escrow does not exist.
+    #[test]
+    fn test_cancel_mutual_not_found_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let reason = symbol_short!("nope");
+        let result = client.try_cancel_mutual(&99u64, &buyer, &seller, &reason);
+        assert_eq!(result, Err(Ok(EscrowError::NotFound)));
+    }
 }
