@@ -504,6 +504,34 @@ pub struct TimeoutExtensionVoucher {
     pub seller_signature: BytesN<64>,
 }
 
+/// Off-chain EIP-712 / SEP-style authorization envelope for a gasless
+/// escrow release submitted by a relayer on the buyer's behalf.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DelegatedReleaseAuth {
+    /// Escrow / order identifier to release.
+    pub order_id: u64,
+    /// Buyer who authorized the release.
+    pub buyer_address: Address,
+    /// Relayer submitting the transaction.
+    pub relayer_address: Address,
+    /// Single-use nonce; must match the buyer's next expected nonce.
+    pub nonce: u64,
+    /// Unix timestamp after which this authorization is invalid.
+    pub valid_until: u64,
+    /// Ed25519 signature over `(order_id, nonce, valid_until)`.
+    pub signature: BytesN<64>,
+}
+
+/// Canonical signed payload for [`DelegatedReleaseAuth`].
+#[contracttype]
+#[derive(Clone, Debug)]
+struct DelegatedReleasePayload {
+    order_id: u64,
+    nonce: u64,
+    valid_until: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SignedDeliveryPayload {
@@ -662,6 +690,8 @@ pub struct CrossCurrencySwapReleasedEvent {
     pub payout_amount: i128,
     /// Address that triggered the release.
     pub released_by: Address,
+}
+
 /// Maximum number of milestones a single milestone escrow may carry. Keeps
 /// schedule validation and storage bounded.
 pub const MAX_MILESTONES: u32 = 20;
@@ -966,6 +996,8 @@ pub struct SubItemResolvedEvent {
     pub remaining: i128,
     /// Admin that resolved the item.
     pub resolved_by: Address,
+}
+
 /// k-of-n oracle consensus configuration for an escrow (issue #352).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1219,6 +1251,8 @@ pub struct TokenAllowlistUpdatedEvent {
     pub token: Address,
     /// `true` when the token was added to the allowlist, `false` when removed.
     pub allowed: bool,
+}
+
 /// Emitted when an escrow is rescued via emergency intervention due to a broken external token contract.
 /// This event indicates that governance has recovered stranded funds through the timelock-protected
 /// emergency rescue mechanism.
@@ -1912,35 +1946,18 @@ pub enum DataKey {
     /// Minimum release fee floor, in the token's smallest unit, configurable by
     /// the admin (issue #362).
     MinFeeStroops,
-}
-
-// `export = false` suppresses the generated `contractspecv0` entry for this
-// enum only. The Soroban XDR spec caps `ScSpecUdtErrorEnumV0.cases` at 50
-// entries, and this enum carries more variants than that (the codes are frozen
-// and cannot be pruned to fit). Dropping the spec entry keeps the crate
-// compiling and leaves the runtime ABI untouched: every variant still converts
-// to and from `soroban_sdk::Error` through the `TryFrom`/`From` impls generated
-// below, with the same numeric codes. The registry table in this attribute is
-// the authoritative error catalogue for tooling.
-#[contracterror(export = false)]
-    /// Published delivery Merkle root for a UTC epoch day.
-    MerkleRoot(u64),
-}
-
-    /// Published delivery Merkle root for a UTC epoch day.
-    MerkleRoot(u64),
     /// Registered line items of a multi-item escrow (issue #363).
     SubOrderItems(u64),
     /// Persisted resolution record for a single line item (issue #363).
     SubItemResolution(u64, Symbol),
-}
-
-    /// Published delivery Merkle root for a UTC epoch day.
-    MerkleRoot(u64),
     /// Multi-oracle consensus configuration for an escrow (issue #352).
     MultiOracleConfig(u64),
     /// Recorded oracle attestations for an escrow (issue #352).
     EscrowOracleVotes(u64),
+    /// Next expected nonce for a buyer's relayed release authorization.
+    BuyerReleaseNonce(Address),
+    /// Ed25519 public key registered by a buyer for relayed release signatures.
+    BuyerReleaseKey(Address),
 }
 
 // NOTE: `EscrowError` intentionally does not use the `#[contracterror]` derive.
@@ -1948,11 +1965,6 @@ pub enum DataKey {
 // (`VecM<ScSpecUdtErrorEnumCaseV0, 50>`), but this ABI carries more than that.
 // The equivalent conversions are implemented by hand below (without emitting
 // the on-chain spec entry) so every historic code stays representable.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
-    /// Daily delivery Merkle tree root for batch delivery verification.
-    MerkleRoot(u64),
-}
 
 // Canonical ABI numbering for `EscrowError`.
 //
@@ -2359,6 +2371,13 @@ pub enum EscrowError {
     CourierPubkeyNotSet = 461,
     /// Tranche escrows must be paid out through `unlock_tranche`.
     TrancheReleaseRequired = 462,
+    InvalidTtlExtension = 456,
+    /// Relayed release authorization nonce was already consumed.
+    NonceAlreadyUsed = 480,
+    /// Relayed release authorization has expired.
+    AuthorizationExpired = 481,
+    /// Buyer has not registered a release signing key.
+    BuyerReleaseKeyNotSet = 482,
 }
 
 /// Runs `f` under a re-entrancy lock and returns its result unchanged.
@@ -2394,22 +2413,6 @@ where
     // re-usable by the next call.
     storage.remove(&DataKey::ReentrancyGuard);
     result
-    /// An unexecuted upgrade proposal is already pending
-    UpgradeProposalExists = 411,
-    /// No pending upgrade proposal exists
-    UpgradeProposalNotFound = 412,
-    /// The upgrade timelock has not elapsed yet
-    UpgradeTimelockActive = 413,
-    /// The supplied wasm hash does not match the pending proposal
-    UpgradeHashMismatch = 414,
-    /// Checked arithmetic overflowed while updating escrow disbursements
-    MathOverflow = 415,
-    /// Cumulative releases and refunds would exceed the escrowed principal
-    ExceedsTotalEscrowAmount = 416,
-    /// Seller merchant category is not in the authorized category list
-    MerchantCategoryNotAllowed = 417,
-    /// A sub-order line item has already been resolved
-    SubItemAlreadyResolved = 418,
 }
 
 /// Manual, spec-free equivalent of the impls generated by `#[contracterror]`.
@@ -2526,6 +2529,10 @@ impl_escrow_error_try_from! {
     460 => InvalidTrancheProof,
     461 => CourierPubkeyNotSet,
     462 => TrancheReleaseRequired,
+    456 => InvalidTtlExtension,
+    480 => NonceAlreadyUsed,
+    481 => AuthorizationExpired,
+    482 => BuyerReleaseKeyNotSet,
 }
 
 impl TryFrom<&soroban_sdk::Error> for EscrowError {
@@ -2589,16 +2596,6 @@ impl soroban_sdk::TryFromVal<soroban_sdk::Env, EscrowError> for soroban_sdk::Val
         let error: soroban_sdk::Error = val.into();
         Ok(error.into())
     }
-    /// Emergency rescue proposal not found for the given escrow.
-    EmergencyRescueProposalNotFound = 411,
-    /// Emergency rescue timelock period has not yet elapsed.
-    EmergencyRescueTimelockNotElapsed = 412,
-    /// Multi-sig approval threshold not reached for emergency rescue.
-    EmergencyRescueThresholdNotMet = 413,
-    /// Emergency rescue has already been executed for this escrow.
-    EmergencyRescueAlreadyExecuted = 414,
-    /// Escrow is not eligible for emergency rescue (must be in Funded or Disputed status).
-    EscrowNotEligibleForRescue = 415,
 }
 
 /// Errors returned by the multi-oracle consensus path (issue #352).
@@ -3252,6 +3249,8 @@ fn update_merchant_volume_and_tier(env: &Env, merchant: &Address, amount: i128) 
             );
         }
     }
+}
+
 /// Verify the actual net token delta received by the contract after a deposit
 /// transfer.
 ///
@@ -7792,6 +7791,100 @@ impl EscrowContract {
 
         let remaining = record.amount - record.released_amount - record.refunded_amount;
         Self::partial_release_internal(env.clone(), escrow_id, caller, remaining)?;
+        Self::exit_release(&env);
+        Ok(true)
+    }
+
+    /// Register the Ed25519 public key used to verify [`DelegatedReleaseAuth`]
+    /// signatures for gasless / relayed releases. Must be authorized by `buyer`.
+    pub fn set_buyer_release_key(
+        env: Env,
+        buyer: Address,
+        public_key: BytesN<32>,
+    ) -> Result<bool, EscrowError> {
+        buyer.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::BuyerReleaseKey(buyer), &public_key);
+        Ok(true)
+    }
+
+    /// Returns the next nonce a relayed release for `buyer` must use.
+    pub fn get_buyer_release_nonce(env: Env, buyer: Address) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::BuyerReleaseNonce(buyer))
+            .unwrap_or(0)
+    }
+
+    /// Release escrowed funds to the merchant using a buyer-signed,
+    /// nonce-guarded authorization envelope submitted by a relayer.
+    ///
+    /// The buyer signs `(order_id, nonce, valid_until)` off-chain with the key
+    /// registered via [`Self::set_buyer_release_key`]. The relayer submits the
+    /// envelope on-chain; the nonce is stored and incremented in instance
+    /// storage so a replay with the same nonce fails with
+    /// [`EscrowError::NonceAlreadyUsed`].
+    pub fn relayed_release(env: Env, auth: DelegatedReleaseAuth) -> Result<bool, EscrowError> {
+        use soroban_sdk::xdr::ToXdr;
+
+        auth.relayer_address.require_auth();
+
+        if env.ledger().timestamp() > auth.valid_until {
+            return Err(EscrowError::AuthorizationExpired);
+        }
+
+        let escrow_id = auth.order_id;
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        if auth.buyer_address != record.buyer {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        let nonce_key = DataKey::BuyerReleaseNonce(auth.buyer_address.clone());
+        let expected_nonce: u64 = env.storage().instance().get(&nonce_key).unwrap_or(0);
+        if auth.nonce != expected_nonce {
+            return Err(EscrowError::NonceAlreadyUsed);
+        }
+
+        let public_key: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::BuyerReleaseKey(auth.buyer_address.clone()))
+            .ok_or(EscrowError::BuyerReleaseKeyNotSet)?;
+
+        let payload = DelegatedReleasePayload {
+            order_id: auth.order_id,
+            nonce: auth.nonce,
+            valid_until: auth.valid_until,
+        }
+        .to_xdr(&env);
+        env.crypto()
+            .ed25519_verify(&public_key, &payload, &auth.signature);
+
+        // Advance the nonce before disbursement so a replay in the same ledger
+        // cannot reuse the authorization even if settlement panics later.
+        let next_nonce = auth
+            .nonce
+            .checked_add(1)
+            .ok_or(EscrowError::NonceAlreadyUsed)?;
+        env.storage().instance().set(&nonce_key, &next_nonce);
+
+        Self::enter_release(&env)?;
+        Self::validate_seller_category(&env, &record.seller)?;
+        let remaining = record.amount - record.released_amount - record.refunded_amount;
+        // Disburse as the buyer so existing release authorization rules apply.
+        Self::partial_release_internal(
+            env.clone(),
+            escrow_id,
+            auth.buyer_address,
+            remaining,
+        )?;
         Self::exit_release(&env);
         Ok(true)
     }
