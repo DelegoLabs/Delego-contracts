@@ -14297,6 +14297,10 @@ mod integration_tests;
 #[cfg(all(test, feature = "full_suite"))]
 mod test;
 
+/// Unit-test sub-modules for the escrow contract (issue #536).
+#[cfg(test)]
+mod tests;
+
 #[cfg(test)]
 mod dual_control_timeout_tests {
     use super::*;

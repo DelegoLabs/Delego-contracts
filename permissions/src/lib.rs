@@ -6976,6 +6976,10 @@ mod integration_tests;
 mod quorum_migration_tests;
 #[cfg(test)]
 mod test;
+/// Overflow-arithmetic tests — verifies `overflow-checks = true` is active and
+/// that balance/fee helpers abort or return errors on overflow inputs (issue #536).
+#[cfg(test)]
+mod overflow_arithmetic;
 
 #[cfg(test)]
 mod absent_key_tests {
