@@ -18,4 +18,5 @@ delego-reputation = { path = "../reputation", features = ["testutils"] }
 testutils = ["soroban-sdk/testutils"]
 # Enables the legacy test suite (test.rs) which has pre-existing compile failures
 # from bad merges. Gate it so normal `cargo test` only runs the healthy inline tests.
+# Gate the legacy test.rs (has pre-existing compile failures from bad merges).
 full_suite = []

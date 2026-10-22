@@ -609,6 +609,22 @@ pub enum ReputationError {
     /// Probation orders requirement not yet met for graduation.
     ProbationNotComplete = 3028,
     /// Invalid collateral amount (must be positive).
+    DuplicateReviewCommitment = 3021,
+    /// Caller is not the buyer for this escrow.
+    NotBuyer = 3022,
+    /// Escrow is not in settled state.
+    EscrowNotSettled = 3023,
+    /// Quorum threshold not reached for dispute verdict.
+    QuorumNotReached = 3024,
+    /// Invalid dispute verdict symbol.
+    InvalidVerdictSymbol = 3025,
+    /// Merchant is not eligible for rehabilitation.
+    NotEligibleForRehabilitation = 3026,
+    /// Rehabilitation program not found for merchant.
+    RehabilitationNotFound = 3027,
+    /// Probation orders requirement not yet met for graduation.
+    ProbationNotComplete = 3028,
+    /// Invalid collateral amount (must be positive).
     InvalidCollateralAmount = 3029,
     /// Blinded review verification failed.
     BlindedReviewVerificationFailed = 3022,
@@ -665,6 +681,9 @@ pub enum ReputationError {
     /// The review appeal voting window is still open, so the appeal cannot be
     /// expired yet.
     AppealWindowNotExpired = 3040,
+    InvalidReportStatus = 3020,
+    /// A carrier proof was submitted by an oracle that is not registered.
+    CarrierOracleNotAuthorized = 3030,
 }
 
 #[cfg(test)]

@@ -376,6 +376,8 @@ pub enum MarketplaceError {
     ReserveLocked = 4047,
     /// The requested SKU quantity exceeds available stock.
     OutOfStock = 4049,
+    /// Batch exceeds the maximum allowed listing count.
+    BatchTooLarge = 4048,
 }
 
 // ---------------------------------------------------------------------------
@@ -847,6 +849,9 @@ pub enum DataKey {
     /// Collateral bond balance for a merchant (used in operational view).
     MerchantBond(u64),
     /// Number of disputes recorded against a merchant.
+    /// Collateral bond balance for a merchant (operational view).
+    MerchantBond(u64),
+    /// Dispute count recorded against a merchant.
     MerchantDisputeCount(u64),
     /// Treasury split routing configuration (instance storage).
     TreasurySplit,
@@ -858,6 +863,12 @@ pub enum DataKey {
     MerchantCatalogSkuList(u64),
     /// Authorized escrow contract address allowed to decrement SKU stock.
     AuthorizedEscrow,
+    /// Authorized escrow contract address allowed to decrement SKU stock.
+    AuthorizedEscrow,
+    /// Bulk listing catalog record: (merchant_id, sku_id) → ListingRecord.
+    ListingRecord(u64, Symbol),
+    /// Ordered list of all catalog listing SKU IDs for a merchant.
+    MerchantListingSkuList(u64),
 }
 
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.
@@ -1003,6 +1014,12 @@ pub const RESERVE_BPS: u32 = 1000;
 
 /// Number of ledgers the liquidation reserve is locked before the merchant can withdraw.
 /// ~24 hours at 5 s/ledger.
+pub const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_000; // 100 XLM
+
+/// Fraction of a high-value settlement held as a liquidation reserve, in basis points.
+pub const RESERVE_BPS: u32 = 1000; // 10%
+
+/// Ledger lock period for a liquidation reserve (~24 h at 5 s/ledger).
 pub const RESERVE_LOCK_LEDGERS: u32 = 17_280;
 
 // Largest of the caps above; used to size the stack buffer that string
@@ -5231,6 +5248,41 @@ impl MarketplaceContract {
     /// Return all SKU IDs in the catalog for `merchant_id`.
     pub fn get_merchant_catalog(env: Env, merchant_id: u64) -> Vec<Symbol> {
         catalog::get_merchant_catalog(env, merchant_id)
+    // Bulk Listing Registration (issue #559) — delegates to catalog module
+    // -----------------------------------------------------------------------
+
+    /// Register up to 20 listings atomically for `merchant`.
+    ///
+    /// Validates every item before committing any write (all-or-nothing).
+    /// Returns the number of listings registered.
+    ///
+    /// # Errors
+    /// * [`MarketplaceError::BatchTooLarge`] — more than 20 items supplied.
+    /// * [`MarketplaceError::MerchantNotFound`] — `merchant` is not registered.
+    /// * [`MarketplaceError::Unauthorized`] — `merchant` is not the owner.
+    /// * [`MarketplaceError::InvalidSku`] — any item has `price ≤ 0`, an
+    ///   empty / oversized `sku_id`, an intra-batch duplicate, or a `sku_id`
+    ///   that is already registered for this merchant.
+    pub fn batch_register_listings(
+        env: Env,
+        merchant: Address,
+        listings: Vec<catalog::ListingParams>,
+    ) -> Result<u32, MarketplaceError> {
+        catalog::batch_register_listings(env, merchant, listings)
+    }
+
+    /// Return the [`catalog::ListingRecord`] for `(merchant_id, sku_id)`.
+    pub fn get_listing(
+        env: Env,
+        merchant_id: u64,
+        sku_id: Symbol,
+    ) -> Result<catalog::ListingRecord, MarketplaceError> {
+        catalog::get_listing(env, merchant_id, sku_id)
+    }
+
+    /// Return all catalog SKU IDs registered for `merchant_id`.
+    pub fn get_merchant_listings(env: Env, merchant_id: u64) -> Vec<Symbol> {
+        catalog::get_merchant_listings(env, merchant_id)
     }
 }
 
@@ -5350,6 +5402,7 @@ mod error_code_uniqueness_tests {
             MarketplaceError::ReserveNotFound as u32,
             MarketplaceError::ReserveLocked as u32,
             MarketplaceError::OutOfStock as u32,
+            MarketplaceError::BatchTooLarge as u32,
         ]
     }
 
