@@ -671,6 +671,8 @@ pub enum DelegationError {
     NotEligibleForBounty = 4020,
     /// The protocol maintenance reserve has insufficient funds to pay the keeper bounty.
     InsufficientMaintenanceReserve = 4021,
+    /// A revoked delegation is terminal and can never be restored by rollback.
+    RevokedCannotBeRestored = 4022,
     /// The session has expired or is not yet valid.
     SessionExpired = 4020,
     /// A supplied parameter is invalid, e.g. a zero `owner` or `permissions_contract` address.
@@ -990,6 +992,12 @@ impl DelegationRegistry {
 
         if record.status != DelegationStatus::Active {
             return Err(DelegationError::NotActive);
+        }
+
+        // A ledger-expired delegation that was never swept is logically dead;
+        // pausing it would let `resume_delegation` revive it later.
+        if env.ledger().sequence() >= record.expires_at_ledger {
+            return Err(DelegationError::Expired);
         }
 
         record.status = DelegationStatus::Paused;
@@ -1407,6 +1415,18 @@ impl DelegationRegistry {
         }
     }
 
+    /// `Revoked` is a permanent terminal state: a rollback must never restore
+    /// a delegation that was revoked, whichever snapshot it targets.
+    fn validate_rollback_security(
+        current: &DelegationRecord,
+        _target_snapshot: &DelegationRecord,
+    ) -> Result<(), DelegationError> {
+        if current.status == DelegationStatus::Revoked {
+            return Err(DelegationError::RevokedCannotBeRestored);
+        }
+        Ok(())
+    }
+
     /// Rolls a delegation back to a previous version.
     pub fn rollback_delegation(
         env: Env,
@@ -1448,6 +1468,8 @@ impl DelegationRegistry {
         if snapshot.record.status == DelegationStatus::Expired {
             return Err(DelegationError::Expired);
         }
+
+        Self::validate_rollback_security(&record, &snapshot.record)?;
 
         record = snapshot.record;
 
@@ -3028,6 +3050,7 @@ mod error_code_uniqueness_tests {
             (DelegationError::NotEligibleForBounty, 4020u32),
             (DelegationError::InsufficientMaintenanceReserve, 4021u32),
             (DelegationError::SessionExpired, 4020u32),
+            (DelegationError::RevokedCannotBeRestored, 4022u32),
         ];
 
         for (variant, expected) in codes {
@@ -3057,6 +3080,7 @@ mod error_code_uniqueness_tests {
             DelegationError::NotEligibleForBounty as u32,
             DelegationError::InsufficientMaintenanceReserve as u32,
             DelegationError::SessionExpired as u32,
+            DelegationError::RevokedCannotBeRestored as u32,
         ];
         seen.sort_unstable();
         for pair in seen.windows(2) {
