@@ -70,6 +70,27 @@ fn relayed_spend_signing_payload(env: &Env, message: &RelayedSpendMessage) -> so
     payload
 }
 
+/// Checks that a session key is still within its absolute timestamp window.
+///
+/// Called on every delegate execution path before any spend is permitted
+/// (issue #566). Using `env.ledger().timestamp()` rather than the ledger
+/// sequence number gives an absolute wall-clock bound that cannot be stretched
+/// by validators choosing to close ledgers slowly.
+///
+/// # Errors
+/// Returns [`PermissionError::SessionExpired`] when
+/// `current_timestamp >= session.expires_at`, i.e. the wall-clock deadline
+/// has been reached or passed.
+pub fn verify_session_active(
+    session: &SessionKeyConfig,
+    current_timestamp: u64,
+) -> Result<(), PermissionError> {
+    if current_timestamp >= session.expires_at {
+        return Err(PermissionError::SessionExpired);
+    }
+    Ok(())
+}
+
 /// Maximum number of merchant addresses allowed in a permission's whitelist.
 /// Prevents overly large merchant lists from increasing storage and execution
 /// costs unexpectedly.
@@ -244,6 +265,10 @@ pub enum PermissionError {
     /// The relayer address has been frozen by an admin; all delegated spends
     /// submitted by this relayer are blocked until the freeze is lifted.
     RelayerFrozen = 2426,
+    /// Session key timestamp expiration has passed (`current_timestamp >= session.expires_at`).
+    /// Distinct from `Expired` (ledger-sequence expiry) so callers can distinguish
+    /// between the two expiration dimensions (issue #566).
+    SessionExpired = 2431,
 }
 
 /// Epoch period for allowance reset logic.
@@ -319,11 +344,12 @@ mod error_code_tests {
         PermissionError::TooManyPendingProposals as u32,
         PermissionError::EphemeralRelayerUnsupported as u32,
         PermissionError::RelayerFrozen as u32,
+        PermissionError::SessionExpired as u32,
     ];
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 39);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 40);
 
         let permission_range = ERROR_CODE_RANGES
             .iter()
@@ -416,6 +442,10 @@ pub struct SessionKeyConfig {
     pub session_key: Address,
     pub max_spend_per_session: i128,
     pub valid_until_ledger: u32,
+    /// Absolute UNIX timestamp (seconds) after which the session is invalid.
+    /// Every authorization checks `env.ledger().timestamp() < expires_at`
+    /// before any spend is permitted (issue #566).
+    pub expires_at: u64,
 }
 
 #[contracttype]
@@ -1536,6 +1566,12 @@ impl PermissionsContract {
         let duration = config.valid_until_ledger - current_ledger;
         if duration > MAX_SESSION_WINDOW_LEDGERS {
             return Err(PermissionError::InvalidParam);
+        }
+
+        // Issue #566: expires_at must be a future timestamp so the session
+        // has a valid absolute wall-clock deadline from the moment it is granted.
+        if config.expires_at <= env.ledger().timestamp() {
+            return Err(PermissionError::SessionExpired);
         }
 
         if let Some(state) = env
@@ -2942,6 +2978,8 @@ impl PermissionsContract {
             if current_ledger > session.config.valid_until_ledger {
                 return Err(PermissionError::Expired);
             }
+            // Issue #566: timestamp-based expiration invariant check.
+            verify_session_active(&session.config, env.ledger().timestamp())?;
             if amount <= 0 {
                 return Err(PermissionError::InvalidParam);
             }
@@ -3561,6 +3599,8 @@ impl PermissionsContract {
         if current_ledger > session.config.valid_until_ledger {
             return Err(PermissionError::Expired);
         }
+        // Issue #566: timestamp-based expiration invariant check.
+        verify_session_active(&session.config, env.ledger().timestamp())?;
         if amount <= 0 {
             return Err(PermissionError::InvalidParam);
         }
@@ -3597,6 +3637,8 @@ impl PermissionsContract {
             if env.ledger().sequence() > session.config.valid_until_ledger {
                 return Err(PermissionError::Expired);
             }
+            // Issue #566: timestamp-based expiration invariant check.
+            verify_session_active(&session.config, env.ledger().timestamp())?;
             return Err(PermissionError::EphemeralRelayerUnsupported);
         }
         Ok(())

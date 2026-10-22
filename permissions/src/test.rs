@@ -2,7 +2,7 @@
 #[allow(clippy::module_inception)]
 mod test {
     use crate::{
-        validate_relayer_fee, DataKey, PermissionError, PermissionRecord,
+        validate_relayer_fee, verify_session_active, DataKey, PermissionError, PermissionRecord,
         PermissionScopeUpdatedEvent, PermissionStatus, PermissionsContract,
         PermissionsContractClient, ScopedPermissionConfig, SessionKeyConfig,
         MAX_ABSOLUTE_RELAYER_STROOPS, MAX_RELAYER_FEE_BPS, MAX_SESSION_WINDOW_LEDGERS,
@@ -38,6 +38,7 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().set_sequence_number(1_000);
+        env.ledger().set_timestamp(10_000);
         let owner = Address::generate(&env);
         let session_key = Address::generate(&env);
         let merchant = Address::generate(&env);
@@ -51,6 +52,7 @@ mod test {
                 session_key: session_key.clone(),
                 max_spend_per_session: 100,
                 valid_until_ledger: 1_720,
+                expires_at: 99_000,
             },
         );
 
@@ -135,6 +137,7 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().set_sequence_number(100);
+        env.ledger().set_timestamp(1_000);
         let owner = Address::generate(&env);
         let session_key = Address::generate(&env);
         let contract_id = env.register(PermissionsContract, ());
@@ -147,6 +150,7 @@ mod test {
                     session_key: session_key.clone(),
                     max_spend_per_session: 1,
                     valid_until_ledger: 99,
+                    expires_at: 99_000,
                 },
             ),
             Err(Ok(PermissionError::Expired))
@@ -158,6 +162,7 @@ mod test {
                     session_key: session_key.clone(),
                     max_spend_per_session: 1,
                     valid_until_ledger: 100 + MAX_SESSION_WINDOW_LEDGERS + 1,
+                    expires_at: 99_000,
                 },
             ),
             Err(Ok(PermissionError::InvalidParam))
@@ -169,9 +174,188 @@ mod test {
                     session_key,
                     max_spend_per_session: 0,
                     valid_until_ledger: 100,
+                    expires_at: 99_000,
                 },
             ),
             Err(Ok(PermissionError::InvalidParam))
+        );
+    }
+
+    // --- Issue #566: Session key timestamp-based expiration invariant ---
+
+    /// `verify_session_active` is a pure function; test it directly without
+    /// standing up a full contract environment.
+    #[test]
+    fn test_verify_session_active_rejects_at_or_past_expiry() {
+        let env = Env::default();
+        let dummy_address = Address::generate(&env);
+
+        let mock_config = |expires_at: u64| SessionKeyConfig {
+            session_key: dummy_address.clone(),
+            max_spend_per_session: 100,
+            valid_until_ledger: 9_999,
+            expires_at,
+        };
+
+        // Exactly at expiry → rejected.
+        assert_eq!(
+            verify_session_active(&mock_config(500), 500),
+            Err(PermissionError::SessionExpired)
+        );
+        // Past expiry → rejected.
+        assert_eq!(
+            verify_session_active(&mock_config(500), 501),
+            Err(PermissionError::SessionExpired)
+        );
+        // One second before expiry → allowed.
+        assert_eq!(verify_session_active(&mock_config(500), 499), Ok(()));
+        // Well before expiry → allowed.
+        assert_eq!(verify_session_active(&mock_config(1_000_000), 0), Ok(()));
+    }
+
+    /// An active session (timestamp before expires_at) executes spends smoothly.
+    #[test]
+    fn test_session_key_active_timestamp_allows_spend() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_sequence_number(500);
+        env.ledger().set_timestamp(1_000);
+
+        let owner = Address::generate(&env);
+        let session_key = Address::generate(&env);
+        let merchant = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        client.grant_ephemeral_session(
+            &owner,
+            &SessionKeyConfig {
+                session_key: session_key.clone(),
+                max_spend_per_session: 200,
+                valid_until_ledger: 1_000,
+                expires_at: 9_000, // well in the future
+            },
+        );
+
+        // can_spend and execute_spend both succeed while timestamp < expires_at.
+        assert_eq!(
+            client.try_can_spend(&owner, &session_key, &50, &merchant),
+            Ok(Ok(()))
+        );
+        client.execute_spend(&owner, &session_key, &50, &merchant);
+        assert_eq!(client.try_can_spend(&owner, &session_key, &50, &merchant), Ok(Ok(())));
+    }
+
+    /// Once the ledger timestamp reaches or passes `expires_at`, every
+    /// authorization path (can_spend, execute_spend, execute_spend_via_relayer)
+    /// must reject with `SessionExpired`.
+    #[test]
+    fn test_session_key_expired_timestamp_rejects_all_paths() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_sequence_number(500);
+        env.ledger().set_timestamp(1_000);
+
+        let owner = Address::generate(&env);
+        let session_key = Address::generate(&env);
+        let merchant = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        client.grant_ephemeral_session(
+            &owner,
+            &SessionKeyConfig {
+                session_key: session_key.clone(),
+                max_spend_per_session: 200,
+                valid_until_ledger: 2_000, // ledger expiry is far away
+                expires_at: 2_000,         // but timestamp expiry is near
+            },
+        );
+
+        // Sanity: session works before expiry.
+        assert_eq!(
+            client.try_can_spend(&owner, &session_key, &10, &merchant),
+            Ok(Ok(()))
+        );
+
+        // Advance timestamp to exactly expires_at → both paths rejected.
+        env.ledger().set_timestamp(2_000);
+
+        assert_eq!(
+            client.try_can_spend(&owner, &session_key, &10, &merchant),
+            Err(Ok(PermissionError::SessionExpired))
+        );
+        assert_eq!(
+            client.try_execute_spend(&owner, &session_key, &10, &merchant),
+            Err(Ok(PermissionError::SessionExpired))
+        );
+
+        // Advance timestamp past expiry → still rejected.
+        env.ledger().set_timestamp(2_001);
+        assert_eq!(
+            client.try_can_spend(&owner, &session_key, &10, &merchant),
+            Err(Ok(PermissionError::SessionExpired))
+        );
+        assert_eq!(
+            client.try_execute_spend(&owner, &session_key, &10, &merchant),
+            Err(Ok(PermissionError::SessionExpired))
+        );
+    }
+
+    /// grant_ephemeral_session must itself reject a config whose `expires_at`
+    /// is already in the past (at or before the current ledger timestamp).
+    #[test]
+    fn test_grant_ephemeral_session_rejects_expired_timestamp() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_sequence_number(500);
+        env.ledger().set_timestamp(5_000);
+
+        let owner = Address::generate(&env);
+        let session_key = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        // expires_at exactly equal to current timestamp → rejected.
+        assert_eq!(
+            client.try_grant_ephemeral_session(
+                &owner,
+                &SessionKeyConfig {
+                    session_key: session_key.clone(),
+                    max_spend_per_session: 100,
+                    valid_until_ledger: 1_000,
+                    expires_at: 5_000,
+                },
+            ),
+            Err(Ok(PermissionError::SessionExpired))
+        );
+
+        // expires_at strictly in the past → rejected.
+        assert_eq!(
+            client.try_grant_ephemeral_session(
+                &owner,
+                &SessionKeyConfig {
+                    session_key: session_key.clone(),
+                    max_spend_per_session: 100,
+                    valid_until_ledger: 1_000,
+                    expires_at: 4_999,
+                },
+            ),
+            Err(Ok(PermissionError::SessionExpired))
+        );
+
+        // expires_at strictly in the future → grant succeeds.
+        assert_eq!(
+            client.try_grant_ephemeral_session(
+                &owner,
+                &SessionKeyConfig {
+                    session_key,
+                    max_spend_per_session: 100,
+                    valid_until_ledger: 1_000,
+                    expires_at: 5_001,
+                },
+            ),
+            Ok(Ok(()))
         );
     }
 
