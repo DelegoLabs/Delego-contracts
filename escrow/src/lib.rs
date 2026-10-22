@@ -66,6 +66,9 @@ pub mod invariants;
 /// Multi-merchant sub-order mapping and independent resolution routing.
 pub mod sub_orders;
 pub use sub_orders::SubOrder;
+/// Strict buyer + merchant + fee = deposit checks for terminal settlements (issue #547).
+pub mod value_conservation;
+pub use value_conservation::assert_value_conservation;
 
 mod admin_actions;
 #[cfg(test)]
@@ -2284,6 +2287,9 @@ pub enum EscrowError {
     TimelockExtensionPendingApproval = 455,
     /// Requested storage TTL extension is outside the supported bounds.
     InvalidTtlExtension = 450,
+    /// Buyer refund + merchant payout + platform fee does not equal the
+    /// deposited escrow principal (issue #547).
+    ValueConservationViolation = 461,
 }
 
 /// Runs `f` under a re-entrancy lock and returns its result unchanged.
@@ -2443,6 +2449,7 @@ impl_escrow_error_try_from! {
     416 => ExceedsTotalEscrowAmount,
     417 => MerchantCategoryNotAllowed,
     418 => SubItemAlreadyResolved,
+    461 => ValueConservationViolation,
 }
 
 impl TryFrom<&soroban_sdk::Error> for EscrowError {
@@ -7070,11 +7077,13 @@ impl EscrowContract {
         let token_client = soroban_sdk::token::Client::new(env, &record.token);
 
         let payout = Self::compute_payout(env, &record.seller, release_amount)?;
+        // Strict conservation of this release slice (issue #547).
+        assert_value_conservation(release_amount, 0, payout.seller_net, payout.fee)?;
         Self::distribute_fee(env, &token_client, payout.fee)?;
         token_client.transfer(
             &env.current_contract_address(),
             &record.seller,
-            &seller_net,
+            &payout.seller_net,
         );
 
         record.released_amount += total_drawn;
@@ -7557,6 +7566,8 @@ impl EscrowContract {
         // Defence in depth: cumulative releases and refunds must never exceed
         // the escrowed principal.
         Self::assert_value_conservation_invariant(&record, 0, refund_amount)?;
+        // Strict conservation of this refund slice (issue #547).
+        assert_value_conservation(refund_amount, refund_amount, 0, 0)?;
 
         blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);

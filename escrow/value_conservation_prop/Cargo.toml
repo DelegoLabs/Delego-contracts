@@ -1,0 +1,12 @@
+[package]
+name = "value-conservation-prop"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+# Standalone property-test harness for issue #547. Kept separate from
+# `delego-escrow` so the 10_000-iteration proptest suite can run even when
+# unrelated merge damage on `main` prevents the full escrow crate from building.
+
+[dev-dependencies]
+proptest = "1.11.0"

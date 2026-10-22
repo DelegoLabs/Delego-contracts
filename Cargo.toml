@@ -2,6 +2,7 @@
 members = [
     "delegation_registry",
     "escrow",
+    "escrow/value_conservation_prop",
     "interfaces",
     "permissions",
     "reputation",
