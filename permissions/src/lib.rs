@@ -26,6 +26,7 @@
 #![cfg_attr(not(test), no_std)]
 #![allow(clippy::too_many_arguments)]
 #![warn(missing_docs)]
+mod recovery;
 mod recurring_quota;
 mod crypto;
 pub use recurring_quota::RecurringQuotaConfig;
