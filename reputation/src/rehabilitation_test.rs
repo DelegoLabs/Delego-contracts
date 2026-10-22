@@ -1,15 +1,24 @@
 #![cfg(test)]
 
 use crate::*;
-use soroban_sdk::{testutils::Address as TestAddress, Env, Symbol};
+use soroban_sdk::{testutils::Address as _, Address, Env};
+
+fn setup(
+    env: &Env,
+    admin: &Address,
+    config: ReputationConfig,
+) -> ReputationContractClient<'static> {
+    let contract_id = env.register(ReputationContract, (admin.clone(), config));
+    ReputationContractClient::new(env, &contract_id)
+}
 
 #[test]
 fn test_enter_rehabilitation_success() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin = TestAddress::random(&env);
-    let merchant = TestAddress::random(&env);
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
 
     let config = ReputationConfig {
         decay_window_seconds: 2_592_000,
@@ -18,15 +27,14 @@ fn test_enter_rehabilitation_success() {
         freeze_threshold_flags: 3,
     };
 
-    ReputationContract::__constructor(&env, admin.clone(), config).unwrap();
+    let client = setup(&env, &admin, config);
 
     // Freeze the merchant first
-    ReputationContract::freeze_entity(&env, admin.clone(), merchant.clone()).unwrap();
+    client.freeze_entity(&admin, &merchant);
 
     // Enter rehabilitation with collateral
     let collateral = 500_000_000i128; // 50 USDC in stroops
-    let program = ReputationContract::enter_rehabilitation(&env, merchant.clone(), collateral)
-        .expect("Should enter rehabilitation");
+    let program = client.enter_rehabilitation(&merchant, &collateral);
 
     assert_eq!(program.merchant, merchant);
     assert_eq!(program.collateral_staked_stroops, collateral);
@@ -40,8 +48,8 @@ fn test_enter_rehabilitation_not_eligible() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin = TestAddress::random(&env);
-    let merchant = TestAddress::random(&env);
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
 
     let config = ReputationConfig {
         decay_window_seconds: 2_592_000,
@@ -50,14 +58,14 @@ fn test_enter_rehabilitation_not_eligible() {
         freeze_threshold_flags: 3,
     };
 
-    ReputationContract::__constructor(&env, admin.clone(), config).unwrap();
+    let client = setup(&env, &admin, config);
 
     // Merchant is not frozen and has no penalties, should not be eligible
-    let result = ReputationContract::enter_rehabilitation(&env, merchant.clone(), 500_000_000);
-    assert!(matches!(
+    let result = client.try_enter_rehabilitation(&merchant, &500_000_000);
+    assert_eq!(
         result,
-        Err(ReputationError::NotEligibleForRehabilitation)
-    ));
+        Err(Ok(ReputationError::NotEligibleForRehabilitation))
+    );
 }
 
 #[test]
@@ -65,8 +73,8 @@ fn test_complete_probation_orders() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin = TestAddress::random(&env);
-    let merchant = TestAddress::random(&env);
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
 
     let config = ReputationConfig {
         decay_window_seconds: 2_592_000,
@@ -75,24 +83,32 @@ fn test_complete_probation_orders() {
         freeze_threshold_flags: 3,
     };
 
-    ReputationContract::__constructor(&env, admin.clone(), config).unwrap();
+    let client = setup(&env, &admin, config);
 
     // Freeze and enter rehabilitation
-    ReputationContract::freeze_entity(&env, admin.clone(), merchant.clone()).unwrap();
+    client.freeze_entity(&admin, &merchant);
     let collateral = 500_000_000i128;
-    ReputationContract::enter_rehabilitation(&env, merchant.clone(), collateral).unwrap();
+    client.enter_rehabilitation(&merchant, &collateral);
 
     // Complete probation orders
     for i in 0..5 {
-        let program = ReputationContract::complete_probation_order(&env, merchant.clone())
-            .expect(&format!("Should complete order {}", i + 1));
+        let program = client.complete_probation_order(&merchant);
         assert_eq!(program.probation_orders_completed, (i + 1) as u32);
     }
 
-    // Check reputation improved
-    let rep = ReputationContract::get_reputation(&env, merchant.clone())
-        .expect("Should get reputation");
-    assert!(rep.score > 0, "Score should improve with completed orders");
+    // Check reputation improved. The public score stays masked until the
+    // entity passes the transaction threshold, so the restored score is read
+    // from the persisted reputation record.
+    let stored = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get::<_, ReputationScore>(&DataKey::Reputation(merchant.clone()))
+    });
+    let stored = stored.expect("Should have a reputation record");
+    assert!(
+        stored.score > 0,
+        "Score should improve with completed orders"
+    );
 }
 
 #[test]
@@ -100,8 +116,8 @@ fn test_graduate_rehabilitation() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin = TestAddress::random(&env);
-    let merchant = TestAddress::random(&env);
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
 
     let config = ReputationConfig {
         decay_window_seconds: 2_592_000,
@@ -110,24 +126,23 @@ fn test_graduate_rehabilitation() {
         freeze_threshold_flags: 3,
     };
 
-    ReputationContract::__constructor(&env, admin.clone(), config).unwrap();
+    let client = setup(&env, &admin, config);
 
     // Setup and enter rehabilitation
-    ReputationContract::freeze_entity(&env, admin.clone(), merchant.clone()).unwrap();
+    client.freeze_entity(&admin, &merchant);
     let collateral = 500_000_000i128;
-    ReputationContract::enter_rehabilitation(&env, merchant.clone(), collateral).unwrap();
+    client.enter_rehabilitation(&merchant, &collateral);
 
     // Complete all required orders
     for _ in 0..10 {
-        ReputationContract::complete_probation_order(&env, merchant.clone()).unwrap();
+        client.complete_probation_order(&merchant);
     }
 
     // Graduate
-    let returned_collateral = ReputationContract::graduate_rehabilitation(&env, merchant.clone())
-        .expect("Should graduate");
+    let returned_collateral = client.graduate_rehabilitation(&merchant);
     assert_eq!(returned_collateral, collateral);
 
     // Verify merchant is unfrozen
-    let is_frozen = ReputationContract::is_frozen(env, merchant);
+    let is_frozen = client.is_frozen(&merchant);
     assert!(!is_frozen, "Merchant should be unfrozen after graduation");
 }

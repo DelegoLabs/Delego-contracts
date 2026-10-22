@@ -1,6 +1,4 @@
-use soroban_sdk::{
-    contracttype, symbol_short, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol,
-};
+use soroban_sdk::{contracttype, symbol_short, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol};
 
 use crate::{DataKey, ReputationError};
 
@@ -85,12 +83,11 @@ pub(crate) fn verify_carrier_proof(env: &Env, proof: &CarrierProof) -> Result<()
         crate::PERSISTENT_BUMP_AMOUNT,
     );
 
-    env.crypto()
-        .ed25519_verify(
-            &public_key,
-            &signing_payload(env, &env.current_contract_address(), proof),
-            &proof.signature,
-        );
+    env.crypto().ed25519_verify(
+        &public_key,
+        &signing_payload(env, &env.current_contract_address(), proof),
+        &proof.signature,
+    );
 
     env.events().publish(
         (

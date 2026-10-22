@@ -2,6 +2,9 @@
 // 
 // Allows third-party lending, insurance, and underwriting contracts to query merchant
 // reputation scores, dispute ratios, and standing status for credit assessment.
+//!
+//! Allows third-party lending, insurance, and underwriting contracts to query merchant
+//! reputation scores, dispute ratios, and standing status for credit assessment.
 
 use soroban_sdk::{Address, Env};
 
@@ -9,6 +12,9 @@ use soroban_sdk::{Address, Env};
 // 
 // Implemented by the reputation contract to allow external contracts (lenders, insurers, etc.)
 // to evaluate merchant creditworthiness using standardized queries.
+///
+/// Implemented by the reputation contract to allow external contracts (lenders, insurers, etc.)
+/// to evaluate merchant creditworthiness using standardized queries.
 pub trait ReputationReaderTrait {
     /// Get merchant's current reputation rating (0-10000 basis points).
     ///
