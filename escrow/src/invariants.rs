@@ -302,7 +302,7 @@ pub fn verify_transition_invariants(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Address, Env};
+    use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
 
     fn mock_escrow(
         env: &Env,
@@ -316,11 +316,12 @@ mod tests {
             buyer: Address::generate(env),
             seller: Address::generate(env),
             token: Address::generate(env),
-            order_id: [0u8; 32].into(),
+            order_id: BytesN::from_array(env, &[0u8; 32]),
             amount,
             released_amount: released,
             refunded_amount: refunded,
             status,
+            flags: crate::EscrowFlags(0),
             created_at: 1000,
             updated_at: 1000,
             timeout_ledger: 2000,
