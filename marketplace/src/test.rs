@@ -8,17 +8,7 @@ use crate::{
     CommissionTier, MerchantVolumeRecord,
     ReputationCursor, RankedMerchantPage,
     TreasurySplitConfig, RESERVE_LOCK_LEDGERS,
-    AdminAcceptedEvent, AdminProposedEvent, CategoryChange, CategoryEntry, DataKey,
-    MarketplaceContract, MarketplaceContractClient, MarketplaceError, Merchant,
-    MerchantCategoryChangedEvent, MerchantCursor, MerchantOperationalView,
-    MerchantRegisteredEvent, MerchantStats, MerchantStatus, MerchantValidationError,
-    RegisterParams, VerificationPolicy, Verifier,
-    MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN, MAX_METADATA_LEN, MAX_NAME_LEN,
-    normalize_symbol,
-    MerchantCategoryChangedEvent, MerchantCursor, MerchantOperationalView, MerchantRegisteredEvent,
-    MerchantStats, MerchantStatus, MerchantValidationError, RegisterParams, VerificationPolicy,
-    Verifier, VerifierPage, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN, MAX_METADATA_LEN, MAX_NAME_LEN,
-    MAX_VERIFIERS,
+    VerifierPage, MAX_VERIFIERS,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,

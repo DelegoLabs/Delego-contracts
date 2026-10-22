@@ -2307,7 +2307,7 @@ impl MarketplaceContract {
 
         // Check merchant status - must be active (Verified or Registered)
         match merchant.status {
-            MerchantStatus::Verified | MerchantStatus::Registered | MerchantStatus::Maintenance => {
+            MerchantStatus::Verified | MerchantStatus::Registered => {
             }
             MerchantStatus::Suspended => return Err(MarketplaceError::MerchantFrozen),
             MerchantStatus::Closed => return Err(MarketplaceError::MerchantClosed),
@@ -2317,6 +2317,7 @@ impl MarketplaceContract {
                 // This is a sentinel value, should never reach here
                 return Err(MarketplaceError::InvalidParam);
             }
+            MerchantStatus::Maintenance => return Err(MarketplaceError::MaintenanceActive),
         }
 
         // Check if merchant's category is in the authorized list

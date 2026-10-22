@@ -1,6 +1,6 @@
 use crate::{
-    DataKey, MarketplaceContract, MarketplaceError, Merchant, PERSISTENT_BUMP_AMOUNT,
-    PERSISTENT_BUMP_THRESHOLD,
+    DataKey, MarketplaceContract, MarketplaceError, Merchant, MerchantStatus,
+    PERSISTENT_BUMP_AMOUNT, PERSISTENT_BUMP_THRESHOLD,
 };
 use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String};
 
@@ -38,6 +38,13 @@ pub fn set_storefront_metadata(
         .persistent()
         .get(&DataKey::Merchant(merchant_id))
         .ok_or(MarketplaceError::MerchantNotFound)?;
+
+    // Suspended merchants may not update their storefront while under
+    // policy review; the suspension must be lifted before metadata changes.
+    if merchant.status == MerchantStatus::Suspended {
+        return Err(MarketplaceError::MerchantSuspended);
+    }
+
     MarketplaceContract::check_not_frozen_or_closed(&merchant)?;
 
     if merchant.owner.as_ref() != Some(&caller) {
