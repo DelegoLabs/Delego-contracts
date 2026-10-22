@@ -63,6 +63,10 @@ pub use blend_yield::YieldBearingEscrowConfig;
 // Formal verification specifications for escrow lifecycle invariants
 pub mod invariants;
 
+/// Multi-merchant sub-order mapping and independent resolution routing.
+pub mod sub_orders;
+pub use sub_orders::SubOrder;
+
 mod admin_actions;
 #[cfg(test)]
 mod admin_actions_test;
