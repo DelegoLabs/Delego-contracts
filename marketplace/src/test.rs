@@ -3,10 +3,9 @@ use crate::{
     DataKey, MarketplaceContract, MarketplaceContractClient, MarketplaceError, Merchant,
     MerchantCategoryChangedEvent, MerchantCursor, MerchantOperationalView,
     MerchantRegisteredEvent, MerchantStats, MerchantStatus, MerchantValidationError,
-    RegisterParams, VerificationPolicy, Verifier, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN,
-    MAX_METADATA_LEN, MAX_NAME_LEN,
+    RegisterParams, VerificationPolicy, Verifier, VerifierPage,
+    MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN, MAX_METADATA_LEN, MAX_NAME_LEN, MAX_VERIFIERS,
     CommissionTier, MerchantVolumeRecord,
-    ReputationCursor, RankedMerchantPage,
     TreasurySplitConfig, RESERVE_LOCK_LEDGERS,
     VerifierPage, MAX_VERIFIERS,
 };
