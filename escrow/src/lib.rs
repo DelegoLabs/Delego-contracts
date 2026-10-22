@@ -60,6 +60,10 @@ use delego_interfaces::LendingPoolClient;
 pub mod blend_yield;
 pub use blend_yield::YieldBearingEscrowConfig;
 
+/// Multi-hop path payment validation and surplus refund helper.
+pub mod path_payment;
+pub use path_payment::{assert_min_destination, resolve_path_payment, PathPaymentArgs};
+
 // Formal verification specifications for escrow lifecycle invariants
 pub mod invariants;
 
