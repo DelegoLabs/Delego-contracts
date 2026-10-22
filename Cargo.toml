@@ -14,6 +14,16 @@ resolver = "2"
 [workspace.dependencies]
 soroban-sdk = "22.0.0"
 
+[profile.dev]
+# Enforce overflow checks in debug builds so integer overflow panics immediately
+# rather than silently wrapping (mirrors the release profile guarantee — issue #536).
+overflow-checks = true
+
+[profile.test]
+# Enforce overflow checks during `cargo test` so overflow-related unit tests
+# actually panic/abort rather than wrapping (issue #536).
+overflow-checks = true
+
 [profile.release]
 opt-level = "z"
 overflow-checks = true
