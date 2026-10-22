@@ -70,9 +70,13 @@ pub use sub_orders::SubOrder;
 mod admin_actions;
 #[cfg(test)]
 mod admin_actions_test;
+mod storage;
 pub use admin_actions::{
     AdminAction, PendingAdminAction, QueuedAdminAction, ADMIN_ACTION_DELAY_LEDGERS,
     ADMIN_ACTION_DELAY_SECONDS,
+};
+pub use storage::{
+    ReentrancyGuard, ReentrancyGuardHandle, ReentrancyKey, ReentrancyStatus, with_reentrancy_guard,
 };
 
 /// Lifecycle state of an escrow.
@@ -6597,15 +6601,22 @@ impl EscrowContract {
 
         let token_client = soroban_sdk::token::Client::new(&env, &token);
         let balance_before = token_client.balance(&env.current_contract_address());
-        token_client.transfer(&buyer, &env.current_contract_address(), &amount);
-        let net_received = verify_received_deposit_delta(
-            &env,
-            &token_client,
-            &env.current_contract_address(),
-            balance_before,
-            amount,
-        )?;
 
+        // Execute the external token transfer under the reentrancy guard.
+        // This follows Checks-Effects-Interactions: the guard is acquired
+        // before the external call, and state mutations happen after.
+        let net_received = with_reentrancy_guard(&env, || -> Result<i128, EscrowError> {
+            token_client.transfer(&buyer, &env.current_contract_address(), &amount);
+            verify_received_deposit_delta(
+                &env,
+                &token_client,
+                &env.current_contract_address(),
+                balance_before,
+                amount,
+            )
+        })?;
+
+        // State mutations (Effects) after external call (Interactions)
         record.amount = net_received;
         record.status = EscrowStatus::Funded;
         record.updated_at = env.ledger().timestamp();
@@ -6716,7 +6727,9 @@ impl EscrowContract {
             );
         }
 
+        // Phase 1: Create all escrows in Created status (no funds yet)
         let mut escrow_ids = Vec::new(&env);
+        let mut escrow_tokens: Vec<(Address, i128)> = Vec::new(&env);
         for item in items.iter() {
             let timeout_ledgers = item
                 .timeout_ledger
@@ -6726,13 +6739,31 @@ impl EscrowContract {
                 env.clone(),
                 buyer.clone(),
                 item.seller,
-                item.token,
+                item.token.clone(),
                 item.amount,
                 item.order_id,
                 timeout_ledgers,
                 None,
                 None,
             )?;
+            escrow_tokens.push_back((item.token.clone(), item.amount));
+            escrow_ids.push_back(escrow_id);
+        }
+
+        // Phase 2: Execute all token transfers under reentrancy guard
+        // This follows Checks-Effects-Interactions: external calls happen
+        // before state mutations that mark escrows as Funded.
+        let contract_address = env.current_contract_address();
+        with_reentrancy_guard(&env, || -> Result<(), EscrowError> {
+            for (token, amount) in token_totals.iter() {
+                let token_client = soroban_sdk::token::Client::new(&env, &token);
+                token_client.transfer_from(&contract_address, &buyer, &contract_address, &amount);
+            }
+            Ok(())
+        })?;
+
+        // Phase 3: Update all escrows to Funded status (Effects)
+        for (idx, escrow_id) in escrow_ids.iter().enumerate() {
             let key = DataKey::Escrow(escrow_id);
             let mut record: EscrowRecord = env
                 .storage()
@@ -6747,14 +6778,8 @@ impl EscrowContract {
                 PERSISTENT_BUMP_THRESHOLD,
                 PERSISTENT_BUMP_AMOUNT,
             );
-            escrow_ids.push_back(escrow_id);
         }
 
-        let contract_address = env.current_contract_address();
-        for (token, amount) in token_totals.iter() {
-            let token_client = soroban_sdk::token::Client::new(&env, &token);
-            token_client.transfer_from(&contract_address, &buyer, &contract_address, &amount);
-        }
         Ok(escrow_ids)
     }
 
