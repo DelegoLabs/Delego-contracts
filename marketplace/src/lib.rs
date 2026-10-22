@@ -18,6 +18,9 @@ use soroban_sdk::{
 
 /// Storefront metadata storage and update support.
 pub mod storefront;
+/// Fee discount calculator for merchants staking platform governance tokens.
+pub mod fees;
+pub use fees::*;
 pub mod oracle;
 pub mod catalog;
 pub use oracle::*;
@@ -869,6 +872,8 @@ pub enum DataKey {
     ListingRecord(u64, Symbol),
     /// Ordered list of all catalog listing SKU IDs for a merchant.
     MerchantListingSkuList(u64),
+    /// Staked platform governance tokens for a merchant address.
+    GovernanceStake(Address),
 }
 
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.
@@ -2783,6 +2788,72 @@ impl MarketplaceContract {
     pub fn get_commission(env: Env, merchant_id: u64) -> Result<u32, MarketplaceError> {
         let merchant = Self::get_merchant(env, merchant_id)?;
         Ok(merchant.commission_rate_bps)
+    }
+
+    /// Sets the staked platform governance token amount for a merchant address.
+    ///
+    /// Callable by the platform admin or the merchant address itself to record
+    /// governance stake used for commission fee discounts.
+    pub fn set_governance_stake(
+        env: Env,
+        caller: Address,
+        merchant: Address,
+        stake: i128,
+    ) -> Result<(), MarketplaceError> {
+        caller.require_auth();
+
+        let admin = Self::get_admin(env.clone())?;
+        if caller != admin && caller != merchant {
+            return Err(MarketplaceError::Unauthorized);
+        }
+        if stake < 0 {
+            return Err(MarketplaceError::InvalidParam);
+        }
+
+        let key = DataKey::GovernanceStake(merchant);
+        env.storage().persistent().set(&key, &stake);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        Ok(())
+    }
+
+    /// Returns the staked platform governance token amount for `merchant`.
+    pub fn get_governance_stake(env: Env, merchant: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovernanceStake(merchant))
+            .unwrap_or(0)
+    }
+
+    /// Cross-contract query method returning the discounted commission fee in basis points
+    /// for a merchant address after applying governance token staking discounts.
+    ///
+    /// Looks up the merchant's base `commission_rate_bps` (defaulting to `0` if not found)
+    /// and staked governance tokens (`DataKey::GovernanceStake(merchant)`), then applies
+    /// [`calculate_discounted_fee`]. Cannot reduce fee below `0` basis points.
+    pub fn get_merchant_fee_bps(env: Env, merchant: Address) -> u32 {
+        let base_fee_bps: u32 = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::MerchantOwner(merchant.clone()))
+            .and_then(|id| {
+                env.storage()
+                    .persistent()
+                    .get::<_, Merchant>(&DataKey::Merchant(id))
+            })
+            .map(|m| m.commission_rate_bps)
+            .unwrap_or(0);
+
+        let governance_stake: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovernanceStake(merchant))
+            .unwrap_or(0);
+
+        fees::calculate_discounted_fee(base_fee_bps, governance_stake)
     }
 
     // --- Operational view (issue #561) ---
