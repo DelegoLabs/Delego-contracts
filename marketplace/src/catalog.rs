@@ -286,6 +286,27 @@ pub fn decrement_stock(
     env.storage().persistent().set(&record_key, &record);
     env.storage().persistent().extend_ttl(
         &record_key,
+        PERSISTENT_BUMP_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+
+    env.events().publish(
+        (
+            symbol_short!("mkplc"),
+            symbol_short!("sku_dec"),
+            merchant_id,
+        ),
+        SkuStockDecrementedEvent {
+            merchant_id,
+            sku_id,
+            quantity,
+            remaining: record.available_quantity,
+        },
+    );
+
+    Ok(record.available_quantity)
+}
+
 /// Emitted once per successful [`batch_register_listings`] call.
 #[contracttype]
 #[derive(Clone, Debug)]
