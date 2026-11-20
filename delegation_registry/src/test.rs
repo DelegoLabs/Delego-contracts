@@ -3183,3 +3183,131 @@ fn test_rollback_cannot_reactivate_revoked_delegation() {
     assert_eq!(client.get_delegation_version(&id), 2);
     assert!(!client.is_authorized(&id, &agent_id));
 }
+
+// ── Merchant whitelist filters (issue #493) ─────────────────────────────────
+
+#[test]
+fn test_merchant_filter_rejects_unauthorized_merchant_when_strict() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Strict_Agent");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    let good_merchant = Address::generate(&env);
+    let bad_merchant = Address::generate(&env);
+
+    let mut allowed = Vec::new(&env);
+    allowed.push_back(good_merchant.clone());
+
+    client.set_merchant_filter(
+        &id,
+        &DelegationMerchantFilter {
+            allowed_merchants: allowed,
+            is_strict_whitelist: true,
+            max_per_merchant_stroops: 1_000,
+        },
+    );
+
+    let result = client.try_authorize_merchant_checkout(&id, &agent_id, &bad_merchant, &100);
+    assert_eq!(result, Err(Ok(DelegationError::UnauthorizedMerchant)));
+
+    let spent = client.authorize_merchant_checkout(&id, &agent_id, &good_merchant, &300);
+    assert_eq!(spent, 300);
+    assert_eq!(client.get_merchant_spent(&id, &good_merchant), 300);
+}
+
+#[test]
+fn test_merchant_filter_enforces_per_merchant_spend_limit() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Capped_Agent");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    let merchant = Address::generate(&env);
+    let mut allowed = Vec::new(&env);
+    allowed.push_back(merchant.clone());
+
+    client.set_merchant_filter(
+        &id,
+        &DelegationMerchantFilter {
+            allowed_merchants: allowed,
+            is_strict_whitelist: true,
+            max_per_merchant_stroops: 500,
+        },
+    );
+
+    let spent = client.authorize_merchant_checkout(&id, &agent_id, &merchant, &400);
+    assert_eq!(spent, 400);
+
+    let result = client.try_authorize_merchant_checkout(&id, &agent_id, &merchant, &200);
+    assert_eq!(result, Err(Ok(DelegationError::MerchantSpendLimitExceeded)));
+}
+
+#[test]
+fn test_merchant_filter_non_strict_allows_unlisted_merchant_uncapped() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Open_Agent");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    let listed_merchant = Address::generate(&env);
+    let other_merchant = Address::generate(&env);
+    let mut allowed = Vec::new(&env);
+    allowed.push_back(listed_merchant);
+
+    client.set_merchant_filter(
+        &id,
+        &DelegationMerchantFilter {
+            allowed_merchants: allowed,
+            is_strict_whitelist: false,
+            max_per_merchant_stroops: 100,
+        },
+    );
+
+    // Not on the list, but the filter is non-strict, so it passes uncapped.
+    let spent = client.authorize_merchant_checkout(&id, &agent_id, &other_merchant, &10_000);
+    assert_eq!(spent, 10_000);
+    // Non-whitelisted merchants are intentionally not tracked.
+    assert_eq!(client.get_merchant_spent(&id, &other_merchant), 0);
+}
+
+#[test]
+fn test_no_merchant_filter_is_unrestricted() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Unrestricted_Agent");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    let merchant = Address::generate(&env);
+    let spent = client.authorize_merchant_checkout(&id, &agent_id, &merchant, &1_000_000);
+    assert_eq!(spent, 1_000_000);
+    assert_eq!(client.get_merchant_filter(&id), None);
+}
+
+#[test]
+fn test_merchant_filter_requires_owner_auth() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Auth_Check_Agent");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let _ = owner;
+
+    let merchant = Address::generate(&env);
+    let mut allowed = Vec::new(&env);
+    allowed.push_back(merchant);
+
+    let result = client.try_set_merchant_filter(
+        &id,
+        &DelegationMerchantFilter {
+            allowed_merchants: allowed,
+            is_strict_whitelist: true,
+            max_per_merchant_stroops: 0,
+        },
+    );
+    assert_eq!(result, Err(Ok(DelegationError::InvalidMerchantFilter)));
+}

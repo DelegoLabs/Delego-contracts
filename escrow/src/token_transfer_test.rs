@@ -1,13 +1,28 @@
 #![cfg(test)]
 
 use soroban_sdk::{
-    contract, contractimpl,
+    contract, contracterror, contractimpl, panic_with_error,
     testutils::Address as _,
     token::{StellarAssetClient, TokenClient},
     Address, Env,
 };
 
 use crate::{token_transfer::safe_token_transfer, EscrowError};
+
+/// Mirrors the host's built-in Stellar Asset Contract error discriminants
+/// (`soroban_env_host::builtin_contracts::contract_error::ContractError`,
+/// pinned via `soroban-env-host = 22.1.3` in `Cargo.lock`) so tests can make
+/// a mock token trap with the exact same codes a real SAC would, without
+/// needing to engineer an actual insufficient-allowance condition through
+/// the real built-in asset contract.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum FakeSacError {
+    Allowance = 9,
+    BalanceDeauthorized = 11,
+    TrustlineMissing = 13,
+}
 
 // --- Mock tokens -----------------------------------------------------------
 
@@ -42,6 +57,33 @@ pub struct PanicToken;
 impl PanicToken {
     pub fn transfer(_e: Env, _from: Address, _to: Address, _amount: i128) {
         panic!("insufficient balance");
+    }
+}
+
+#[contract]
+pub struct AllowanceExceededToken;
+#[contractimpl]
+impl AllowanceExceededToken {
+    pub fn transfer(e: Env, _from: Address, _to: Address, _amount: i128) {
+        panic_with_error!(&e, FakeSacError::Allowance);
+    }
+}
+
+#[contract]
+pub struct FrozenTrustlineToken;
+#[contractimpl]
+impl FrozenTrustlineToken {
+    pub fn transfer(e: Env, _from: Address, _to: Address, _amount: i128) {
+        panic_with_error!(&e, FakeSacError::BalanceDeauthorized);
+    }
+}
+
+#[contract]
+pub struct MissingTrustlineToken;
+#[contractimpl]
+impl MissingTrustlineToken {
+    pub fn transfer(e: Env, _from: Address, _to: Address, _amount: i128) {
+        panic_with_error!(&e, FakeSacError::TrustlineMissing);
     }
 }
 
@@ -123,7 +165,7 @@ fn works_with_real_stellar_asset_contract() {
 }
 
 #[test]
-fn sac_insufficient_balance_maps_to_failed() {
+fn sac_insufficient_balance_maps_to_specific_error() {
     let env = Env::default();
     env.mock_all_auths();
     let host = env.register(Host, ());
@@ -134,5 +176,29 @@ fn sac_insufficient_balance_maps_to_failed() {
     StellarAssetClient::new(&env, &token_id).mint(&host, &50);
 
     let res = env.as_contract(&host, || safe_token_transfer(&env, &token_id, &to, 400));
-    assert_eq!(res, Err(EscrowError::TokenTransferFailed));
+    assert_eq!(res, Err(EscrowError::TokenInsufficientBalance));
+}
+
+#[test]
+fn sac_allowance_exceeded_maps_to_specific_error() {
+    assert_eq!(
+        run(AllowanceExceededToken, 100),
+        Err(EscrowError::TokenAllowanceExceeded)
+    );
+}
+
+#[test]
+fn sac_frozen_trustline_maps_to_specific_error() {
+    assert_eq!(
+        run(FrozenTrustlineToken, 100),
+        Err(EscrowError::TokenFrozen)
+    );
+}
+
+#[test]
+fn sac_missing_trustline_maps_to_specific_error() {
+    assert_eq!(
+        run(MissingTrustlineToken, 100),
+        Err(EscrowError::TokenInvalidTokenContract)
+    );
 }
