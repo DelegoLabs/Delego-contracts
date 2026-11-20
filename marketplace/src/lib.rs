@@ -381,6 +381,8 @@ pub enum MarketplaceError {
     OutOfStock = 4049,
     /// Batch exceeds the maximum allowed listing count.
     BatchTooLarge = 4048,
+    /// No [`CancellationPenaltyConfig`] has been set by the admin yet.
+    CancellationPenaltyNotConfigured = 4050,
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +596,33 @@ pub struct MerchantDepositRefundedEvent {
     pub owner: Address,
     pub amount: i128,
     pub token: Address,
+}
+
+/// Configuration for the merchant-initiated order cancellation penalty
+/// (issue #506). When a merchant repeatedly accepts orders and then cancels
+/// them (e.g. stock negligence), a penalty is deducted from their staked
+/// deposit/bond and paid out to the inconvenienced buyer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancellationPenaltyConfig {
+    /// Amount (in the merchant's deposit token's smallest unit) deducted from
+    /// the merchant's bond and credited to the buyer on each penalised
+    /// cancellation.
+    pub penalty_amount_stroops: i128,
+    /// Number of merchant-initiated cancellations tolerated before the
+    /// merchant is automatically suspended.
+    pub max_cancellations_before_suspension: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MerchantCancellationPenalizedEvent {
+    pub merchant_id: u64,
+    pub buyer: Address,
+    pub token: Address,
+    pub penalty_amount: i128,
+    pub strike_count: u32,
+    pub auto_suspended: bool,
 }
 
 #[contracttype]
@@ -851,11 +880,13 @@ pub enum DataKey {
     StorefrontMetadata(u64),
     /// Collateral bond balance for a merchant (used in operational view).
     MerchantBond(u64),
-    /// Number of disputes recorded against a merchant.
-    /// Collateral bond balance for a merchant (operational view).
-    MerchantBond(u64),
     /// Dispute count recorded against a merchant.
     MerchantDisputeCount(u64),
+    /// Admin-configured [`CancellationPenaltyConfig`] (issue #506), instance storage.
+    CancellationPenaltyConfig,
+    /// Count of merchant-initiated order cancellations charged a penalty
+    /// (issue #506). Reset only by admin action, never automatically.
+    MerchantCancellationStrikes(u64),
     /// Treasury split routing configuration (instance storage).
     TreasurySplit,
     /// Liquidation reserve held for a high-value order.
@@ -864,8 +895,6 @@ pub enum DataKey {
     SkuRecord(u64, Symbol),
     /// List of all catalog SKU IDs for a merchant.
     MerchantCatalogSkuList(u64),
-    /// Authorized escrow contract address allowed to decrement SKU stock.
-    AuthorizedEscrow,
     /// Authorized escrow contract address allowed to decrement SKU stock.
     AuthorizedEscrow,
     /// Bulk listing catalog record: (merchant_id, sku_id) → ListingRecord.
@@ -3082,6 +3111,193 @@ impl MarketplaceContract {
     }
 
     // --- Moderation / Security ---
+
+    /// Admin-only: set (or update) the [`CancellationPenaltyConfig`] applied
+    /// by [`Self::record_merchant_cancellation`] (issue #506).
+    pub fn set_cancellation_penalty_config(
+        env: Env,
+        admin: Address,
+        config: CancellationPenaltyConfig,
+    ) -> Result<(), MarketplaceError> {
+        admin.require_auth();
+        let current_admin = Self::get_admin(env.clone())?;
+        if admin != current_admin {
+            return Err(MarketplaceError::Unauthorized);
+        }
+        if config.penalty_amount_stroops <= 0 {
+            return Err(MarketplaceError::InvalidParam);
+        }
+        if config.max_cancellations_before_suspension == 0 {
+            return Err(MarketplaceError::InvalidParam);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::CancellationPenaltyConfig, &config);
+        Ok(())
+    }
+
+    /// Return the currently configured [`CancellationPenaltyConfig`], if any.
+    pub fn get_cancellation_penalty_config(env: Env) -> Option<CancellationPenaltyConfig> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CancellationPenaltyConfig)
+    }
+
+    /// Return the number of penalised merchant-initiated cancellations
+    /// charged against `merchant_id` so far.
+    pub fn get_merchant_cancellation_strikes(env: Env, merchant_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantCancellationStrikes(merchant_id))
+            .unwrap_or(0u32)
+    }
+
+    /// Record a merchant-initiated order cancellation (issue #506): deducts
+    /// [`CancellationPenaltyConfig::penalty_amount_stroops`] from the
+    /// merchant's staked registration deposit and pays it to `buyer` as
+    /// compensation for the inconvenience, then increments the merchant's
+    /// strike counter. Once the strike counter reaches
+    /// `max_cancellations_before_suspension`, the merchant is automatically
+    /// suspended exactly like [`Self::suspend_merchant`] would.
+    ///
+    /// Callable only by the platform admin or the configured authorized
+    /// escrow contract ([`catalog::get_authorized_escrow`]), mirroring the
+    /// authorization model already used for `decrement_sku_stock` so the
+    /// escrow contract can report a merchant-side cancellation as soon as it
+    /// finalizes one.
+    ///
+    /// # Errors
+    /// * [`MarketplaceError::Unauthorized`] — caller is neither admin nor the
+    ///   authorized escrow contract.
+    /// * [`MarketplaceError::CancellationPenaltyNotConfigured`] — no config
+    ///   has been set via [`Self::set_cancellation_penalty_config`].
+    /// * [`MarketplaceError::MerchantClosed`] / [`MarketplaceError::MerchantBanned`]
+    ///   — merchant is not in a state that can be penalised further.
+    /// * [`MarketplaceError::DepositNotFound`] — merchant has no staked
+    ///   deposit on file to deduct the penalty from.
+    pub fn record_merchant_cancellation(
+        env: Env,
+        caller: Address,
+        merchant_id: u64,
+        buyer: Address,
+    ) -> Result<(), MarketplaceError> {
+        caller.require_auth();
+        let admin = Self::get_admin(env.clone())?;
+        let authorized_escrow = catalog::get_authorized_escrow(env.clone());
+        if caller != admin && Some(caller.clone()) != authorized_escrow {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
+        if merchant.status == MerchantStatus::Closed {
+            return Err(MarketplaceError::MerchantClosed);
+        }
+        if merchant.status == MerchantStatus::Banned {
+            return Err(MarketplaceError::MerchantBanned);
+        }
+
+        let config: CancellationPenaltyConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::CancellationPenaltyConfig)
+            .ok_or(MarketplaceError::CancellationPenaltyNotConfigured)?;
+
+        let deposit_amount: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantDeposit(merchant_id))
+            .ok_or(MarketplaceError::DepositNotFound)?;
+        let deposit_token: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DepositToken(merchant_id))
+            .ok_or(MarketplaceError::DepositNotFound)?;
+
+        // Never deduct more than the merchant actually has staked.
+        let penalty_amount = config.penalty_amount_stroops.min(deposit_amount).max(0);
+
+        if penalty_amount > 0 {
+            use soroban_sdk::token;
+            let token_client = token::Client::new(&env, &deposit_token);
+            token_client.transfer(&env.current_contract_address(), &buyer, &penalty_amount);
+
+            let remaining_deposit = deposit_amount - penalty_amount;
+            env.storage()
+                .persistent()
+                .set(&DataKey::MerchantDeposit(merchant_id), &remaining_deposit);
+
+            // Keep the operational-view bond mirror in sync with the real,
+            // token-backed deposit balance.
+            let bond_balance: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::MerchantBond(merchant_id))
+                .unwrap_or(0i128);
+            let new_bond_balance = (bond_balance - penalty_amount).max(0);
+            env.storage()
+                .persistent()
+                .set(&DataKey::MerchantBond(merchant_id), &new_bond_balance);
+        }
+
+        let strike_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantCancellationStrikes(merchant_id))
+            .unwrap_or(0u32)
+            .saturating_add(1);
+        env.storage().persistent().set(
+            &DataKey::MerchantCancellationStrikes(merchant_id),
+            &strike_count,
+        );
+
+        let mut auto_suspended = false;
+        if strike_count >= config.max_cancellations_before_suspension
+            && merchant.status != MerchantStatus::Suspended
+            && merchant.status != MerchantStatus::Inactive
+        {
+            let prev_status = merchant.status;
+            if prev_status != MerchantStatus::Suspended {
+                let mut stats = Self::get_merchant_stats(env.clone());
+                stats.active = stats.active.saturating_sub(1);
+                stats.suspended = stats.suspended.saturating_add(1);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::MerchantStats, &stats);
+            }
+            merchant.status = MerchantStatus::Suspended;
+            merchant.updated_at = env.ledger().timestamp();
+            env.storage()
+                .persistent()
+                .set(&DataKey::Merchant(merchant_id), &merchant);
+
+            env.events().publish(
+                (
+                    symbol_short!("mkplc"),
+                    symbol_short!("suspend"),
+                    merchant_id,
+                ),
+                MerchantSuspendedEvent {
+                    merchant_id,
+                    suspended_by: admin.clone(),
+                },
+            );
+            auto_suspended = true;
+        }
+
+        env.events().publish(
+            (symbol_short!("mkplc"), symbol_short!("cnclpen"), merchant_id),
+            MerchantCancellationPenalizedEvent {
+                merchant_id,
+                buyer,
+                token: deposit_token,
+                penalty_amount,
+                strike_count,
+                auto_suspended,
+            },
+        );
+
+        Ok(())
+    }
 
     pub fn suspend_merchant(
         env: Env,

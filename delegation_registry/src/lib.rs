@@ -498,6 +498,26 @@ pub struct EphemeralSessionBounds {
     pub max_spending_limit: i128,
 }
 
+/// Rolling time-window spend velocity limit for an autonomous agent
+/// delegation (issue #494). Mitigates risk if an agent key is compromised by
+/// bounding spend to `max_window_spend_stroops` per `window_ledgers`, in
+/// addition to any static all-time cap enforced elsewhere (e.g. the
+/// `permissions` contract's per-tx/total allowance), rather than relying on a
+/// static all-time cap alone.
+#[contracttype]
+#[allow(missing_docs)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlidingWindowRateLimit {
+    /// Length of the rolling window, in ledgers (e.g. 14,400 for ~24h at 5s/ledger).
+    pub window_ledgers: u32,
+    /// Maximum total spend (in stroops) allowed within any single window.
+    pub max_window_spend_stroops: i128,
+    /// Amount already spent (in stroops) within the current window.
+    pub current_window_spend: i128,
+    /// Ledger sequence at which the current window began.
+    pub window_start_ledger: u32,
+}
+
 /// Topic 0 symbol for every event emitted by the delegation registry.
 pub const EVENT_TOPIC_CONTRACT: Symbol = symbol_short!("deleg");
 
@@ -554,6 +574,9 @@ pub enum DataKey {
     DelegationV2(Address, Symbol),
     /// Schema version marker for the delegation storage layout.
     SchemaVersion,
+    /// Sliding-window spend velocity limit configured for a delegation
+    /// (issue #494), keyed by delegation id.
+    SpendRateLimit(u64),
 }
 
 /// Current delegation storage schema version.
@@ -674,9 +697,14 @@ pub enum DelegationError {
     /// A revoked delegation is terminal and can never be restored by rollback.
     RevokedCannotBeRestored = 4022,
     /// The session has expired or is not yet valid.
-    SessionExpired = 4020,
+    SessionExpired = 4023,
     /// A supplied parameter is invalid, e.g. a zero `owner` or `permissions_contract` address.
-    InvalidParam = 4020,
+    InvalidParam = 4024,
+    /// No [`SlidingWindowRateLimit`] has been configured for this delegation (issue #494).
+    RateLimitNotConfigured = 4025,
+    /// The proposed spend would exceed the delegation's configured
+    /// sliding-window spend velocity limit (issue #494).
+    SpendRateLimitExceeded = 4026,
 }
 
 /// The delegation registry contract.
@@ -1836,6 +1864,121 @@ impl DelegationRegistry {
         );
 
         Ok(true)
+    }
+
+    /// Configures (or replaces) the sliding-window spend velocity limit for a
+    /// delegation (issue #494), requiring the delegation owner's
+    /// authorization. Resets the accumulator to a fresh window starting at
+    /// the current ledger.
+    pub fn set_spend_rate_limit(
+        env: Env,
+        delegation_id: u64,
+        window_ledgers: u32,
+        max_window_spend_stroops: i128,
+    ) -> Result<(), DelegationError> {
+        if window_ledgers == 0 || max_window_spend_stroops <= 0 {
+            return Err(DelegationError::InvalidParam);
+        }
+
+        let record =
+            Self::load_delegation_by_id(&env, delegation_id).ok_or(DelegationError::NotFound)?;
+        record.owner.require_auth();
+
+        let limit = SlidingWindowRateLimit {
+            window_ledgers,
+            max_window_spend_stroops,
+            current_window_spend: 0,
+            window_start_ledger: env.ledger().sequence(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::SpendRateLimit(delegation_id), &limit);
+        Ok(())
+    }
+
+    /// Returns the configured [`SlidingWindowRateLimit`] for a delegation, if any.
+    pub fn get_spend_rate_limit(env: Env, delegation_id: u64) -> Option<SlidingWindowRateLimit> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SpendRateLimit(delegation_id))
+    }
+
+    /// Checks a proposed spend against the delegation's sliding-window spend
+    /// velocity limit and, if it fits, records it atomically (issue #494).
+    ///
+    /// Mitigates the risk of a compromised agent key by bounding spend to
+    /// `max_window_spend_stroops` per rolling `window_ledgers` window, on top
+    /// of any static all-time cap enforced elsewhere. Same liveness/identity
+    /// checks as [`is_authorized`](Self::is_authorized): the delegation must
+    /// be `Active`, unexpired, and registered to `agent_id`.
+    ///
+    /// The window resets automatically — spend is never carried over — once
+    /// `current_ledger >= window_start_ledger + window_ledgers` has elapsed,
+    /// after which this call starts a fresh window beginning at the current
+    /// ledger with `proposed_amount` as its first recorded spend.
+    ///
+    /// # Errors
+    /// * [`DelegationError::NotFound`] — delegation does not exist.
+    /// * [`DelegationError::NotActive`] / [`DelegationError::Expired`] — delegation is not live.
+    /// * [`DelegationError::NotAuthorized`] — `agent_id` does not match the delegation.
+    /// * [`DelegationError::RateLimitNotConfigured`] — no limit was set via
+    ///   [`Self::set_spend_rate_limit`].
+    /// * [`DelegationError::SpendRateLimitExceeded`] — `proposed_amount` would
+    ///   push the window's accumulated spend past `max_window_spend_stroops`;
+    ///   the spend is rejected and no state is mutated.
+    pub fn check_and_record_spend(
+        env: Env,
+        delegation_id: u64,
+        agent_id: BytesN<32>,
+        proposed_amount: i128,
+    ) -> Result<SlidingWindowRateLimit, DelegationError> {
+        if proposed_amount <= 0 {
+            return Err(DelegationError::InvalidParam);
+        }
+
+        let record =
+            Self::load_delegation_by_id(&env, delegation_id).ok_or(DelegationError::NotFound)?;
+
+        if record.status != DelegationStatus::Active {
+            return Err(DelegationError::NotActive);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        if current_ledger >= record.expires_at_ledger {
+            return Err(DelegationError::Expired);
+        }
+
+        if record.agent_id != agent_id {
+            return Err(DelegationError::NotAuthorized);
+        }
+
+        let key = DataKey::SpendRateLimit(delegation_id);
+        let mut limit: SlidingWindowRateLimit = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(DelegationError::RateLimitNotConfigured)?;
+
+        // Reset the window once it has fully elapsed, discarding the stale
+        // accumulated spend rather than carrying any of it forward.
+        if current_ledger >= limit.window_start_ledger.saturating_add(limit.window_ledgers) {
+            limit.current_window_spend = 0;
+            limit.window_start_ledger = current_ledger;
+        }
+
+        let projected_spend = limit.current_window_spend.saturating_add(proposed_amount);
+        if projected_spend > limit.max_window_spend_stroops {
+            return Err(DelegationError::SpendRateLimitExceeded);
+        }
+
+        limit.current_window_spend = projected_spend;
+        env.storage().persistent().set(&key, &limit);
+
+        // Keep the delegation and its owner index alive while it's actively
+        // being spent against, same as the other liveness-checking entrypoints.
+        Self::bump_delegation(&env, delegation_id, &record.owner);
+
+        Ok(limit)
     }
 
     /// Sweeps a caller-supplied batch of delegation ids, transitioning any
@@ -3049,8 +3192,11 @@ mod error_code_uniqueness_tests {
             (DelegationError::DelegationMismatch, 4019u32),
             (DelegationError::NotEligibleForBounty, 4020u32),
             (DelegationError::InsufficientMaintenanceReserve, 4021u32),
-            (DelegationError::SessionExpired, 4020u32),
             (DelegationError::RevokedCannotBeRestored, 4022u32),
+            (DelegationError::SessionExpired, 4023u32),
+            (DelegationError::InvalidParam, 4024u32),
+            (DelegationError::RateLimitNotConfigured, 4025u32),
+            (DelegationError::SpendRateLimitExceeded, 4026u32),
         ];
 
         for (variant, expected) in codes {
@@ -3079,8 +3225,11 @@ mod error_code_uniqueness_tests {
             DelegationError::DelegationMismatch as u32,
             DelegationError::NotEligibleForBounty as u32,
             DelegationError::InsufficientMaintenanceReserve as u32,
-            DelegationError::SessionExpired as u32,
             DelegationError::RevokedCannotBeRestored as u32,
+            DelegationError::SessionExpired as u32,
+            DelegationError::InvalidParam as u32,
+            DelegationError::RateLimitNotConfigured as u32,
+            DelegationError::SpendRateLimitExceeded as u32,
         ];
         seen.sort_unstable();
         for pair in seen.windows(2) {
