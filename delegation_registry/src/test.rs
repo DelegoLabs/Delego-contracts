@@ -3183,3 +3183,99 @@ fn test_rollback_cannot_reactivate_revoked_delegation() {
     assert_eq!(client.get_delegation_version(&id), 2);
     assert!(!client.is_authorized(&id, &agent_id));
 }
+
+// --- Sliding-window spend rate limiter (issue #494) ---
+
+#[test]
+fn test_spend_rate_limit_not_configured_returns_error() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "No_Limit");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100_000);
+
+    let result = client.try_check_and_record_spend(&id, &agent_id, &100i128);
+    assert_eq!(result, Err(Ok(DelegationError::RateLimitNotConfigured)));
+}
+
+#[test]
+fn test_spend_rate_limit_allows_within_window_and_blocks_over_limit() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(1_000);
+
+    let label = Symbol::new(&env, "Rate_Limited");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100_000);
+
+    // 14,400-ledger (~24h) window, 500 stroops max spend per window.
+    client.set_spend_rate_limit(&id, &14_400u32, &500i128);
+
+    let limit = client.check_and_record_spend(&id, &agent_id, &300i128);
+    assert_eq!(limit.current_window_spend, 300);
+    assert_eq!(limit.window_start_ledger, 1_000);
+
+    // A second spend that would push the window total to 600 (> 500) must be
+    // rejected, and must leave the accumulator untouched.
+    let result = client.try_check_and_record_spend(&id, &agent_id, &300i128);
+    assert_eq!(result, Err(Ok(DelegationError::SpendRateLimitExceeded)));
+    let limit = client.get_spend_rate_limit(&id).unwrap();
+    assert_eq!(limit.current_window_spend, 300);
+
+    // A smaller spend that exactly fills the remaining allowance succeeds.
+    let limit = client.check_and_record_spend(&id, &agent_id, &200i128);
+    assert_eq!(limit.current_window_spend, 500);
+}
+
+#[test]
+fn test_spend_rate_limit_resets_after_window_elapses() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(1_000);
+
+    let label = Symbol::new(&env, "Rate_Limited_Reset");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100_000);
+
+    client.set_spend_rate_limit(&id, &14_400u32, &500i128);
+
+    // Exhaust the window right at its start.
+    let limit = client.check_and_record_spend(&id, &agent_id, &500i128);
+    assert_eq!(limit.current_window_spend, 500);
+
+    // Still inside the same window: any further spend is rejected.
+    let just_before_boundary = 1_000 + 14_400 - 1;
+    env.ledger().set_sequence_number(just_before_boundary);
+    let result = client.try_check_and_record_spend(&id, &agent_id, &1i128);
+    assert_eq!(result, Err(Ok(DelegationError::SpendRateLimitExceeded)));
+
+    // Rapid successive spend crossing the ledger window boundary: once the
+    // window has fully elapsed, the accumulator resets and the full limit is
+    // available again, independent of the previous window's usage.
+    let window_boundary = 1_000 + 14_400;
+    env.ledger().set_sequence_number(window_boundary);
+    let limit = client.check_and_record_spend(&id, &agent_id, &500i128);
+    assert_eq!(limit.current_window_spend, 500);
+    assert_eq!(limit.window_start_ledger, window_boundary);
+
+    // Immediately following spend in the same (new) window is still bounded.
+    let result = client.try_check_and_record_spend(&id, &agent_id, &1i128);
+    assert_eq!(result, Err(Ok(DelegationError::SpendRateLimitExceeded)));
+}
+
+#[test]
+fn test_spend_rate_limit_rejects_wrong_agent_and_inactive_delegation() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(1_000);
+
+    let label = Symbol::new(&env, "Rate_Limited_Agent_Check");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100_000);
+    client.set_spend_rate_limit(&id, &14_400u32, &500i128);
+
+    let wrong_agent = BytesN::from_array(&env, &[9; 32]);
+    let result = client.try_check_and_record_spend(&id, &wrong_agent, &100i128);
+    assert_eq!(result, Err(Ok(DelegationError::NotAuthorized)));
+
+    client.pause_delegation(&id);
+    let result = client.try_check_and_record_spend(&id, &agent_id, &100i128);
+    assert_eq!(result, Err(Ok(DelegationError::NotActive)));
+}

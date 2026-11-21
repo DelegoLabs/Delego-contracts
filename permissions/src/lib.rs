@@ -277,7 +277,7 @@ pub enum PermissionError {
     /// Session key timestamp expiration has passed (`current_timestamp >= session.expires_at`).
     /// Distinct from `Expired` (ledger-sequence expiry) so callers can distinguish
     /// between the two expiration dimensions (issue #566).
-    SessionExpired = 2431,
+    SessionExpired = 2432,
 }
 
 /// Epoch period for allowance reset logic.

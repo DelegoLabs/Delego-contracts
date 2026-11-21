@@ -593,39 +593,6 @@ pub enum ReputationError {
     ProbationNotComplete = 3020,
     /// Invalid collateral amount (must be positive).
     InvalidCollateralAmount = 3021,
-    DuplicateReviewCommitment = 3021,
-    /// Caller is not the buyer for this escrow.
-    NotBuyer = 3022,
-    /// Escrow is not in settled state.
-    EscrowNotSettled = 3023,
-    /// Quorum threshold not reached for dispute verdict.
-    QuorumNotReached = 3024,
-    /// Invalid dispute verdict symbol.
-    InvalidVerdictSymbol = 3025,
-    /// Merchant is not eligible for rehabilitation.
-    NotEligibleForRehabilitation = 3026,
-    /// Rehabilitation program not found for merchant.
-    RehabilitationNotFound = 3027,
-    /// Probation orders requirement not yet met for graduation.
-    ProbationNotComplete = 3028,
-    /// Invalid collateral amount (must be positive).
-    DuplicateReviewCommitment = 3021,
-    /// Caller is not the buyer for this escrow.
-    NotBuyer = 3022,
-    /// Escrow is not in settled state.
-    EscrowNotSettled = 3023,
-    /// Quorum threshold not reached for dispute verdict.
-    QuorumNotReached = 3024,
-    /// Invalid dispute verdict symbol.
-    InvalidVerdictSymbol = 3025,
-    /// Merchant is not eligible for rehabilitation.
-    NotEligibleForRehabilitation = 3026,
-    /// Rehabilitation program not found for merchant.
-    RehabilitationNotFound = 3027,
-    /// Probation orders requirement not yet met for graduation.
-    ProbationNotComplete = 3028,
-    /// Invalid collateral amount (must be positive).
-    InvalidCollateralAmount = 3029,
     /// Blinded review verification failed.
     BlindedReviewVerificationFailed = 3022,
     /// Blinded receipt already used (double-submission prevented).
@@ -642,30 +609,24 @@ pub enum ReputationError {
     NoMatchingPrecedentRule = 3028,
     /// The supplied carrier attestation did not match the rule's required status.
     PrecedentAttestationMismatch = 3029,
-    CarrierOracleNotAuthorized = 3013,
     /// A review between this buyer/seller pair landed inside the cooldown window.
-    ReviewCooldownActive = 3021,
+    ReviewCooldownActive = 3033,
     /// Review targeted by flag was not found.
-    ReviewNotFound = 3028,
+    ReviewNotFound = 3041,
     /// Flag record was not found.
-    FlagNotFound = 3029,
+    FlagNotFound = 3042,
     /// Flag has already been resolved.
     FlagAlreadyResolved = 3030,
-    InvalidReportStatus = 3020,
-    /// A carrier proof was submitted by an oracle that is not registered.
-    CarrierOracleNotAuthorized = 3030,
     /// No review appeal exists for the given review id.
-    ReviewAppealNotFound = 3028,
+    ReviewAppealNotFound = 3043,
     /// A review appeal has already been filed for this review id.
-    ReviewAppealAlreadyExists = 3029,
+    ReviewAppealAlreadyExists = 3044,
     /// Invalid appeal bond amount (must be positive).
-    InvalidAppealBond = 3030,
+    InvalidAppealBond = 3045,
     /// The review appeal has already been resolved and cannot change again.
     AppealAlreadyResolved = 3031,
     /// Caller is not a party to the appeal (neither merchant nor arbiter).
     NotAppealParty = 3032,
-    /// The review being appealed does not exist.
-    ReviewNotFound = 3033,
     /// The review being appealed targets a different merchant.
     AppealMerchantMismatch = 3034,
     /// The appeal bond does not match the configured bond amount.
@@ -681,9 +642,6 @@ pub enum ReputationError {
     /// The review appeal voting window is still open, so the appeal cannot be
     /// expired yet.
     AppealWindowNotExpired = 3040,
-    InvalidReportStatus = 3020,
-    /// A carrier proof was submitted by an oracle that is not registered.
-    CarrierOracleNotAuthorized = 3030,
 }
 
 #[cfg(test)]
@@ -730,7 +688,6 @@ mod error_code_allocation {
             ReputationError::InvalidAppealBond as u32,
             ReputationError::AppealAlreadyResolved as u32,
             ReputationError::NotAppealParty as u32,
-            ReputationError::ReviewNotFound as u32,
             ReputationError::AppealMerchantMismatch as u32,
             ReputationError::AppealBondMismatch as u32,
             ReputationError::AppealAlreadyVoted as u32,

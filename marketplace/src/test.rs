@@ -2878,3 +2878,88 @@ fn test_version_matches_cargo_toml() {
     let expected = env!("CARGO_PKG_VERSION").replace('.', "_");
     assert_eq!(v.semver, soroban_sdk::Symbol::new(&env, &expected));
 }
+
+// --- Order cancellation penalty deductions from merchant staked bond (issue #506) ---
+
+#[test]
+fn test_merchant_cancellation_penalty_deducts_bond_and_compensates_buyer() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+    let buyer = Address::generate(&f.env);
+
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "Cancel Prone Store"),
+        description: String::from_str(&f.env, "Sells things, sometimes cancels them"),
+        category: symbol_short!("tools"),
+        image_url: String::from_str(&f.env, "https://cdn.example.com/logo.png"),
+        metadata: None,
+        metadata_uri: None,
+        required_verifications: 1,
+    };
+
+    let (token, deposit) = crate::testutil::funded_registration_deposit(&f.env, &merchant_addr);
+    let merchant_id = f
+        .client
+        .register_merchant(&merchant_addr, &params, &token, &deposit);
+
+    let token_client = soroban_sdk::token::Client::new(&f.env, &token);
+    assert_eq!(token_client.balance(&buyer), 0);
+
+    f.client.set_cancellation_penalty_config(
+        &f.admin,
+        &crate::CancellationPenaltyConfig {
+            penalty_amount_stroops: 2_000_000,
+            max_cancellations_before_suspension: 2,
+        },
+    );
+
+    // First merchant-initiated cancellation: penalty is deducted from the
+    // merchant's staked deposit and paid out to the inconvenienced buyer, but
+    // one strike is not yet enough to trigger suspension.
+    f.client
+        .record_merchant_cancellation(&f.admin, &merchant_id, &buyer);
+    assert_eq!(token_client.balance(&buyer), 2_000_000);
+    assert_eq!(f.client.get_merchant_cancellation_strikes(&merchant_id), 1);
+    assert_eq!(
+        f.client.get_merchant(&merchant_id).status,
+        MerchantStatus::Registered
+    );
+
+    // Second cancellation reaches `max_cancellations_before_suspension`: the
+    // merchant is automatically suspended and the buyer is compensated again.
+    f.client
+        .record_merchant_cancellation(&f.admin, &merchant_id, &buyer);
+    assert_eq!(token_client.balance(&buyer), 4_000_000);
+    assert_eq!(f.client.get_merchant_cancellation_strikes(&merchant_id), 2);
+    assert_eq!(
+        f.client.get_merchant(&merchant_id).status,
+        MerchantStatus::Suspended
+    );
+}
+
+#[test]
+fn test_merchant_cancellation_without_config_errors() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+    let buyer = Address::generate(&f.env);
+
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "Unconfigured Store"),
+        description: String::from_str(&f.env, "No penalty config set yet"),
+        category: symbol_short!("tools"),
+        image_url: String::from_str(&f.env, "https://cdn.example.com/logo.png"),
+        metadata: None,
+        metadata_uri: None,
+        required_verifications: 1,
+    };
+    let merchant_id =
+        crate::testutil::register_merchant_with_deposit(&f.env, &f.client, &merchant_addr, &params);
+
+    let result = f
+        .client
+        .try_record_merchant_cancellation(&f.admin, &merchant_id, &buyer);
+    assert_eq!(
+        result,
+        Err(Ok(MarketplaceError::CancellationPenaltyNotConfigured))
+    );
+}
