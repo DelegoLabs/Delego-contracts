@@ -155,6 +155,45 @@ pub struct LiquidationReserve {
     pub unlock_ledger: u32,
 }
 
+/// Dispute reserve fund pool tracking a merchant's solvency against its open
+/// escrow book (issue #509).
+///
+/// `reserve_balance_stroops` must cover `active_escrow_liability_stroops` at
+/// `reserve_ratio_basis_points` (e.g. `1000` == 10%) or new order intake is
+/// refused via [`MarketplaceContract::report_order_opened`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct MerchantReservePool {
+    pub merchant: Address,
+    pub reserve_balance_stroops: i128,
+    pub active_escrow_liability_stroops: i128,
+    pub reserve_ratio_basis_points: u32,
+}
+
+/// Immutable on-chain commitment to a product's listed terms, anchored at
+/// checkout time to prevent post-purchase "bait-and-switch" edits (issue #507).
+///
+/// `content_hash` is expected to be `SHA-256(title || spec || price)` (or an
+/// equivalent canonical encoding agreed off-chain); this contract treats it
+/// as an opaque 32-byte digest and never recomputes it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ProductAttestation {
+    pub product_id: u64,
+    pub content_hash: BytesN<32>,
+    pub committed_ledger: u32,
+}
+
+/// Emitted once per successful [`MarketplaceContract::commit_product_attestation`] call.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProductAttestationCommittedEvent {
+    pub merchant_id: u64,
+    pub product_id: u64,
+    pub content_hash: BytesN<32>,
+    pub committed_ledger: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub struct MerchantCursor {
@@ -383,6 +422,20 @@ pub enum MarketplaceError {
     BatchTooLarge = 4048,
     /// No [`CancellationPenaltyConfig`] has been set by the admin yet.
     CancellationPenaltyNotConfigured = 4050,
+    /// No dispute reserve pool has been configured for this merchant (issue #509).
+    ReservePoolNotFound = 5031,
+    /// Merchant's reserve balance does not cover the active escrow liability
+    /// at the configured reserve ratio; new order intake is paused (issue #509).
+    InsufficientReserveCoverage = 5032,
+    /// Reserve top-up amount must be greater than zero.
+    InvalidReserveAmount = 5033,
+    /// Reserve ratio must be in `0..=10_000` basis points.
+    InvalidReserveRatio = 5034,
+    /// A product hash attestation has already been committed for this
+    /// `product_id`; attestations are immutable once committed (issue #507).
+    ProductAttestationAlreadyCommitted = 5035,
+    /// No product hash attestation has been committed for this `product_id`.
+    ProductAttestationNotFound = 5036,
 }
 
 // ---------------------------------------------------------------------------
@@ -903,6 +956,10 @@ pub enum DataKey {
     MerchantListingSkuList(u64),
     /// Staked platform governance tokens for a merchant address.
     GovernanceStake(Address),
+    /// Dispute reserve fund pool for a merchant (issue #509).
+    MerchantReservePool(u64),
+    /// Immutable product hash attestation committed at checkout time (issue #507).
+    ProductAttestation(u64),
 }
 
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.
@@ -948,6 +1005,9 @@ const CATEGORY_VOTING_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
 pub const PAYOUT_CHANGE_COOLDOWN_LEDGERS: u32 = 17_280; // ~24 hours
+/// Default dispute reserve ratio (10%) applied the first time a merchant's
+/// reserve pool is touched without an explicit admin configuration (issue #509).
+pub const DEFAULT_RESERVE_RATIO_BPS: u32 = 1_000;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3556,6 +3616,289 @@ impl MarketplaceContract {
             .persistent()
             .set(&DataKey::ActiveEscrowCount(merchant_id), &count);
         Ok(())
+    }
+
+    // --- Merchant Dispute Reserve Fund Pool (issue #509) ---
+    //
+    // Merchants must keep a reserve balance proportional to their open escrow
+    // liability (e.g. 10%). `report_order_opened` is the gate: it refuses to
+    // record a new order's liability — and so refuses the order — once the
+    // merchant's reserve can no longer cover it at the configured ratio.
+    // `report_order_settled` reduces liability as orders complete, which can
+    // unblock intake again. Both mirror the auth model used by
+    // `report_escrow_opened` / `report_escrow_settled` above.
+
+    /// Returns the merchant's reserve pool, if one has been configured or
+    /// touched yet.
+    pub fn get_merchant_reserve_pool(env: Env, merchant_id: u64) -> Option<MerchantReservePool> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantReservePool(merchant_id))
+    }
+
+    /// Admin-only: sets (or updates) the reserve ratio required of
+    /// `merchant_id`, in basis points (`1000` == 10%). Creates the pool with
+    /// a zero balance and zero liability the first time it is called.
+    pub fn configure_reserve_pool(
+        env: Env,
+        admin: Address,
+        merchant_id: u64,
+        reserve_ratio_basis_points: u32,
+    ) -> Result<MerchantReservePool, MarketplaceError> {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone())? {
+            return Err(MarketplaceError::Unauthorized);
+        }
+        if reserve_ratio_basis_points > 10_000 {
+            return Err(MarketplaceError::InvalidReserveRatio);
+        }
+        let merchant_record = Self::get_merchant(env.clone(), merchant_id)?;
+        let owner = merchant_record
+            .owner
+            .ok_or(MarketplaceError::MerchantNotFound)?;
+
+        let key = DataKey::MerchantReservePool(merchant_id);
+        let mut pool: MerchantReservePool =
+            env.storage().persistent().get(&key).unwrap_or(MerchantReservePool {
+                merchant: owner,
+                reserve_balance_stroops: 0,
+                active_escrow_liability_stroops: 0,
+                reserve_ratio_basis_points,
+            });
+        pool.reserve_ratio_basis_points = reserve_ratio_basis_points;
+        env.storage().persistent().set(&key, &pool);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        Ok(pool)
+    }
+
+    /// Merchant top-up of its own dispute reserve balance. Callable at any
+    /// time regardless of lifecycle status, since adding funds can only
+    /// improve solvency. Transfers `amount` of the merchant's registered
+    /// deposit token from `merchant_owner` into the contract and returns the
+    /// new reserve balance.
+    pub fn top_up_reserve(
+        env: Env,
+        merchant_owner: Address,
+        merchant_id: u64,
+        amount: i128,
+    ) -> Result<i128, MarketplaceError> {
+        merchant_owner.require_auth();
+        if amount <= 0 {
+            return Err(MarketplaceError::InvalidReserveAmount);
+        }
+        let merchant_record = Self::get_merchant(env.clone(), merchant_id)?;
+        if merchant_record.owner.as_ref() != Some(&merchant_owner) {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        let (_, deposit_token) = Self::get_merchant_deposit(env.clone(), merchant_id)
+            .ok_or(MarketplaceError::DepositNotFound)?;
+
+        use soroban_sdk::token;
+        let token_client = token::Client::new(&env, &deposit_token);
+        token_client.transfer(&merchant_owner, &env.current_contract_address(), &amount);
+
+        let key = DataKey::MerchantReservePool(merchant_id);
+        let mut pool: MerchantReservePool =
+            env.storage().persistent().get(&key).unwrap_or(MerchantReservePool {
+                merchant: merchant_owner,
+                reserve_balance_stroops: 0,
+                active_escrow_liability_stroops: 0,
+                reserve_ratio_basis_points: DEFAULT_RESERVE_RATIO_BPS,
+            });
+        pool.reserve_balance_stroops = pool
+            .reserve_balance_stroops
+            .checked_add(amount)
+            .ok_or(MarketplaceError::InvalidReserveAmount)?;
+        env.storage().persistent().set(&key, &pool);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        Ok(pool.reserve_balance_stroops)
+    }
+
+    /// Reports that a new escrow order of `order_amount` was opened against
+    /// `merchant_id`, adding it to the merchant's open liability.
+    ///
+    /// Callable by the admin or the configured risk oracle (mirrors
+    /// [`Self::report_escrow_opened`]). Refuses the order with
+    /// [`MarketplaceError::InsufficientReserveCoverage`] when the merchant's
+    /// reserve balance would no longer cover the updated liability at its
+    /// configured reserve ratio. On refusal, no state is changed. A merchant
+    /// touched for the first time starts from a zero balance at the default
+    /// 10% ratio, so it must be funded via [`Self::top_up_reserve`] (or have
+    /// its ratio configured) before any order is accepted.
+    pub fn report_order_opened(
+        env: Env,
+        reporter: Address,
+        merchant_id: u64,
+        order_amount: i128,
+    ) -> Result<(), MarketplaceError> {
+        reporter.require_auth();
+        if !Self::is_admin_or_risk_oracle(&env, &reporter)? {
+            return Err(MarketplaceError::Unauthorized);
+        }
+        if order_amount <= 0 {
+            return Err(MarketplaceError::InvalidReserveAmount);
+        }
+        let merchant_record = Self::get_merchant(env.clone(), merchant_id)?;
+        let owner = merchant_record
+            .owner
+            .ok_or(MarketplaceError::MerchantNotFound)?;
+
+        let key = DataKey::MerchantReservePool(merchant_id);
+        let mut pool: MerchantReservePool =
+            env.storage().persistent().get(&key).unwrap_or(MerchantReservePool {
+                merchant: owner,
+                reserve_balance_stroops: 0,
+                active_escrow_liability_stroops: 0,
+                reserve_ratio_basis_points: DEFAULT_RESERVE_RATIO_BPS,
+            });
+
+        let projected_liability = pool
+            .active_escrow_liability_stroops
+            .checked_add(order_amount)
+            .ok_or(MarketplaceError::InvalidReserveAmount)?;
+        let required_reserve = projected_liability
+            .checked_mul(pool.reserve_ratio_basis_points as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(MarketplaceError::InvalidReserveAmount)?;
+
+        if pool.reserve_balance_stroops < required_reserve {
+            return Err(MarketplaceError::InsufficientReserveCoverage);
+        }
+
+        pool.active_escrow_liability_stroops = projected_liability;
+        env.storage().persistent().set(&key, &pool);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        Ok(())
+    }
+
+    /// Reports that an order of `order_amount` against `merchant_id` settled
+    /// (released, refunded, or cancelled), reducing open liability and
+    /// potentially unblocking new order intake. Floors at zero so a duplicate
+    /// settlement report cannot wrap the liability back up.
+    pub fn report_order_settled(
+        env: Env,
+        reporter: Address,
+        merchant_id: u64,
+        order_amount: i128,
+    ) -> Result<(), MarketplaceError> {
+        reporter.require_auth();
+        if !Self::is_admin_or_risk_oracle(&env, &reporter)? {
+            return Err(MarketplaceError::Unauthorized);
+        }
+        if order_amount <= 0 {
+            return Err(MarketplaceError::InvalidReserveAmount);
+        }
+
+        let key = DataKey::MerchantReservePool(merchant_id);
+        let mut pool: MerchantReservePool = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(MarketplaceError::ReservePoolNotFound)?;
+
+        pool.active_escrow_liability_stroops =
+            (pool.active_escrow_liability_stroops - order_amount).max(0);
+        env.storage().persistent().set(&key, &pool);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        Ok(())
+    }
+
+    // --- Verifiable Product Hash Attestation (issue #507) ---
+    //
+    // Anchors a cryptographic digest of a product's listed terms
+    // (`SHA-256(title || spec || price)`) on-chain at checkout time, so a
+    // merchant cannot alter the listing after a buyer has paid and later
+    // claim the buyer agreed to different terms. The commitment is
+    // write-once: there is no update entry point.
+
+    /// Commits `content_hash` for `product_id`, immutably. Requires an auth
+    /// entry from `merchant`, who must be the registered owner of
+    /// `merchant_id`. Fails with
+    /// [`MarketplaceError::ProductAttestationAlreadyCommitted`] if this
+    /// `product_id` already has a commitment — attestations cannot be
+    /// overwritten.
+    pub fn commit_product_attestation(
+        env: Env,
+        merchant: Address,
+        merchant_id: u64,
+        product_id: u64,
+        content_hash: BytesN<32>,
+    ) -> Result<(), MarketplaceError> {
+        merchant.require_auth();
+        let merchant_record = Self::get_merchant(env.clone(), merchant_id)?;
+        if merchant_record.owner.as_ref() != Some(&merchant) {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        let key = DataKey::ProductAttestation(product_id);
+        if env.storage().persistent().has(&key) {
+            return Err(MarketplaceError::ProductAttestationAlreadyCommitted);
+        }
+
+        let committed_ledger = env.ledger().sequence();
+        let attestation = ProductAttestation {
+            product_id,
+            content_hash: content_hash.clone(),
+            committed_ledger,
+        };
+        env.storage().persistent().set(&key, &attestation);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("prodattst"),
+                merchant_id,
+            ),
+            ProductAttestationCommittedEvent {
+                merchant_id,
+                product_id,
+                content_hash,
+                committed_ledger,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Returns the committed attestation for `product_id`, if any.
+    pub fn get_product_attestation(env: Env, product_id: u64) -> Option<ProductAttestation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProductAttestation(product_id))
+    }
+
+    /// Cryptographically verifies that `expected_hash` matches the hash
+    /// committed on-chain for `product_id` at checkout time.
+    ///
+    /// Used by dispute arbitrators to cross-reference the merchant's current
+    /// claims against the immutable original commitment, and by buyers to
+    /// independently confirm their order matches what was anchored at
+    /// purchase time. Fails with
+    /// [`MarketplaceError::ProductAttestationNotFound`] if nothing was ever
+    /// committed for `product_id`.
+    pub fn verify_product_attestation(
+        env: Env,
+        product_id: u64,
+        expected_hash: BytesN<32>,
+    ) -> Result<bool, MarketplaceError> {
+        let attestation: ProductAttestation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProductAttestation(product_id))
+            .ok_or(MarketplaceError::ProductAttestationNotFound)?;
+        Ok(attestation.content_hash == expected_hash)
     }
 
     /// Closes the storefront to new orders without retiring the registry
