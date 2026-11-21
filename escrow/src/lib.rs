@@ -77,6 +77,10 @@ mod admin_actions;
 #[cfg(test)]
 mod admin_actions_test;
 mod storage;
+/// Token allowance safety revocation after DeFi pool deposits and AMM swaps
+/// (issue #599).
+pub mod token_safety;
+pub use token_safety::revoke_allowance_safe;
 /// Safe cross-contract token transfer wrapper with typed SAC/SEP-41 error
 /// propagation (issue #481).
 pub mod token_transfer;
@@ -5936,6 +5940,10 @@ impl EscrowContract {
             &result.output_amount,
         );
 
+        // Revoke any residual allowance the path-payment router may hold
+        // after the swap execution (issue #599).
+        token_safety::revoke_allowance_safe(&env, &record.token, &router);
+
         record.released_amount = record
             .released_amount
             .checked_add(result.input_amount)
@@ -6509,6 +6517,15 @@ impl EscrowContract {
         )?;
 
         blend_yield::fund(&env, escrow_id, &record.token, net_received);
+        // Revoke any residual allowance the pool may hold after the deposit
+        // (issue #599).
+        if let Some(cfg) = blend_yield::config(&env, escrow_id) {
+            token_safety::revoke_allowance_safe(
+                &env,
+                &record.token,
+                &cfg.lending_pool_contract,
+            );
+        }
 
         record.amount = net_received;
         record.status = EscrowStatus::Funded;
@@ -9258,6 +9275,14 @@ impl EscrowContract {
             Ok(Ok(_)) => return Err(EscrowError::SlippageExceeded),
             _ => return Err(EscrowError::SwapRouterCallFailed),
         };
+
+        // Revoke any residual allowance the router may hold after the swap
+        // (issue #599).
+        token_safety::revoke_allowance_safe(
+            &env,
+            &record.token,
+            &swap_config.router_contract,
+        );
 
         record.released_amount += remaining;
         record.status = EscrowStatus::Released;
