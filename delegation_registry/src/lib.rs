@@ -518,6 +518,25 @@ pub struct SlidingWindowRateLimit {
     pub window_start_ledger: u32,
 }
 
+/// Per-delegation merchant whitelist restricting which merchant addresses an
+/// agent may target on behalf of the owner, with an independent spending cap
+/// per merchant (issue #493).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationMerchantFilter {
+    /// Merchant addresses the delegated agent is permitted to target.
+    pub allowed_merchants: Vec<Address>,
+    /// When `true`, only merchants in `allowed_merchants` may be targeted at
+    /// all. When `false`, `allowed_merchants` still caps spend per listed
+    /// merchant, but merchants outside the list are permitted (unlimited
+    /// per-merchant tracking is only enforced for merchants the owner
+    /// explicitly configured a limit for).
+    pub is_strict_whitelist: bool,
+    /// Maximum cumulative stroops the agent may spend with any single
+    /// whitelisted merchant over the lifetime of the delegation.
+    pub max_per_merchant_stroops: i128,
+}
+
 /// Topic 0 symbol for every event emitted by the delegation registry.
 pub const EVENT_TOPIC_CONTRACT: Symbol = symbol_short!("deleg");
 
@@ -577,6 +596,11 @@ pub enum DataKey {
     /// Sliding-window spend velocity limit configured for a delegation
     /// (issue #494), keyed by delegation id.
     SpendRateLimit(u64),
+    /// Merchant whitelist filter configured for a delegation (issue #493).
+    MerchantFilter(u64),
+    /// Cumulative stroops spent by a delegation with a specific merchant
+    /// (issue #493).
+    MerchantSpent(u64, Address),
 }
 
 /// Current delegation storage schema version.
@@ -705,6 +729,14 @@ pub enum DelegationError {
     /// The proposed spend would exceed the delegation's configured
     /// sliding-window spend velocity limit (issue #494).
     SpendRateLimitExceeded = 4026,
+    /// The target merchant is not present in the delegation's merchant
+    /// whitelist filter (issue #493).
+    UnauthorizedMerchant = 4027,
+    /// The requested spend would push cumulative spend with this merchant
+    /// past the delegation's configured per-merchant cap (issue #493).
+    MerchantSpendLimitExceeded = 4028,
+    /// The merchant filter's `max_per_merchant_stroops` must be positive.
+    InvalidMerchantFilter = 4029,
 }
 
 /// The delegation registry contract.
@@ -3158,6 +3190,160 @@ impl DelegationRegistry {
         let current_time = env.ledger().timestamp();
         let is_timestamp_valid = expected_timestamp >= current_time;
         Ok((true, is_timestamp_valid))
+    }
+
+    // ── Merchant whitelist filters (issue #493) ─────────────────────────────
+
+    /// Sets (or replaces) the merchant whitelist filter for `delegation_id`.
+    ///
+    /// Requires authorization from the delegation's owner. Rejects a filter
+    /// whose `max_per_merchant_stroops` is not strictly positive, since a
+    /// zero/negative cap would make every tracked merchant spend fail
+    /// unconditionally.
+    pub fn set_merchant_filter(
+        env: Env,
+        delegation_id: u64,
+        filter: DelegationMerchantFilter,
+    ) -> Result<bool, DelegationError> {
+        let record =
+            Self::load_delegation_by_id(&env, delegation_id).ok_or(DelegationError::NotFound)?;
+
+        record.owner.require_auth();
+
+        if filter.max_per_merchant_stroops <= 0 {
+            return Err(DelegationError::InvalidMerchantFilter);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantFilter(delegation_id), &filter);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerchantFilter(delegation_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(true)
+    }
+
+    /// Returns the merchant whitelist filter configured for `delegation_id`,
+    /// or `None` if the owner never set one (in which case the delegation is
+    /// unrestricted with respect to merchants).
+    pub fn get_merchant_filter(env: Env, delegation_id: u64) -> Option<DelegationMerchantFilter> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantFilter(delegation_id))
+    }
+
+    /// Returns the cumulative stroops already spent by `delegation_id` with
+    /// `merchant`.
+    pub fn get_merchant_spent(env: Env, delegation_id: u64, merchant: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantSpent(delegation_id, merchant))
+            .unwrap_or(0)
+    }
+
+    /// Authorizes a prospective checkout of `amount` stroops with `merchant`
+    /// on behalf of `delegation_id`, and atomically records the spend.
+    ///
+    /// Intended to be called by the contract that actually executes the
+    /// checkout (e.g. the escrow or marketplace contract) immediately before
+    /// moving funds, so the merchant filter is enforced at the point of
+    /// spend rather than only at session-validation time. Callers should
+    /// treat an `Err` return as a hard stop: no funds should move.
+    ///
+    /// Enforcement rules:
+    /// - The delegation must be `Active`, unexpired, and registered to
+    ///   `agent_id` (same identity/liveness checks as
+    ///   [`is_authorized`](Self::is_authorized)).
+    /// - If no merchant filter is configured, the checkout is unrestricted
+    ///   and this call is a no-op that returns `Ok(amount)`.
+    /// - If a filter is configured and `merchant` is in
+    ///   `allowed_merchants`, cumulative spend with that merchant (tracked
+    ///   independently per merchant) must not exceed
+    ///   `max_per_merchant_stroops`, or this returns
+    ///   `DelegationError::MerchantSpendLimitExceeded`.
+    /// - If a filter is configured and `merchant` is *not* in
+    ///   `allowed_merchants`: when `is_strict_whitelist` is `true` this
+    ///   returns `DelegationError::UnauthorizedMerchant`; when `false` the
+    ///   checkout is allowed through uncapped (the filter only polices
+    ///   merchants the owner explicitly listed).
+    ///
+    /// Returns the new cumulative stroops spent with `merchant` on success.
+    pub fn authorize_merchant_checkout(
+        env: Env,
+        delegation_id: u64,
+        agent_id: BytesN<32>,
+        merchant: Address,
+        amount: i128,
+    ) -> Result<i128, DelegationError> {
+        if amount <= 0 {
+            return Err(DelegationError::InvalidParam);
+        }
+
+        let record =
+            Self::load_delegation_by_id(&env, delegation_id).ok_or(DelegationError::NotFound)?;
+
+        if record.status != DelegationStatus::Active {
+            return Err(DelegationError::NotActive);
+        }
+
+        if env.ledger().sequence() >= record.expires_at_ledger {
+            return Err(DelegationError::Expired);
+        }
+
+        if record.agent_id != agent_id {
+            return Err(DelegationError::NotAuthorized);
+        }
+
+        let filter: Option<DelegationMerchantFilter> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantFilter(delegation_id));
+
+        let filter = match filter {
+            Some(f) => f,
+            // No filter configured: unrestricted with respect to merchants.
+            None => {
+                Self::bump_delegation(&env, delegation_id, &record.owner);
+                return Ok(amount);
+            }
+        };
+
+        let is_whitelisted = filter.allowed_merchants.contains(&merchant);
+
+        if !is_whitelisted {
+            if filter.is_strict_whitelist {
+                return Err(DelegationError::UnauthorizedMerchant);
+            }
+            // Not strictly enforced: allow, uncapped, since this merchant
+            // was never given a per-merchant limit to track against.
+            Self::bump_delegation(&env, delegation_id, &record.owner);
+            return Ok(amount);
+        }
+
+        let spent_key = DataKey::MerchantSpent(delegation_id, merchant.clone());
+        let previously_spent: i128 = env.storage().persistent().get(&spent_key).unwrap_or(0);
+
+        let new_total = previously_spent
+            .checked_add(amount)
+            .ok_or(DelegationError::MerchantSpendLimitExceeded)?;
+
+        if new_total > filter.max_per_merchant_stroops {
+            return Err(DelegationError::MerchantSpendLimitExceeded);
+        }
+
+        env.storage().persistent().set(&spent_key, &new_total);
+        env.storage().persistent().extend_ttl(
+            &spent_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Self::bump_delegation(&env, delegation_id, &record.owner);
+
+        Ok(new_total)
     }
 }
 

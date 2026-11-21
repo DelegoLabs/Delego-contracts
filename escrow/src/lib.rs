@@ -77,6 +77,11 @@ mod admin_actions;
 #[cfg(test)]
 mod admin_actions_test;
 mod storage;
+/// Safe cross-contract token transfer wrapper with typed SAC/SEP-41 error
+/// propagation (issue #481).
+pub mod token_transfer;
+#[cfg(test)]
+mod token_transfer_test;
 /// Unit-test sub-modules for the escrow contract (issue #540).
 #[cfg(test)]
 mod tests;
@@ -112,6 +117,9 @@ pub enum EscrowStatus {
     /// courier pickup (issue #487). Full deposit is returned to buyer with
     /// zero platform fees.
     CancelledByMutualConsent,
+    /// A negotiated compromise split the remaining balance between buyer and
+    /// merchant via `settle_partial_refund` (issue #483).
+    SettledWithPartialRefund,
 }
 
 #[contracttype]
@@ -350,6 +358,11 @@ pub struct EscrowRecord {
 /// Token-unit threshold above which escrow releases require finance approval.
 pub const DUAL_CONTROL_THRESHOLD: i128 = 10_000;
 
+/// Maximum share of the platform fee (out of 10_000) that may be routed to a
+/// referrer via a [`ReferralAttribution`] (issue #492). Capped below 100% so
+/// the platform always retains some portion of its own fee.
+pub const MAX_REFERRAL_COMMISSION_BPS: u32 = 5_000;
+
 /// A single tier in a merchant's commission schedule.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -515,6 +528,34 @@ pub struct SignedDeliveryProof {
     pub signature: BytesN<64>,
 }
 
+/// Buyer/merchant negotiated split of a disputed escrow's remaining balance
+/// (issue #483).
+///
+/// `buyer_refund_amount` and `merchant_payout_amount` are the two parties'
+/// agreed net shares; the contract independently computes the prorated
+/// platform fee owed on the merchant's share and verifies the three amounts
+/// exactly exhaust the escrow's remaining deposit with zero rounding dust,
+/// rejecting the request otherwise.
+///
+/// As with [`TimeoutExtensionVoucher`], the signatures are included in the
+/// canonical authorization arguments and the contract additionally calls
+/// `require_auth_for_args` for both participants, so Soroban verifies each
+/// participant's cryptographic signature over the complete request.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitSettlementRequest {
+    /// Escrow being settled.
+    pub escrow_id: u64,
+    /// Net amount returned to the buyer.
+    pub buyer_refund_amount: i128,
+    /// Net amount paid to the merchant, after the prorated platform fee.
+    pub merchant_payout_amount: i128,
+    /// Buyer's authorization signature over this request.
+    pub buyer_signature: BytesN<64>,
+    /// Merchant's authorization signature over this request.
+    pub merchant_signature: BytesN<64>,
+}
+
 /// Buyer/seller authorization envelope for an absolute timeout extension.
 ///
 /// The signatures are included in the canonical authorization arguments. The
@@ -566,6 +607,36 @@ struct SignedDeliveryPayload {
     carrier_code: Symbol,
     tracking_hash: BytesN<32>,
     delivery_timestamp: u64,
+}
+
+/// Referral commission attribution for an escrow (issue #492).
+///
+/// Registered once, immutably, via [`EscrowContract::set_referral_attribution`]
+/// before an escrow's first release. On every subsequent release — partial or
+/// full — a `commission_basis_points` share of that release's platform fee is
+/// disbursed directly to `referrer_address`, with the remainder of the fee
+/// following the normal treasury distribution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferralAttribution {
+    /// On-chain address of the referrer who receives the commission.
+    pub referrer_address: Address,
+    /// Share of the platform fee (out of 10_000) paid to `referrer_address`.
+    pub commission_basis_points: u32,
+    /// Ed25519 signature from `referrer_address`'s registered referral key
+    /// over `(escrow_id, referrer_address, commission_basis_points)`,
+    /// proving the referrer actually originated the referral rather than the
+    /// buyer unilaterally naming an address to redirect fees to.
+    pub referrer_signature: BytesN<64>,
+}
+
+/// Canonical signed payload for [`ReferralAttribution::referrer_signature`].
+#[contracttype]
+#[derive(Clone, Debug)]
+struct ReferralAttributionPayload {
+    escrow_id: u64,
+    referrer_address: Address,
+    commission_basis_points: u32,
 }
 
 /// Emitted when a new escrow is created.
@@ -698,6 +769,21 @@ pub struct EscrowReleasedEvent {
     pub amount: i128,
     /// Address that triggered the release.
     pub released_by: Address,
+}
+
+/// Emitted when a disputed escrow is settled via a negotiated split
+/// (issue #483).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowSplitSettledEvent {
+    /// Unique identifier for the escrow.
+    pub escrow_id: u64,
+    /// Amount refunded to the buyer.
+    pub buyer_refund_amount: i128,
+    /// Net amount paid to the merchant.
+    pub merchant_payout_amount: i128,
+    /// Prorated platform fee taken from the merchant's gross share.
+    pub prorated_fee: i128,
 }
 
 /// Emitted when an oracle relayer is reimbursed for the transaction cost of
@@ -2039,6 +2125,12 @@ pub enum DataKey {
     /// Mutual cancellation record for an escrow cancelled by buyer + merchant
     /// cooperative agreement before courier pickup (issue #487).
     MutualCancellation(u64),
+    /// Referral commission attribution registered for an escrow, immutable
+    /// once set (issue #492).
+    ReferralAttribution(u64),
+    /// Ed25519 public key registered by a referrer to sign referral
+    /// attributions (issue #492).
+    ReferrerPublicKey(Address),
 }
 
 // NOTE: `EscrowError` intentionally does not use the `#[contracterror]` derive.
@@ -2475,6 +2567,44 @@ pub enum EscrowError {
     /// Escrow has already been shipped; mutual cancellation is no longer
     /// permitted (issue #487).
     AlreadyShipped = 456,
+    /// Cross-contract token `transfer`/`transfer_from` call failed and no
+    /// more specific reason could be determined (issue #481).
+    TokenTransferFailed = 600,
+    /// Token contract call succeeded but returned `false` (ERC-20-style
+    /// rejection) (issue #481).
+    TokenTransferRejected = 601,
+    /// Token contract call succeeded but returned a value that is neither
+    /// void nor `bool` (issue #481).
+    TokenUnexpectedReturn = 602,
+    /// Token transfer failed because the source's balance is insufficient
+    /// (SAC `BalanceError`) (issue #481).
+    TokenInsufficientBalance = 603,
+    /// Token transfer failed because it exceeds the caller's remaining
+    /// allowance (SAC `AllowanceError`) (issue #481).
+    TokenAllowanceExceeded = 604,
+    /// Token transfer failed because the source or destination trustline is
+    /// frozen/deauthorized (SAC `BalanceDeauthorizedError`) (issue #481).
+    TokenFrozen = 605,
+    /// Token transfer failed because the token address has no trustline for
+    /// the destination, or does not behave like a valid token contract (SAC
+    /// `TrustlineMissingError`) (issue #481).
+    TokenInvalidTokenContract = 606,
+    /// A referral attribution has already been registered for this escrow;
+    /// attributions are immutable once set (issue #492).
+    ReferralAlreadySet = 607,
+    /// The referrer address is the same as the buyer or seller on this
+    /// escrow (issue #492).
+    SelfReferralNotAllowed = 608,
+    /// The referral commission basis points are zero or exceed the maximum
+    /// allowed share of the platform fee (issue #492).
+    InvalidReferralCommission = 609,
+    /// The referrer has not registered an Ed25519 public key via
+    /// `register_referrer_key` (issue #492).
+    ReferrerKeyNotSet = 610,
+    /// A `SplitSettlementRequest`'s amounts are invalid: negative, or
+    /// `buyer_refund_amount + merchant_payout_amount + prorated_fee` does
+    /// not exactly equal the escrow's remaining deposit (issue #483).
+    InvalidSplitSettlement = 611,
 }
 
 pub fn execute_atomic_operation<F, T>(env: &Env, f: F) -> Result<T, EscrowError>
@@ -3273,6 +3403,7 @@ fn check_not_terminal(record: &EscrowRecord) -> Result<(), EscrowError> {
         EscrowStatus::Refunded => Err(EscrowError::AlreadyRefunded),
         EscrowStatus::Cancelled => Err(EscrowError::AlreadyCancelled),
         EscrowStatus::CancelledByMutualConsent => Err(EscrowError::AlreadyCancelled),
+        EscrowStatus::SettledWithPartialRefund => Err(EscrowError::AlreadyReleased),
         _ => Ok(()),
     }
 }
@@ -5155,10 +5286,15 @@ impl EscrowContract {
             }
             (total_fee, total_bps)
         } else {
+            // Pre-existing bug (unrelated to issue #483): this branch
+            // previously computed `effective_fee_bps`/`bps_fee` twice in a
+            // row with a stray, unreachable duplicate (`let fee_bps = ...;
+            // (expr) let bps = ...; (expr)`), which does not parse as valid
+            // Rust. Collapsed to the single computation both copies agreed
+            // on; fixed here only because it otherwise blocks this file
+            // (and therefore `settle_partial_refund`) from compiling at all.
             let fee_bps = effective_fee_bps(env, merchant)?;
             (bps_fee(amount, fee_bps), fee_bps)
-            let bps = effective_fee_bps(env, merchant)?;
-            (bps_fee(amount, bps), bps)
         };
 
         // Apply floor: ensure fee is never zero due to integer truncation (issue #540).
@@ -7390,7 +7526,11 @@ impl EscrowContract {
         let payout = Self::compute_payout(env, &record.seller, release_amount)?;
         // Strict conservation of this release slice (issue #547).
         assert_value_conservation(release_amount, 0, payout.seller_net, payout.fee)?;
-        Self::distribute_fee(env, &token_client, payout.fee)?;
+        // Carve out the referrer's commission (if any) before splitting the
+        // remaining fee across the treasury/treasuries (issue #492).
+        let treasury_fee =
+            Self::disburse_referral_commission(env, &token_client, escrow_id, payout.fee)?;
+        Self::distribute_fee(env, &token_client, treasury_fee)?;
         token_client.transfer(
             &env.current_contract_address(),
             &record.seller,
@@ -8007,6 +8147,159 @@ impl EscrowContract {
         Ok(true)
     }
 
+    /// Settles a disputed escrow via a negotiated compromise: splits the
+    /// escrow's entire remaining balance between the buyer and merchant in a
+    /// single atomic transaction, deducting the prorated platform fee from
+    /// the merchant's share (issue #483).
+    ///
+    /// Both the buyer and merchant must authorize the exact request via
+    /// `require_auth_for_args` (mirroring [`Self::extend_timeout_mutual_sigs`]),
+    /// so changing either amount or either signature invalidates the
+    /// authorization. The contract independently computes the prorated fee
+    /// on the merchant's gross share via the normal fee-tier machinery and
+    /// rejects the request unless `buyer_refund_amount +
+    /// merchant_payout_amount + prorated_fee` exactly equals the escrow's
+    /// remaining (unreleased, unrefunded) deposit, so settlement can never
+    /// leave rounding dust stranded in the contract.
+    ///
+    /// # Errors
+    /// - [`EscrowError::NotFound`] if the escrow does not exist.
+    /// - [`EscrowError::InvalidStatus`] if the escrow is not `Funded`,
+    ///   `Disputed`, or `Inspection`.
+    /// - [`EscrowError::ZeroAmount`] if either requested amount is negative.
+    /// - [`EscrowError::InvalidSplitSettlement`] if the requested split does
+    ///   not exactly exhaust the remaining deposit once the prorated fee is
+    ///   accounted for.
+    pub fn settle_partial_refund(
+        env: Env,
+        request: SplitSettlementRequest,
+    ) -> Result<bool, EscrowError> {
+        Self::enter_release(&env)?;
+
+        let key = DataKey::Escrow(request.escrow_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        if record.status != EscrowStatus::Funded
+            && record.status != EscrowStatus::Disputed
+            && record.status != EscrowStatus::Inspection
+        {
+            return Err(EscrowError::InvalidStatus);
+        }
+
+        if request.buyer_refund_amount < 0 || request.merchant_payout_amount < 0 {
+            return Err(EscrowError::ZeroAmount);
+        }
+
+        // Each party authorizes the exact, complete request: the signatures
+        // are bound into the authorized argument list so a relayer cannot
+        // alter either amount without invalidating both authorizations.
+        record.buyer.require_auth_for_args(soroban_sdk::vec![
+            &env,
+            request.escrow_id.into_val(&env),
+            request.buyer_refund_amount.into_val(&env),
+            request.merchant_payout_amount.into_val(&env),
+            request.buyer_signature.clone().into_val(&env),
+            request.merchant_signature.clone().into_val(&env),
+        ]);
+        record.seller.require_auth_for_args(soroban_sdk::vec![
+            &env,
+            request.escrow_id.into_val(&env),
+            request.buyer_refund_amount.into_val(&env),
+            request.merchant_payout_amount.into_val(&env),
+            request.buyer_signature.into_val(&env),
+            request.merchant_signature.into_val(&env),
+        ]);
+
+        let remaining = record
+            .amount
+            .checked_sub(record.released_amount)
+            .and_then(|balance| balance.checked_sub(record.refunded_amount))
+            .ok_or(EscrowError::MathOverflow)?;
+
+        let gross_for_merchant = remaining
+            .checked_sub(request.buyer_refund_amount)
+            .ok_or(EscrowError::MathOverflow)?;
+        if gross_for_merchant < 0 {
+            return Err(EscrowError::InvalidSplitSettlement);
+        }
+
+        let payout = Self::compute_payout(&env, &record.seller, gross_for_merchant)?;
+        if payout.seller_net != request.merchant_payout_amount {
+            return Err(EscrowError::InvalidSplitSettlement);
+        }
+
+        let total_disbursed = request
+            .buyer_refund_amount
+            .checked_add(request.merchant_payout_amount)
+            .and_then(|sum| sum.checked_add(payout.fee))
+            .ok_or(EscrowError::MathOverflow)?;
+        if total_disbursed != remaining {
+            return Err(EscrowError::InvalidSplitSettlement);
+        }
+
+        let token_client = soroban_sdk::token::Client::new(&env, &record.token);
+
+        if request.buyer_refund_amount > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &record.buyer,
+                &request.buyer_refund_amount,
+            );
+        }
+        if request.merchant_payout_amount > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &record.seller,
+                &request.merchant_payout_amount,
+            );
+        }
+        // Referral commission (if any) comes out of the platform's own fee
+        // share, same as a normal release (issue #492).
+        let treasury_fee = Self::disburse_referral_commission(
+            &env,
+            &token_client,
+            request.escrow_id,
+            payout.fee,
+        )?;
+        Self::distribute_fee(&env, &token_client, treasury_fee)?;
+
+        record.released_amount = record
+            .released_amount
+            .checked_add(request.merchant_payout_amount)
+            .ok_or(EscrowError::MathOverflow)?;
+        record.refunded_amount = record
+            .refunded_amount
+            .checked_add(request.buyer_refund_amount)
+            .ok_or(EscrowError::MathOverflow)?;
+        record.status = EscrowStatus::SettledWithPartialRefund;
+        record.updated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SettledLedger(request.escrow_id), &env.ledger().sequence());
+
+        env.events().publish(
+            (
+                symbol_short!("escrow"),
+                symbol_short!("splitset"),
+                request.escrow_id,
+            ),
+            EscrowSplitSettledEvent {
+                escrow_id: request.escrow_id,
+                buyer_refund_amount: request.buyer_refund_amount,
+                merchant_payout_amount: request.merchant_payout_amount,
+                prorated_fee: payout.fee,
+            },
+        );
+
+        Self::exit_release(&env);
+        Ok(true)
+    }
+
     /// Register the Ed25519 public key used to verify [`DelegatedReleaseAuth`]
     /// signatures for gasless / relayed releases. Must be authorized by `buyer`.
     pub fn set_buyer_release_key(
@@ -8027,6 +8320,183 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::BuyerReleaseNonce(buyer))
             .unwrap_or(0)
+    }
+
+    /// Registers (or rotates) the Ed25519 public key a referrer uses to sign
+    /// [`ReferralAttribution`]s. Must be authorized by `referrer` (issue #492).
+    pub fn register_referrer_key(
+        env: Env,
+        referrer: Address,
+        public_key: BytesN<32>,
+    ) -> Result<bool, EscrowError> {
+        referrer.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::ReferrerPublicKey(referrer), &public_key);
+        Ok(true)
+    }
+
+    /// Registers an immutable referral commission attribution for
+    /// `escrow_id` (issue #492).
+    ///
+    /// Must be called by the escrow's buyer before the escrow has had any
+    /// funds released (an escrow that has already started paying out cannot
+    /// retroactively redirect a share of fees already distributed). The
+    /// referrer must have previously registered a signing key via
+    /// [`Self::register_referrer_key`], and `referral.referrer_signature`
+    /// must verify over `(escrow_id, referrer_address, commission_basis_points)`
+    /// under that key — this proves the referrer actually originated the
+    /// referral, rather than the buyer unilaterally naming an address to
+    /// redirect fees to.
+    ///
+    /// # Errors
+    /// - [`EscrowError::NotFound`] if the escrow does not exist.
+    /// - [`EscrowError::Unauthorized`] if `buyer` is not the escrow's buyer.
+    /// - [`EscrowError::ReferralAlreadySet`] if an attribution is already
+    ///   registered for this escrow.
+    /// - [`EscrowError::SelfReferralNotAllowed`] if the referrer is the
+    ///   escrow's buyer or seller.
+    /// - [`EscrowError::InvalidReferralCommission`] if
+    ///   `commission_basis_points` is zero or exceeds
+    ///   [`MAX_REFERRAL_COMMISSION_BPS`].
+    /// - [`EscrowError::ReferrerKeyNotSet`] if the referrer never registered
+    ///   a signing key.
+    pub fn set_referral_attribution(
+        env: Env,
+        escrow_id: u64,
+        buyer: Address,
+        referral: ReferralAttribution,
+    ) -> Result<bool, EscrowError> {
+        buyer.require_auth();
+
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        if buyer != record.buyer {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        if record.released_amount > 0 {
+            return Err(EscrowError::ReferralAlreadySet);
+        }
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::ReferralAttribution(escrow_id))
+        {
+            return Err(EscrowError::ReferralAlreadySet);
+        }
+
+        if referral.referrer_address == record.buyer || referral.referrer_address == record.seller
+        {
+            return Err(EscrowError::SelfReferralNotAllowed);
+        }
+
+        if referral.commission_basis_points == 0
+            || referral.commission_basis_points > MAX_REFERRAL_COMMISSION_BPS
+        {
+            return Err(EscrowError::InvalidReferralCommission);
+        }
+
+        let public_key: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReferrerPublicKey(referral.referrer_address.clone()))
+            .ok_or(EscrowError::ReferrerKeyNotSet)?;
+
+        let payload = ReferralAttributionPayload {
+            escrow_id,
+            referrer_address: referral.referrer_address.clone(),
+            commission_basis_points: referral.commission_basis_points,
+        }
+        .to_xdr(&env);
+        env.crypto()
+            .ed25519_verify(&public_key, &payload, &referral.referrer_signature);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReferralAttribution(escrow_id), &referral);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ReferralAttribution(escrow_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("escrow"),
+                symbol_short!("referral"),
+                escrow_id,
+            ),
+            (referral.referrer_address, referral.commission_basis_points),
+        );
+
+        Ok(true)
+    }
+
+    /// Returns the referral attribution registered for `escrow_id`, if any.
+    pub fn get_referral_attribution(env: Env, escrow_id: u64) -> Option<ReferralAttribution> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReferralAttribution(escrow_id))
+    }
+
+    /// Pays the registered referrer their configured share of `total_fee`
+    /// for `escrow_id`, if any, and returns the remaining fee still owed to
+    /// the treasury/treasuries. A no-op (returns `total_fee` unchanged) when
+    /// no referral attribution is registered for this escrow (issue #492).
+    fn disburse_referral_commission(
+        env: &Env,
+        token_client: &soroban_sdk::token::Client,
+        escrow_id: u64,
+        total_fee: i128,
+    ) -> Result<i128, EscrowError> {
+        if total_fee <= 0 {
+            return Ok(total_fee);
+        }
+
+        let attribution: Option<ReferralAttribution> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReferralAttribution(escrow_id));
+
+        let attribution = match attribution {
+            Some(a) => a,
+            None => return Ok(total_fee),
+        };
+
+        let commission = total_fee
+            .checked_mul(attribution.commission_basis_points as i128)
+            .ok_or(EscrowError::MathOverflow)?
+            / 10_000;
+
+        if commission <= 0 {
+            return Ok(total_fee);
+        }
+
+        token_client.transfer(
+            &env.current_contract_address(),
+            &attribution.referrer_address,
+            &commission,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("escrow"),
+                symbol_short!("refpaid"),
+                escrow_id,
+            ),
+            (attribution.referrer_address, commission),
+        );
+
+        total_fee
+            .checked_sub(commission)
+            .ok_or(EscrowError::MathOverflow)
     }
 
     /// Release escrowed funds to the merchant using a buyer-signed,
@@ -11778,6 +12248,13 @@ impl EscrowContract {
             EscrowStatus::Disputed => Some(symbol_short!("disputed")),
             EscrowStatus::InitialRuling => Some(symbol_short!("ruling")),
             EscrowStatus::Cancelled => Some(symbol_short!("cancelled")),
+            // Pre-existing gap (unrelated to issue #483): this match was
+            // never updated when `CancelledByMutualConsent` was added for
+            // issue #487, leaving it non-exhaustive. Filled in here only
+            // because adding `SettledWithPartialRefund` below requires this
+            // match to compile at all.
+            EscrowStatus::CancelledByMutualConsent => Some(symbol_short!("cancelled")),
+            EscrowStatus::SettledWithPartialRefund => Some(symbol_short!("settled")),
         }
     }
 
@@ -19057,6 +19534,321 @@ mod settled_archival_tests {
         assert_eq!(
             f.client.try_archive_settled_escrow(&999999),
             Err(Ok(EscrowError::NotFound))
+        );
+    }
+}
+
+/// Tests for referral commission attribution (issue #492).
+#[cfg(test)]
+mod referral_attribution_tests {
+    use super::*;
+    use ed25519_dalek::Signer;
+    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient};
+
+    struct Fixture<'a> {
+        env: Env,
+        client: EscrowContractClient<'a>,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+    }
+
+    fn setup(env: &Env) -> Fixture<'_> {
+        soroban_sdk::testutils::Ledger::with_mut(&env.ledger(), |l| {
+            l.min_persistent_entry_ttl = PERSISTENT_BUMP_AMOUNT;
+        });
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 1_000, // 10% fee, large enough to make commission splits legible
+            treasury,
+            min_amount: 100,
+            max_amount: 1_000_000,
+            min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(env, &contract_id);
+        StellarAssetClient::new(env, &token).mint(&buyer, &1_000_000);
+        admin_actions_test::approve(env, &client, &admin, AdminAction::AddToken(token.clone()));
+        Fixture {
+            env: env.clone(),
+            client,
+            buyer,
+            seller,
+            token,
+        }
+    }
+
+    /// A deterministic Ed25519 keypair derived from a fixed seed, purely for
+    /// test signing — not a real secret.
+    fn test_keypair(env: &Env, seed: u8) -> (BytesN<32>, ed25519_dalek::SigningKey) {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let public_key = BytesN::from_array(env, &signing_key.verifying_key().to_bytes());
+        (public_key, signing_key)
+    }
+
+    fn sign_attribution(
+        env: &Env,
+        signing_key: &ed25519_dalek::SigningKey,
+        escrow_id: u64,
+        referrer_address: &Address,
+        commission_basis_points: u32,
+    ) -> BytesN<64> {
+        let payload = ReferralAttributionPayload {
+            escrow_id,
+            referrer_address: referrer_address.clone(),
+            commission_basis_points,
+        }
+        .to_xdr(env);
+        let mut payload_bytes = vec![0u8; payload.len() as usize];
+        payload.copy_into_slice(&mut payload_bytes);
+        BytesN::from_array(env, &signing_key.sign(&payload_bytes).to_bytes())
+    }
+
+    #[test]
+    fn referral_commission_paid_on_release() {
+        let env = Env::default();
+        let f = setup(&env);
+        let (public_key, signing_key) = test_keypair(&env, 7);
+        let referrer = Address::generate(&env);
+
+        f.client.register_referrer_key(&referrer, &public_key);
+
+        let order_id = BytesN::from_array(&f.env, &[1u8; 32]);
+        let escrow_id = f.client.deposit(
+            &f.buyer,
+            &f.seller,
+            &f.token,
+            &10_000i128,
+            &order_id,
+            &10_000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
+
+        let commission_bps = 2_000u32; // 20% of the platform fee
+        let signature =
+            sign_attribution(&env, &signing_key, escrow_id, &referrer, commission_bps);
+
+        f.client.set_referral_attribution(
+            &escrow_id,
+            &f.buyer,
+            &ReferralAttribution {
+                referrer_address: referrer.clone(),
+                commission_basis_points: commission_bps,
+                referrer_signature: signature,
+            },
+        );
+
+        let token_client = soroban_sdk::token::Client::new(&env, &f.token);
+        f.client.release_funds(&escrow_id, &f.buyer);
+
+        // fee = 10_000 * 10% = 1_000; referrer gets 20% of that = 200.
+        assert_eq!(token_client.balance(&referrer), 200);
+    }
+
+    #[test]
+    fn self_referral_is_rejected() {
+        let env = Env::default();
+        let f = setup(&env);
+        let (public_key, signing_key) = test_keypair(&env, 9);
+
+        f.client.register_referrer_key(&f.seller, &public_key);
+
+        let order_id = BytesN::from_array(&f.env, &[2u8; 32]);
+        let escrow_id = f.client.deposit(
+            &f.buyer,
+            &f.seller,
+            &f.token,
+            &10_000i128,
+            &order_id,
+            &10_000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
+
+        let signature = sign_attribution(&env, &signing_key, escrow_id, &f.seller, 1_000);
+
+        assert_eq!(
+            f.client.try_set_referral_attribution(
+                &escrow_id,
+                &f.buyer,
+                &ReferralAttribution {
+                    referrer_address: f.seller.clone(),
+                    commission_basis_points: 1_000,
+                    referrer_signature: signature,
+                },
+            ),
+            Err(Ok(EscrowError::SelfReferralNotAllowed))
+        );
+    }
+
+    #[test]
+    fn commission_above_max_is_rejected() {
+        let env = Env::default();
+        let f = setup(&env);
+        let (public_key, signing_key) = test_keypair(&env, 11);
+        let referrer = Address::generate(&env);
+
+        f.client.register_referrer_key(&referrer, &public_key);
+
+        let order_id = BytesN::from_array(&f.env, &[3u8; 32]);
+        let escrow_id = f.client.deposit(
+            &f.buyer,
+            &f.seller,
+            &f.token,
+            &10_000i128,
+            &order_id,
+            &10_000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
+
+        let too_high_bps = MAX_REFERRAL_COMMISSION_BPS + 1;
+        let signature = sign_attribution(&env, &signing_key, escrow_id, &referrer, too_high_bps);
+
+        assert_eq!(
+            f.client.try_set_referral_attribution(
+                &escrow_id,
+                &f.buyer,
+                &ReferralAttribution {
+                    referrer_address: referrer,
+                    commission_basis_points: too_high_bps,
+                    referrer_signature: signature,
+                },
+            ),
+            Err(Ok(EscrowError::InvalidReferralCommission))
+        );
+    }
+}
+
+/// Tests for multi-party partial refund settlement (issue #483).
+#[cfg(test)]
+mod split_settlement_tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient};
+
+    struct Fixture<'a> {
+        env: Env,
+        client: EscrowContractClient<'a>,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+    }
+
+    fn setup(env: &Env) -> Fixture<'_> {
+        soroban_sdk::testutils::Ledger::with_mut(&env.ledger(), |l| {
+            l.min_persistent_entry_ttl = PERSISTENT_BUMP_AMOUNT;
+        });
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 1_000, // 10%
+            treasury,
+            min_amount: 100,
+            max_amount: 1_000_000,
+            min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(env, &contract_id);
+        StellarAssetClient::new(env, &token).mint(&buyer, &1_000_000);
+        admin_actions_test::approve(env, &client, &admin, AdminAction::AddToken(token.clone()));
+        Fixture {
+            env: env.clone(),
+            client,
+            buyer,
+            seller,
+            token,
+        }
+    }
+
+    #[test]
+    fn split_settlement_disburses_both_parties_and_fee() {
+        let env = Env::default();
+        let f = setup(&env);
+
+        let order_id = BytesN::from_array(&f.env, &[1u8; 32]);
+        let escrow_id = f.client.deposit(
+            &f.buyer,
+            &f.seller,
+            &f.token,
+            &10_000i128,
+            &order_id,
+            &10_000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
+
+        f.client.dispute(&escrow_id, &f.buyer);
+
+        // Buyer gets back 4_000; merchant's gross share is 6_000, taxed at
+        // 10% => fee 600, merchant nets 5_400. 4_000 + 5_400 + 600 = 10_000.
+        let request = SplitSettlementRequest {
+            escrow_id,
+            buyer_refund_amount: 4_000,
+            merchant_payout_amount: 5_400,
+            buyer_signature: BytesN::from_array(&env, &[0u8; 64]),
+            merchant_signature: BytesN::from_array(&env, &[0u8; 64]),
+        };
+        assert!(f.client.settle_partial_refund(&request));
+
+        let token_client = soroban_sdk::token::Client::new(&env, &f.token);
+        assert_eq!(token_client.balance(&f.buyer), 1_000_000 - 10_000 + 4_000);
+        assert_eq!(token_client.balance(&f.seller), 5_400);
+
+        let record = f.client.get_escrow(&escrow_id);
+        assert_eq!(record.status, EscrowStatus::SettledWithPartialRefund);
+        assert_eq!(record.refunded_amount, 4_000);
+        assert_eq!(record.released_amount, 5_400);
+    }
+
+    #[test]
+    fn split_settlement_rejects_mismatched_split() {
+        let env = Env::default();
+        let f = setup(&env);
+
+        let order_id = BytesN::from_array(&f.env, &[2u8; 32]);
+        let escrow_id = f.client.deposit(
+            &f.buyer,
+            &f.seller,
+            &f.token,
+            &10_000i128,
+            &order_id,
+            &10_000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
+
+        f.client.dispute(&escrow_id, &f.buyer);
+
+        // Merchant payout doesn't match what the prorated fee calculation
+        // requires for a 4_000 buyer refund (should be 5_400, not 6_000).
+        let request = SplitSettlementRequest {
+            escrow_id,
+            buyer_refund_amount: 4_000,
+            merchant_payout_amount: 6_000,
+            buyer_signature: BytesN::from_array(&env, &[0u8; 64]),
+            merchant_signature: BytesN::from_array(&env, &[0u8; 64]),
+        };
+        assert_eq!(
+            f.client.try_settle_partial_refund(&request),
+            Err(Ok(EscrowError::InvalidSplitSettlement))
         );
     }
 }
