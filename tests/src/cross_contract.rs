@@ -18,7 +18,7 @@ use delego_tests::fixtures::create_mock_token_contract;
 use ed25519_dalek::{Signer, SigningKey};
 use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::Address as _, testutils::Ledger as _, xdr::ToXdr, Address, BytesN, Env,
+    testutils::Address as _, testutils::Ledger as _, Address, BytesN, Env,
     InvokeError, Vec,
 };
 
@@ -30,14 +30,18 @@ fn test_keypair(env: &Env, seed: u8) -> (SigningKey, BytesN<32>) {
     (signing_key, public_key)
 }
 
-/// Sign a `RelayedSpendMessage` over its canonical XDR encoding — the exact
-/// bytes `execute_spend_via_relayer` re-derives and verifies.
+/// Sign a `RelayedSpendMessage` over the versioned, domain-separated payload
+/// (`relayed_spend_signing_payload`) — the exact bytes
+/// `execute_spend_via_relayer` re-derives and verifies (issue #690).
 fn sign_relayed_spend(
     env: &Env,
+    permissions_contract_id: &Address,
     signing_key: &SigningKey,
     message: RelayedSpendMessage,
 ) -> BytesN<64> {
-    let message_bytes = message.to_xdr(env);
+    let message_bytes = env.as_contract(permissions_contract_id, || {
+        delego_permissions::relayed_spend_signing_payload(env, &message)
+    });
     let len = message_bytes.len() as usize;
     let mut buf = [0u8; 512];
     message_bytes.copy_into_slice(&mut buf[..len]);
@@ -690,7 +694,7 @@ fn test_relayed_spend_replay_with_old_nonce_reverts() {
         expiration_ledger,
         epoch: 0,
     };
-    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
 
     perm_client.execute_spend_via_relayer(
         &relayer,

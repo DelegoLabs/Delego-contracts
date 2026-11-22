@@ -412,6 +412,22 @@ pub struct SubAccountDeactivatedEvent {
     pub timestamp: u64,
 }
 
+/// Emitted when a previously deactivated sub-account is reactivated
+/// (issue #698). Mirrors [`SubAccountDeactivatedEvent`].
+#[contracttype]
+#[allow(missing_docs)]
+#[derive(Clone, Debug)]
+pub struct SubAccountReactivatedEvent {
+    /// Unique sub-account identifier.
+    pub sub_account_id: u64,
+    /// Address of the sub-account owner.
+    pub owner: Address,
+    /// Virtual address for the sub-account.
+    pub sub_account_address: Address,
+    /// Ledger timestamp of the event.
+    pub timestamp: u64,
+}
+
 /// Emitted when the current admin proposes a successor.
 #[contracttype]
 #[allow(missing_docs)]
@@ -582,6 +598,10 @@ pub enum DataKey {
     NextSubAccountId(Address),
     /// Sub-account ids associated with an owner.
     OwnerSubAccounts(Address),
+    /// Reverse index from a sub-account address to `(owner, sub_account_id)`,
+    /// used to guarantee each sub-account address is registered at most once
+    /// across the whole registry (issue #698).
+    SubAccountAddress(Address),
     /// Total XLM (in stroops) held in the protocol maintenance reserve for keeper bounties.
     MaintenanceReserve,
     /// Last ledger sequence at which a keeper bounty was paid for a delegation.
@@ -737,6 +757,9 @@ pub enum DelegationError {
     MerchantSpendLimitExceeded = 4028,
     /// The merchant filter's `max_per_merchant_stroops` must be positive.
     InvalidMerchantFilter = 4029,
+    /// The supplied sub-account address is already registered to another
+    /// sub-account (issue #698).
+    SubAccountAddressTaken = 4030,
 }
 
 /// The delegation registry contract.
@@ -2417,11 +2440,22 @@ impl DelegationRegistry {
     /// the main account. Each sub-account is tied to a specific delegation and
     /// inherits its permissions and lifecycle.
     ///
+    /// `sub_account_address` is the dedicated address the agent operates
+    /// from. It must authorize the call (proving control and preventing a
+    /// third party from squatting it), must differ from `owner` and from the
+    /// registry itself, and must not already be registered to any other
+    /// sub-account ([`DelegationError::SubAccountAddressTaken`]).
+    ///
+    /// The parent delegation must be `Active` and not past
+    /// `expires_at_ledger`; a delegation that has expired but has not yet been
+    /// swept is rejected with [`DelegationError::Expired`] (issue #698).
+    ///
     /// Returns the sub-account id.
     pub fn create_sub_account(
         env: Env,
         owner: Address,
         delegation_id: u64,
+        sub_account_address: Address,
         label: Symbol,
     ) -> Result<u64, DelegationError> {
         owner.require_auth();
@@ -2437,6 +2471,25 @@ impl DelegationRegistry {
             return Err(DelegationError::NotAuthorized);
         }
 
+        // The parent must be live: Active status *and* not yet past its
+        // expiry ledger (sweep_expired may not have run yet).
+        if delegation.status != DelegationStatus::Active {
+            return Err(DelegationError::NotActive);
+        }
+        if env.ledger().sequence() >= delegation.expires_at_ledger {
+            return Err(DelegationError::Expired);
+        }
+
+        // The sub-account address must be a distinct, unclaimed address.
+        if sub_account_address == owner || sub_account_address == env.current_contract_address() {
+            return Err(DelegationError::InvalidParam);
+        }
+        let address_index_key = DataKey::SubAccountAddress(sub_account_address.clone());
+        if env.storage().persistent().has(&address_index_key) {
+            return Err(DelegationError::SubAccountAddressTaken);
+        }
+        sub_account_address.require_auth();
+
         // Get or initialize the next sub-account id for this owner
         let next_id_key = DataKey::NextSubAccountId(owner.clone());
         let id = env.storage().persistent().get(&next_id_key).unwrap_or(1u64);
@@ -2447,10 +2500,6 @@ impl DelegationRegistry {
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
-
-        // Create a deterministic sub-account address derived from owner and id
-        // In practice, this could be a contract address or a derived key
-        let sub_account_address = owner.clone(); // Placeholder - in production, derive a unique address
 
         let now = env.ledger().timestamp();
         let record = SubAccountRecord {
@@ -2468,6 +2517,16 @@ impl DelegationRegistry {
         env.storage().persistent().set(&sub_account_key, &record);
         env.storage().persistent().extend_ttl(
             &sub_account_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Claim the sub-account address in the global reverse index.
+        env.storage()
+            .persistent()
+            .set(&address_index_key, &(owner.clone(), id));
+        env.storage().persistent().extend_ttl(
+            &address_index_key,
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -2557,6 +2616,10 @@ impl DelegationRegistry {
     }
 
     /// Reactivates a previously deactivated sub-account.
+    ///
+    /// The parent delegation must not be `Revoked`/`Expired` and must not be
+    /// past `expires_at_ledger`, even if `sweep_expired` has not yet run
+    /// (issue #698). Emits [`SubAccountReactivatedEvent`] on success.
     pub fn reactivate_sub_account(
         env: Env,
         owner: Address,
@@ -2592,8 +2655,34 @@ impl DelegationRegistry {
             return Err(DelegationError::DelegationMismatch);
         }
 
+        // An expired-but-unswept delegation still reads as `Active`/`Paused`,
+        // so the ledger-based expiry must be checked explicitly.
+        if env.ledger().sequence() >= delegation.expires_at_ledger {
+            return Err(DelegationError::Expired);
+        }
+
         record.is_active = true;
         env.storage().persistent().set(&sub_account_key, &record);
+        env.storage().persistent().extend_ttl(
+            &sub_account_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Topics: (contract, action, entity_id) — mirrors `sub_deac`.
+        env.events().publish(
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("sub_reac"),
+                sub_account_id,
+            ),
+            SubAccountReactivatedEvent {
+                sub_account_id,
+                owner,
+                sub_account_address: record.sub_account_address.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
 
         Ok(true)
     }
@@ -3383,6 +3472,10 @@ mod error_code_uniqueness_tests {
             (DelegationError::InvalidParam, 4024u32),
             (DelegationError::RateLimitNotConfigured, 4025u32),
             (DelegationError::SpendRateLimitExceeded, 4026u32),
+            (DelegationError::UnauthorizedMerchant, 4027u32),
+            (DelegationError::MerchantSpendLimitExceeded, 4028u32),
+            (DelegationError::InvalidMerchantFilter, 4029u32),
+            (DelegationError::SubAccountAddressTaken, 4030u32),
         ];
 
         for (variant, expected) in codes {
@@ -3416,6 +3509,10 @@ mod error_code_uniqueness_tests {
             DelegationError::InvalidParam as u32,
             DelegationError::RateLimitNotConfigured as u32,
             DelegationError::SpendRateLimitExceeded as u32,
+            DelegationError::UnauthorizedMerchant as u32,
+            DelegationError::MerchantSpendLimitExceeded as u32,
+            DelegationError::InvalidMerchantFilter as u32,
+            DelegationError::SubAccountAddressTaken as u32,
         ];
         seen.sort_unstable();
         for pair in seen.windows(2) {

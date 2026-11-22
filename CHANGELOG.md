@@ -103,6 +103,19 @@ will reject the change.
 
 ### Unreleased
 
+- Wire the gas sponsorship module into `PermissionsContract` (issue #689):
+  `configure_sponsorship`, `fund_sponsorship`, `charge_sponsored_fee`,
+  `get_sponsorship_policy` and `get_sponsorship_balance`, backed by
+  `SponsorshipPolicy` / `SponsorshipDataKey` persistent entries with checked
+  arithmetic and TTL extension on every read/write.
+- **Breaking (signing):** `execute_spend_via_relayer` now verifies the ed25519
+  signature over `relayed_spend_signing_payload(...)` (versioned domain
+  separator || message XDR) instead of the bare message XDR (issue #690).
+  Off-chain signers must sign the domain-separated payload;
+  `relayed_spend_signing_payload` is now public.
+- Fix the `PERMISSION_ERROR_CODES` length assertion to 49 and add a
+  compile-time exhaustive-match guard over `PermissionError` (issue #691).
+
 - Add `migrate_quorum_threshold` so a multi-owner grant's owner set and
   signature threshold can be reconfigured without revoking and re-granting it
   (issue #371). Widening an enterprise grant from 2-of-3 to 3-of-5 previously
@@ -230,6 +243,13 @@ will reject the change.
 ## delegation_registry (delego-delegation-registry)
 
 ### Unreleased
+
+- **Breaking:** `create_sub_account` takes an explicit `sub_account_address`
+  (replacing the `owner` placeholder), which must authorize, differ from the
+  owner, and be globally unique (`SubAccountAddressTaken`, 4030). Creation now
+  requires an `Active`, unexpired parent delegation; `reactivate_sub_account`
+  also rejects expired-but-unswept parents and emits
+  `SubAccountReactivatedEvent` (issue #698).
 
 - Packed a delegation's four capabilities (spend, refund, dispute, delegate) into
   a single `u32` `PermissionBitmask` instead of storing them as individual

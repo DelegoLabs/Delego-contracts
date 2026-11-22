@@ -148,16 +148,22 @@ pub struct SubAccountRecord {
 
 ### Key Functions
 
-#### `create_sub_account(owner, delegation_id, label) -> Result<u64, DelegationError>`
+#### `create_sub_account(owner, delegation_id, sub_account_address, label) -> Result<u64, DelegationError>`
 
 Creates a new sub-account tied to an existing delegation.
 
 **Behavior:**
-- Requires owner authorization
+- Requires owner authorization and `sub_account_address` authorization
 - Verifies the delegation exists and belongs to the owner
+- Requires the parent delegation to be `Active` (`NotActive` otherwise) and
+  `ledger.sequence < expires_at_ledger` (`Expired` otherwise, even if
+  `sweep_expired` has not run yet)
+- Rejects a `sub_account_address` equal to the owner or the registry
+  (`InvalidParam`) or already registered to any sub-account
+  (`SubAccountAddressTaken`)
 - Generates a unique sub-account ID per owner
-- Creates a deterministic sub-account address (currently uses owner as placeholder)
-- Stores the record with extended TTL
+- Stores the record with extended TTL and claims
+  `DataKey::SubAccountAddress(sub_account_address)`
 - Adds to owner's sub-account index
 - Emits `SubAccountCreatedEvent` with timestamp
 - Returns the sub-account ID
@@ -185,7 +191,10 @@ Reactivates a previously deactivated sub-account.
 **Behavior:**
 - Requires owner authorization
 - Verifies the associated delegation is still valid (not Revoked/Expired)
+- Rejects with `Expired` when `ledger.sequence >= expires_at_ledger`, even if
+  the delegation has not been swept yet
 - Sets `is_active = true`
+- Emits `SubAccountReactivatedEvent` (topic `sub_reac`)
 - Returns `Ok(false)` if already active (idempotent)
 
 #### Query Functions
@@ -234,11 +243,11 @@ let delegation_id = DelegationRegistry::create_delegation(
 
 // Create sub-accounts for different micro-payment purposes
 let payment_sub = DelegationRegistry::create_sub_account(
-    env, owner, delegation_id, symbol_short!("payments")
+    env, owner, delegation_id, payments_agent_address, symbol_short!("payments")
 )?;
 
 let refund_sub = DelegationRegistry::create_sub_account(
-    env, owner, delegation_id, symbol_short!("refunds")
+    env, owner, delegation_id, refunds_agent_address, symbol_short!("refunds")
 )?;
 
 // Get all active sub-accounts

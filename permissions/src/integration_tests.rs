@@ -42,9 +42,29 @@ fn sign_relayed_spend_with_domain(
 }
 
 /// Sign a `RelayedSpendMessage` with the given key, returning the raw
-/// 64-byte ed25519 signature over the message's canonical XDR encoding —
-/// the exact bytes `execute_spend_via_relayer` re-derives and verifies.
+/// 64-byte ed25519 signature over the versioned, domain-separated payload
+/// produced by `relayed_spend_signing_payload` — the exact bytes
+/// `execute_spend_via_relayer` re-derives and verifies (issue #690).
 fn sign_relayed_spend(
+    env: &Env,
+    contract_id: &Address,
+    signing_key: &SigningKey,
+    message: RelayedSpendMessage,
+) -> BytesN<64> {
+    let payload = env.as_contract(contract_id, || {
+        crate::relayed_spend_signing_payload(env, &message)
+    });
+    let len = payload.len() as usize;
+    let mut buf = [0u8; 512];
+    payload.copy_into_slice(&mut buf[..len]);
+    let signature = signing_key.sign(&buf[..len]);
+    BytesN::from_array(env, &signature.to_bytes())
+}
+
+/// Sign the bare XDR encoding of a `RelayedSpendMessage` with no domain
+/// separator. `execute_spend_via_relayer` must reject such signatures; used
+/// only by negative tests (issue #690).
+fn sign_relayed_spend_raw_xdr(
     env: &Env,
     signing_key: &SigningKey,
     message: RelayedSpendMessage,
@@ -646,7 +666,7 @@ fn test_execute_spend_via_relayer_succeeds() {
         expiration_ledger,
         epoch: 0,
     };
-    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
 
     client.execute_spend_via_relayer(
         &relayer,
@@ -696,7 +716,7 @@ fn test_execute_spend_via_relayer_enforces_velocity_limit() {
         expiration_ledger,
         epoch: 0,
     };
-    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
     client.execute_spend_via_relayer(
         &relayer,
         &t.buyer,
@@ -719,7 +739,7 @@ fn test_execute_spend_via_relayer_enforces_velocity_limit() {
         expiration_ledger,
         epoch: 0,
     };
-    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
     assert_eq!(
         client.try_execute_spend_via_relayer(
             &relayer,
@@ -749,7 +769,7 @@ fn test_execute_spend_via_relayer_enforces_velocity_limit() {
         expiration_ledger,
         epoch: 0,
     };
-    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
     client.execute_spend_via_relayer(
         &relayer,
         &t.buyer,
@@ -788,7 +808,7 @@ fn test_execute_spend_via_relayer_rejects_replayed_nonce() {
         expiration_ledger,
         epoch: 0,
     };
-    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
 
     client.execute_spend_via_relayer(
         &relayer,
@@ -840,7 +860,7 @@ fn test_execute_spend_via_relayer_rejects_stale_epoch_after_pause_resume() {
         expiration_ledger,
         epoch: 0,
     };
-    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
 
     client.pause(&t.buyer, &t.agent);
     client.resume(&t.buyer, &t.agent);
@@ -890,7 +910,7 @@ fn test_execute_spend_via_relayer_rejects_invalid_signature() {
         expiration_ledger,
         epoch: 0,
     };
-    let signature = sign_relayed_spend(&t.env, &wrong_key, message);
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &wrong_key, message);
 
     client.execute_spend_via_relayer(
         &relayer,
@@ -929,7 +949,7 @@ fn test_execute_spend_via_relayer_rejects_expired_signature() {
         expiration_ledger,
         epoch: 0,
     };
-    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
 
     assert_eq!(
         client.try_execute_spend_via_relayer(
@@ -968,7 +988,7 @@ fn test_execute_spend_via_relayer_without_registered_key_fails() {
         expiration_ledger,
         epoch: 0,
     };
-    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
 
     assert_eq!(
         client.try_execute_spend_via_relayer(
@@ -1009,7 +1029,7 @@ fn test_execute_spend_via_relayer_enforces_per_tx_limit() {
         expiration_ledger,
         epoch: 0,
     };
-    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
 
     assert_eq!(
         client.try_execute_spend_via_relayer(
@@ -1141,7 +1161,7 @@ fn test_usage_stats_include_relayed_spends() {
         expiration_ledger,
         epoch: 0,
     };
-    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
     client.execute_spend_via_relayer(
         &relayer,
         &t.buyer,
@@ -1302,9 +1322,10 @@ fn test_signature_bound_to_v1_fails_on_v2() {
         amount: 20,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
 
-    // Sign against the V1 domain separator — this is what an attacker would
+    // Sign against a V1 domain separator — this is what an attacker would
     // replay after the contract is upgraded to V2.
     let v1_domain = compute_versioned_domain_separator(
         &t.env,
@@ -1314,31 +1335,27 @@ fn test_signature_bound_to_v1_fails_on_v2() {
     let v1_signature =
         sign_relayed_spend_with_domain(&t.env, &signing_key, message.clone(), &v1_domain);
 
-    // The live contract uses the V2 domain separator, so the V1 signature must
-    // be rejected outright.
-    assert_eq!(
-        client.try_execute_spend_via_relayer(
-            &relayer,
-            &t.buyer,
-            &t.agent,
-            &20,
-            &t.seller,
-            &0u64,
-            &expiration_ledger,
-            &v1_signature,
-        ),
-        Err(Ok(PermissionError::InvalidSignature))
+    // The live contract verifies over its own versioned separator, so the V1
+    // signature fails ed25519 verification (a host crypto error) and nothing
+    // is mutated.
+    let result = client.try_execute_spend_via_relayer(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &20,
+        &t.seller,
+        &0u64,
+        &expiration_ledger,
+        &0u32,
+        &v1_signature,
     );
+    assert!(matches!(result, Err(Err(_))), "V1-bound signature must be rejected");
     assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 0);
     assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 1000);
 
-    // A signature produced against the V2 domain separator is accepted.
-    let v2_domain = compute_versioned_domain_separator(
-        &t.env,
-        &t.permissions_contract_id,
-        &symbol_short!("PERM_V2"),
-    );
-    let v2_signature = sign_relayed_spend_with_domain(&t.env, &signing_key, message, &v2_domain);
+    // A signature over the live contract's domain-separated payload is accepted.
+    let v2_signature =
+        sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
     client.execute_spend_via_relayer(
         &relayer,
         &t.buyer,
@@ -1347,8 +1364,73 @@ fn test_signature_bound_to_v1_fails_on_v2() {
         &t.seller,
         &0u64,
         &expiration_ledger,
+        &0u32,
         &v2_signature,
     );
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 980);
+}
+
+/// Issue #690: a signature over the bare `message.to_xdr()` bytes (no
+/// versioned domain separator) must fail verification in
+/// `execute_spend_via_relayer`, leaving the nonce and allowance untouched.
+#[test]
+fn test_execute_spend_via_relayer_rejects_raw_xdr_signature() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &3600u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 78);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 100;
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 0,
+        expiration_ledger,
+        epoch: 0,
+    };
+
+    let raw_signature = sign_relayed_spend_raw_xdr(&t.env, &signing_key, message.clone());
+    let result = client.try_execute_spend_via_relayer(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &20,
+        &t.seller,
+        &0u64,
+        &expiration_ledger,
+        &0u32,
+        &raw_signature,
+    );
+    assert!(
+        matches!(result, Err(Err(_))),
+        "signature over un-separated XDR must fail verification"
+    );
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 0);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 1000);
+
+    // Sanity check: the same key signing the domain-separated payload succeeds.
+    let separated_signature =
+        sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
+    client.execute_spend_via_relayer(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &20,
+        &t.seller,
+        &0u64,
+        &expiration_ledger,
+        &0u32,
+        &separated_signature,
+    );
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 1);
     assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 980);
 }
 
@@ -1437,7 +1519,7 @@ fn test_relayed_child_spend_decrements_parent_budget() {
         expiration_ledger,
         epoch: 0,
     };
-    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
 
     client.execute_spend_via_relayer(
         &relayer,
@@ -1514,7 +1596,7 @@ fn test_relayed_spend_respects_parent_budget_cap() {
         expiration_ledger,
         epoch: 0,
     };
-    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
 
     // The child still has 10 remaining, but even before reaching apply_spend
     // the can_spend check on the child will block the 20 spend (child limit
@@ -1647,6 +1729,7 @@ fn test_merchant_allowlist_enforced_on_relayed_spend() {
     let expiration_ledger = t.env.ledger().sequence() + 100;
     let signature = sign_relayed_spend(
         &t.env,
+        &t.permissions_contract_id,
         &signing_key,
         RelayedSpendMessage {
             owner: t.buyer.clone(),
@@ -1734,6 +1817,7 @@ fn test_cancel_nonce_unblocks_subsequent_relayed_spends() {
     let sign = |nonce: u64| {
         sign_relayed_spend(
             &t.env,
+            &t.permissions_contract_id,
             &signing_key,
             RelayedSpendMessage {
                 owner: t.buyer.clone(),
@@ -1884,7 +1968,7 @@ fn test_scoped_grant_rejects_relayed_spend() {
         expiration_ledger,
         epoch: 0,
     };
-    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
 
     assert_eq!(
         client.try_execute_spend_via_relayer(

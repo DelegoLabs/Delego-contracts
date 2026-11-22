@@ -3407,3 +3407,173 @@ fn test_merchant_filter_requires_owner_auth() {
     );
     assert_eq!(result, Err(Ok(DelegationError::InvalidMerchantFilter)));
 }
+
+// ── Sub-account lifecycle guards (issue #698) ─────────────────────────────
+
+#[test]
+fn test_create_sub_account_stores_distinct_address() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Sub_Parent");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    let sub_address = Address::generate(&env);
+    let sub_id = client.create_sub_account(&owner, &id, &sub_address, &symbol_short!("micro"));
+
+    let record = client.get_sub_account(&owner, &sub_id);
+    assert_eq!(record.sub_account_address, sub_address);
+    assert_ne!(record.sub_account_address, owner);
+    assert_eq!(record.delegation_id, id);
+    assert!(record.is_active);
+}
+
+#[test]
+fn test_create_sub_account_rejects_owner_as_sub_address() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Sub_Parent");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    assert_eq!(
+        client.try_create_sub_account(&owner, &id, &owner, &symbol_short!("micro")),
+        Err(Ok(DelegationError::InvalidParam))
+    );
+}
+
+#[test]
+fn test_create_sub_account_rejects_duplicate_sub_address() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Sub_Parent");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let sub_address = Address::generate(&env);
+    client.create_sub_account(&owner, &id, &sub_address, &symbol_short!("first"));
+
+    // Same owner, same address.
+    assert_eq!(
+        client.try_create_sub_account(&owner, &id, &sub_address, &symbol_short!("second")),
+        Err(Ok(DelegationError::SubAccountAddressTaken))
+    );
+
+    // A different owner cannot claim an address already in use either.
+    let other_owner = Address::generate(&env);
+    let other_agent = BytesN::from_array(&env, &[2; 32]);
+    let other_id = client.create_delegation(
+        &other_owner,
+        &other_agent,
+        &permissions_contract,
+        &label,
+        &1000,
+    );
+    assert_eq!(
+        client.try_create_sub_account(
+            &other_owner,
+            &other_id,
+            &sub_address,
+            &symbol_short!("squat"),
+        ),
+        Err(Ok(DelegationError::SubAccountAddressTaken))
+    );
+}
+
+#[test]
+fn test_create_sub_account_rejects_expired_unswept_parent() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Sub_Parent");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+
+    // Past expiry, but sweep_expired has not run: status still reads Active.
+    env.ledger().set_sequence_number(200);
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Active);
+
+    assert_eq!(
+        client.try_create_sub_account(
+            &owner,
+            &id,
+            &Address::generate(&env),
+            &symbol_short!("micro"),
+        ),
+        Err(Ok(DelegationError::Expired))
+    );
+    assert_eq!(client.get_sub_accounts_by_owner(&owner).len(), 0);
+}
+
+#[test]
+fn test_create_sub_account_rejects_non_active_parent() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Sub_Parent");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    client.pause_delegation(&id);
+
+    assert_eq!(
+        client.try_create_sub_account(
+            &owner,
+            &id,
+            &Address::generate(&env),
+            &symbol_short!("micro"),
+        ),
+        Err(Ok(DelegationError::NotActive))
+    );
+}
+
+#[test]
+fn test_reactivate_sub_account_rejects_expired_unswept_parent() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Sub_Parent");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+    let sub_id = client.create_sub_account(
+        &owner,
+        &id,
+        &Address::generate(&env),
+        &symbol_short!("micro"),
+    );
+    assert!(client.deactivate_sub_account(&owner, &sub_id));
+
+    // Parent passes its expiry ledger without being swept.
+    env.ledger().set_sequence_number(200);
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Active);
+
+    assert_eq!(
+        client.try_reactivate_sub_account(&owner, &sub_id),
+        Err(Ok(DelegationError::Expired))
+    );
+    assert!(!client.get_sub_account(&owner, &sub_id).is_active);
+}
+
+#[test]
+fn test_reactivate_sub_account_emits_event() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Sub_Parent");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let sub_address = Address::generate(&env);
+    let sub_id = client.create_sub_account(&owner, &id, &sub_address, &symbol_short!("micro"));
+    client.deactivate_sub_account(&owner, &sub_id);
+
+    assert!(client.reactivate_sub_account(&owner, &sub_id));
+    assert!(client.get_sub_account(&owner, &sub_id).is_active);
+
+    let events = env.events().all();
+    let (_, topics, data) = events.last().unwrap();
+    let action = Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(action, symbol_short!("sub_reac"));
+    let event = SubAccountReactivatedEvent::try_from_val(&env, &data).unwrap();
+    assert_eq!(event.sub_account_id, sub_id);
+    assert_eq!(event.owner, owner);
+    assert_eq!(event.sub_account_address, sub_address);
+
+    // Reactivating an already-active sub-account is a no-op.
+    assert!(!client.reactivate_sub_account(&owner, &sub_id));
+}
