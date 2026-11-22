@@ -1660,6 +1660,21 @@ impl DelegationRegistry {
         records
     }
 
+    /// Returns a delegation record by owner and label, looking up via the
+    /// DataKey::DelegationV2 secondary index. Returns `NotFound` when no
+    /// delegation with the given owner/label pair exists.
+    pub fn get_delegation_by_owner_and_label(
+        env: Env,
+        owner: Address,
+        label: Symbol,
+    ) -> Result<DelegationRecord, DelegationError> {
+        let key = DataKey::DelegationV2(owner.clone(), label);
+        env.storage()
+            .persistent()
+            .get::<_, DelegationRecord>(&key)
+            .ok_or(DelegationError::NotFound)
+    }
+
     /// Returns all delegations associated with the given agent identifier.
     ///
     /// Iterates through all issued delegations and collects records matching
@@ -2041,6 +2056,7 @@ impl DelegationRegistry {
                     record.version = Self::increment_version(&env, id);
                     record.updated_at = env.ledger().timestamp();
                     env.storage().persistent().set(&key, &record);
+                    Self::write_delegation_v2(&env, &record);
 
                     Self::store_snapshot(&env, id, &record);
 
@@ -2109,6 +2125,7 @@ impl DelegationRegistry {
                     record.updated_at = env.ledger().timestamp();
 
                     env.storage().persistent().set(&DataKey::Delegation(id), &record);
+                    Self::write_delegation_v2(&env, &record);
                     Self::store_snapshot(&env, id, &record);
 
                     let entries_removed = Self::sweep_auxiliary_keys(&env, id);
@@ -2276,6 +2293,7 @@ impl DelegationRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Delegation(delegation_id), &record);
+        Self::write_delegation_v2(&env, &record);
 
         // Store nonce separately for efficient lookup
         env.storage()

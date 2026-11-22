@@ -6118,8 +6118,99 @@ mod freeze_relayer_tests {
     }
 
     // -----------------------------------------------------------------------
-    // execute_spend_via_channel — frozen relayer is blocked
+    // unfreeze_relayer — happy path
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn unfreeze_relayer_returns_true_and_marks_relayer_unfrozen() {
+        let (env, contract_id, admin, _owner, _delegate, relayer, _merchant) = setup();
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        client.freeze_relayer(&admin, &relayer);
+        assert!(client.is_relayer_frozen(&relayer));
+
+        let result = client.unfreeze_relayer(&admin, &relayer);
+        assert!(result);
+        assert!(!client.is_relayer_frozen(&relayer));
+    }
+
+    #[test]
+    fn unfreeze_relayer_is_idempotent() {
+        let (env, contract_id, admin, _owner, _delegate, relayer, _merchant) = setup();
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        client.unfreeze_relayer(&admin, &relayer);
+        // Second unfreeze of the same relayer should also succeed.
+        let result = client.unfreeze_relayer(&admin, &relayer);
+        assert!(result);
+        assert!(!client.is_relayer_frozen(&relayer));
+    }
+
+    // -----------------------------------------------------------------------
+    // unfreeze_relayer — access control
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unfreeze_relayer_requires_admin() {
+        let (env, contract_id, _admin, _owner, _delegate, relayer, _merchant) = setup();
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        let non_admin = Address::generate(&env);
+
+        let result = client.try_unfreeze_relayer(&non_admin, &relayer);
+        assert_eq!(result, Err(Ok(PermissionError::Unauthorized)));
+    }
+
+    #[test]
+    fn unfreeze_relayer_requires_initialized_admin() {
+        // Contract with no set_admin called yet.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        let any_caller = Address::generate(&env);
+        let any_relayer = Address::generate(&env);
+
+        let result = client.try_unfreeze_relayer(&any_caller, &any_relayer);
+        assert_eq!(result, Err(Ok(PermissionError::NotInitialized)));
+    }
+
+    // -----------------------------------------------------------------------
+    // unfreeze_relayer — event emission
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unfreeze_relayer_emits_relayer_unfrozen_event() {
+        let (env, contract_id, admin, _owner, _delegate, relayer, _merchant) = setup();
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        client.unfreeze_relayer(&admin, &relayer);
+
+        // Find the RelayerFreeze event by its topic symbols.
+        let events = env.events().all();
+        let mut found = false;
+        for (_contract_addr, topics, data) in events.iter() {
+            if topics.len() >= 2 {
+                let t0: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+                let t1: Result<soroban_sdk::Symbol, _> = topics.get(1).unwrap().try_into_val(&env);
+                if let (Ok(sym0), Ok(sym1)) = (t0, t1) {
+                    if sym0 == symbol_short!("perm") && sym1 == symbol_short!("rlyr_unfrz") {
+                        let evt: RelayerFreezeEvent = data.try_into_val(&env).unwrap();
+                        assert_eq!(evt.relayer, relayer);
+                        assert_eq!(evt.frozen, false);
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(found, "RelayerFreeze event not found");
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_spend_via_relayer — frozen relayer is blocked
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn execute_spend_via_relayer_blocked_when_relayer_frozen() {
 
     #[test]
     fn execute_spend_via_channel_blocked_when_relayer_frozen() {

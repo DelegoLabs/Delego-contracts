@@ -54,23 +54,24 @@ fn expiry_ledger_normal_cases_are_correct() {
 // validate_relayer_fee — plain `*` checked by overflow-checks build flag
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `validate_relayer_fee` uses a plain `spend_amount * MAX_RELAYER_FEE_BPS`
-/// multiplication without a `checked_mul`. With `overflow-checks = true` in
-/// `[profile.test]`, passing `i128::MAX` as `spend_amount` will panic rather
-/// than silently wrapping to a negative "proportional cap" that would allow an
-/// arbitrarily large relayer fee through (a security bypass).
-///
-/// If this test fails to panic, it means `overflow-checks` is NOT active and
-/// the security guarantee described in issue #536 is missing.
+/// `validate_relayer_fee` now uses `checked_mul` instead of a plain `*`
+/// multiplication. Passing `i128::MAX` as `spend_amount` should return
+/// `PermissionError::InvalidParam` rather than panic or wrap silently.
 #[test]
-#[should_panic]
-fn relayer_fee_proportion_panics_on_overflow_input() {
-    // spend_amount = i128::MAX causes `i128::MAX * 100` to overflow.
-    // With overflow-checks = true → panic.
-    // Without overflow-checks    → wrap to a negative number, Ok(()) returned,
-    //                              #[should_panic] fails ⇒ test failure reveals
-    //                              the missing build flag.
-    let _ = validate_relayer_fee(i128::MAX, 0);
+fn relayer_fee_proportion_returns_invalid_param_on_overflow_input() {
+    // spend_amount = i128::MAX with any relayer_fee should return InvalidParam
+    // because checked_mul will overflow.
+    assert_eq!(
+        validate_relayer_fee(i128::MAX, 0),
+        Err(PermissionError::InvalidParam),
+        "i128::MAX spend_amount must return InvalidParam (not panic)"
+    );
+
+    // Even with relayer_fee = 0, the multiplication overflows.
+    assert_eq!(
+        validate_relayer_fee(i128::MAX, 100),
+        Err(PermissionError::InvalidParam),
+    );
 }
 
 /// For normal inputs, `validate_relayer_fee` must apply the proportional cap
