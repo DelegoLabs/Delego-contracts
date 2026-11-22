@@ -161,6 +161,15 @@ pub const SPEND_PROPOSAL_TTL_LEDGERS: u32 = 17_280;
 /// from parking a backlog it has no way to settle.
 pub const MAX_PENDING_SPEND_PROPOSALS: u32 = 5;
 
+/// TTL threshold for persistent storage keys (~10 days at 5s ledger interval).
+/// Keys with TTL below this threshold will have their TTL extended on mutation/read.
+pub const PERMISSION_TTL_THRESHOLD: u32 = 172_800;
+
+/// TTL bump amount for persistent storage keys (~30 days at 5s ledger interval).
+/// Active permissions are bumped by this amount on each mutation/read to prevent
+/// archival/eviction.
+pub const PERMISSION_TTL_BUMP: u32 = 518_400;
+
 /// Default grace period (in seconds) granted to merchants verified under an
 /// older verification policy when the required attestation count increases.
 pub const DEFAULT_VERIFICATION_GRACE_PERIOD_SECS: u64 = 2_592_000;
@@ -492,7 +501,10 @@ pub fn validate_relayer_fee(spend_amount: i128, relayer_fee: i128) -> Result<(),
     if relayer_fee < 0 || relayer_fee > MAX_ABSOLUTE_RELAYER_STROOPS {
         return Err(PermissionError::InvalidParam);
     }
-    let max_proportional = (spend_amount * MAX_RELAYER_FEE_BPS as i128) / 10_000;
+    let max_proportional = spend_amount
+        .checked_mul(MAX_RELAYER_FEE_BPS as i128)
+        .ok_or(PermissionError::InvalidParam)?;
+    let max_proportional = max_proportional / 10_000;
     if relayer_fee > max_proportional {
         return Err(PermissionError::InvalidParam);
     }
@@ -1597,6 +1609,31 @@ pub struct PermissionsContract;
 // from user code, so the allow lives on the impl block for those generated
 // wrappers only. User-defined functions carry their own scoped allows.
 #[allow(clippy::too_many_arguments)]
+pub fn bump_persistent_ttl(env: &Env, key: &DataKey) {
+    if env
+        .storage()
+        .persistent()
+        .get_ttl(key)
+        .unwrap_or(0)
+        < PERMISSION_TTL_THRESHOLD
+    {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, PERMISSION_TTL_BUMP, PERMISSION_TTL_BUMP);
+    }
+}
+
+pub fn bump_instance_ttl(env: &Env) {
+    // Instance keys that need TTL bumping are tracked separately;
+    // this is a no-op for now since instance keys are managed differently.
+}
+
+/// Extends the TTL on a persistent storage key if it falls below the threshold.
+/// This prevents active permissions from being evicted during archival.
+fn extend_persistent_ttl_if_needed(env: &Env, key: &DataKey) {
+    bump_persistent_ttl(env, key);
+}
+
 #[contractimpl]
 impl PermissionsContract {
     /// Records a (owner, delegate) delegation as a **first grant**.
@@ -2090,6 +2127,7 @@ impl PermissionsContract {
         if !delegates.contains(&delegate) {
             delegates.push_back(delegate.clone());
             env.storage().persistent().set(&user_perms_key, &delegates);
+            Self::extend_persistent_ttl_if_needed(&env, &user_perms_key);
         }
 
         let user_perms_key = DataKey::UserPermissions(owner.clone());
@@ -2101,6 +2139,7 @@ impl PermissionsContract {
         if !delegates.contains(&delegate) {
             delegates.push_back(delegate.clone());
             env.storage().persistent().set(&user_perms_key, &delegates);
+            Self::extend_persistent_ttl_if_needed(&env, &user_perms_key);
         }
 
         let user_perms_key = DataKey::UserPermissions(owner.clone());
@@ -2112,6 +2151,7 @@ impl PermissionsContract {
         if !delegates.contains(&delegate) {
             delegates.push_back(delegate.clone());
             env.storage().persistent().set(&user_perms_key, &delegates);
+            Self::extend_persistent_ttl_if_needed(&env, &user_perms_key);
         }
 
         let record = PermissionRecord {
@@ -2133,6 +2173,8 @@ impl PermissionsContract {
         };
 
         env.storage().persistent().set(&key, &record);
+        Self::extend_persistent_ttl_if_needed(&env, &key);
+
         let epoch_key = DataKey::ExecutionEpoch(owner.clone(), delegate.clone());
         let epoch_config = env
             .storage()
@@ -2412,6 +2454,7 @@ impl PermissionsContract {
             if let Some(index) = delegates.first_index_of(&delegate) {
                 delegates.remove(index);
                 env.storage().persistent().set(&user_perms_key, &delegates);
+                Self::extend_persistent_ttl_if_needed(&env, &user_perms_key);
             }
             Self::remove_from_address_index(
                 &env,
@@ -2421,6 +2464,7 @@ impl PermissionsContract {
 
             record.status = PermissionStatus::Revoked;
             env.storage().persistent().set(&key, &record);
+            Self::extend_persistent_ttl_if_needed(&env, &key);
             env.storage()
                 .persistent()
                 .remove(&DataKey::PendingDecrement(owner.clone(), delegate.clone()));
@@ -4148,6 +4192,7 @@ impl PermissionsContract {
             .ok_or(PermissionError::NonceAlreadyUsed)?;
 
         env.storage().persistent().set(&nonce_key, &next_nonce);
+        Self::extend_persistent_ttl_if_needed(&env, &nonce_key);
 
         env.events().publish(
             (
@@ -4587,6 +4632,7 @@ impl PermissionsContract {
             &DataKey::MultiPermission(primary_owner.clone(), delegate.clone()),
             &record,
         );
+        Self::extend_persistent_ttl_if_needed(&env, &DataKey::MultiPermission(primary_owner.clone(), delegate.clone()));
 
         // Index the grant by delegate so a queued spend can resolve the one
         // grant — and therefore the one quorum — it draws on (issue #377).
@@ -4723,6 +4769,7 @@ impl PermissionsContract {
             .filter(|spent| *spent <= record.limit_total)
             .ok_or(PermissionError::ExceedsAllowance)?;
         env.storage().persistent().set(&key, &record);
+        Self::extend_persistent_ttl_if_needed(&env, &key);
 
         Self::record_rolling_window_spend(&env, &primary_owner, &delegate, amount)?;
 
@@ -4820,10 +4867,12 @@ impl PermissionsContract {
         env.storage()
             .persistent()
             .set(&DataKey::SpendProposal(proposal_id), &proposal);
+        Self::extend_persistent_ttl_if_needed(&env, &DataKey::SpendProposal(proposal_id));
         queued.push_back(proposal_id);
         env.storage()
             .persistent()
             .set(&DataKey::DelegateSpendProposals(delegate.clone()), &queued);
+        Self::extend_persistent_ttl_if_needed(&env, &DataKey::DelegateSpendProposals(delegate.clone()));
         env.storage()
             .instance()
             .set(&DataKey::SpendProposalCounter, &proposal_id);
@@ -5936,6 +5985,36 @@ impl PermissionsContract {
             RelayerFrozenEvent {
                 admin,
                 relayer,
+            },
+        );
+
+        Ok(true)
+    }
+
+    /// Lifts the freeze on a previously frozen relayer, resuming all
+    /// delegated spend entry points that were blocked.
+    ///
+    /// Only the contract admin may call this.
+    ///
+    /// Returns `true` when the relayer was unfrozen (idempotent: returns
+    /// `true` even if it was already unfrozen).
+    pub fn unfreeze_relayer(
+        env: Env,
+        admin: Address,
+        relayer: Address,
+    ) -> Result<bool, PermissionError> {
+        Self::require_admin(&env, &admin)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::FrozenRelayer(relayer.clone()), &false);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("rlyr_unfrz")),
+            RelayerFreezeEvent {
+                relayer,
+                frozen: false,
+                ledger: env.ledger().sequence(),
             },
         );
 
