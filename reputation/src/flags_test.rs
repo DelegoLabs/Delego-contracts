@@ -37,6 +37,8 @@ fn test_flag_review_success() {
         review_id,
         4,
         content_hash,
+    
+        false,
     )
     .expect("Should record review");
 
@@ -72,6 +74,8 @@ fn test_flag_review_insufficient_bond() {
         review_id,
         5,
         content_hash,
+    
+        false,
     )
     .expect("Should record review");
 
@@ -103,6 +107,8 @@ fn test_flag_review_already_flagged_by_same_reporter() {
         review_id,
         3,
         content_hash,
+    
+        false,
     )
     .expect("Should record review");
 
@@ -128,6 +134,8 @@ fn test_resolve_flag_upheld_removes_review_and_rewards_reporter() {
         review_id,
         1,
         content_hash,
+    
+        false,
     )
     .expect("Should record review");
 
@@ -174,6 +182,8 @@ fn test_resolve_flag_frivolous_slashes_bond_and_keeps_review() {
         review_id,
         5,
         content_hash,
+    
+        false,
     )
     .expect("Should record review");
 
@@ -216,6 +226,8 @@ fn test_resolve_flag_unauthorized() {
         review_id,
         5,
         content_hash,
+    
+        false,
     )
     .expect("Should record review");
 
@@ -240,6 +252,8 @@ fn test_resolve_flag_already_resolved() {
         review_id,
         5,
         content_hash,
+    
+        false,
     )
     .expect("Should record review");
 
