@@ -59,6 +59,10 @@ use delego_interfaces::LendingPoolClient;
 pub mod blend_yield;
 pub use blend_yield::YieldBearingEscrowConfig;
 
+/// Timelocked emergency recovery for inactive escrow parties.
+pub mod emergency;
+pub use emergency::{EmergencyFundRecovered, EmergencyRecoveryTrait};
+
 /// Multi-hop path payment validation and surplus refund helper.
 pub mod path_payment;
 pub use path_payment::{assert_min_destination, resolve_path_payment, PathPaymentArgs};
@@ -270,6 +274,15 @@ pub struct InspectionPeriodConfig {
     pub delivery_confirmed_ledger: u32,
     /// Ledger sequence at which funds will auto-release if no dispute is filed.
     pub auto_release_ledger: u32,
+}
+
+/// Buyer request to extend the inspection window before auto-release.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionRequest {
+    pub order_id: u64,
+    pub additional_ledgers: u32,
+    pub merchant_approved: bool,
 }
 
 /// Mutual consent timelock extension agreement for extending the inspection
@@ -2119,6 +2132,8 @@ pub enum DataKey {
     /// Mutual consent timelock extension agreement for extending the inspection
     /// period auto-release deadline (issue #485).
     TimelockExtensionAgreement(u64),
+    /// Most recent buyer inspection-window extension request for an escrow.
+    ExtensionRequest(u64),
     /// Emergency rescue proposal for a stranded escrow (issue #365).
     EmergencyRescueProposal(u64),
     /// Admin-approved metadata schema → hash of its definition document.
@@ -3263,6 +3278,9 @@ const SECONDS_PER_LEDGER: u64 = 5;
 /// raise a dispute without being front-run the instant the timeout is
 /// reached (issue #284). ~24 hours at a 5s average ledger close time.
 pub const DISPUTE_GRACE_PERIOD_LEDGERS: u32 = 17_280;
+
+/// Maximum inspection-window extension per request (~7 days at 5s/ledger).
+pub const MAX_INSPECTION_EXTENSION_LEDGERS: u32 = 100_000;
 
 /// Maximum number of entries in the volume fee tier table (issue #328).
 /// Keeps the tier lookup bounded; tiers must fit in a single ledger entry.
@@ -10165,6 +10183,111 @@ impl EscrowContract {
             .set(&DataKey::InspectionPeriodConfig(escrow_id), &inspection_cfg);
 
         Ok(())
+    }
+
+    /// Request an extension of the buyer's inspection window.
+    ///
+    /// A buyer may extend the window once without merchant approval, up to
+    /// [`MAX_INSPECTION_EXTENSION_LEDGERS`]. Further extensions require the
+    /// merchant's authorization (or a call by the merchant). Disputed and
+    /// terminal escrows cannot be extended.
+    pub fn request_window_extension(
+        env: Env,
+        order_id: u64,
+        caller: Address,
+        additional_ledgers: u32,
+        merchant_approved: bool,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+
+        if additional_ledgers == 0 || additional_ledgers > MAX_INSPECTION_EXTENSION_LEDGERS {
+            return Err(EscrowError::InvalidTimelockExtension);
+        }
+
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(order_id))
+            .ok_or(EscrowError::NotFound)?;
+
+        // Only a live inspection window can be extended. This also rejects
+        // disputed, released, refunded, and cancelled escrows.
+        if record.status != EscrowStatus::Inspection && record.status != EscrowStatus::Funded {
+            return Err(EscrowError::NotInInspection);
+        }
+
+        if caller != record.buyer && caller != record.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        let mut inspection_config: InspectionPeriodConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InspectionPeriodConfig(order_id))
+            .ok_or(EscrowError::InspectionConfigNotSet)?;
+
+        // A merchant call is itself approval; otherwise the buyer may use the
+        // single no-approval extension, but only once per escrow.
+        let seller_approved = merchant_approved || caller == record.seller;
+        if merchant_approved && caller == record.buyer {
+            record.seller.require_auth();
+        }
+
+        let request_key = DataKey::ExtensionRequest(order_id);
+        if !seller_approved {
+            if let Some(previous) = env
+                .storage()
+                .persistent()
+                .get::<_, ExtensionRequest>(&request_key)
+            {
+                if !previous.merchant_approved {
+                    return Err(EscrowError::TimelockExtensionAlreadyProposed);
+                }
+            }
+        }
+
+        let previous_auto_release_ledger = inspection_config.auto_release_ledger;
+        inspection_config.auto_release_ledger = previous_auto_release_ledger
+            .saturating_add(additional_ledgers);
+        inspection_config.inspection_duration_ledgers = inspection_config
+            .inspection_duration_ledgers
+            .saturating_add(additional_ledgers);
+
+        env.storage().persistent().set(
+            &DataKey::InspectionPeriodConfig(order_id),
+            &inspection_config,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::InspectionPeriodConfig(order_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.storage().persistent().set(
+            &request_key,
+            &ExtensionRequest {
+                order_id,
+                additional_ledgers,
+                merchant_approved: seller_approved,
+            },
+        );
+        env.storage().persistent().extend_ttl(
+            &request_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("tlock_ext"), order_id),
+            TimelockExtendedEvent {
+                escrow_id: order_id,
+                previous_auto_release_ledger,
+                new_auto_release_ledger: inspection_config.auto_release_ledger,
+                extension_ledgers: additional_ledgers,
+            },
+        );
+
+        Ok(true)
     }
 
     /// Propose a timelock extension for the inspection period auto-release deadline.

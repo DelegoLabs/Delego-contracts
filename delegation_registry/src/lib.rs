@@ -1005,6 +1005,11 @@ impl DelegationRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::DelegationVersion(id), &1u32);
+        env.storage().persistent().extend_ttl(
+            &DataKey::DelegationVersion(id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         Self::store_snapshot(&env, id, &record);
 
@@ -1925,6 +1930,11 @@ impl DelegationRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::SpendRateLimit(delegation_id), &limit);
+        env.storage().persistent().extend_ttl(
+            &DataKey::SpendRateLimit(delegation_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         Ok(())
     }
 
@@ -2005,6 +2015,11 @@ impl DelegationRegistry {
 
         limit.current_window_spend = projected_spend;
         env.storage().persistent().set(&key, &limit);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         // Keep the delegation and its owner index alive while it's actively
         // being spent against, same as the other liveness-checking entrypoints.
@@ -2537,6 +2552,11 @@ impl DelegationRegistry {
 
         record.is_active = false;
         env.storage().persistent().set(&sub_account_key, &record);
+        env.storage().persistent().extend_ttl(
+            &sub_account_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         // Topics: (contract, action, entity_id) — entity_id is the sub-account id.
         env.events().publish(
@@ -2594,6 +2614,11 @@ impl DelegationRegistry {
 
         record.is_active = true;
         env.storage().persistent().set(&sub_account_key, &record);
+        env.storage().persistent().extend_ttl(
+            &sub_account_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         Ok(true)
     }
@@ -3064,6 +3089,11 @@ impl DelegationRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::DelegationVersion(delegation_id), &new_version);
+        env.storage().persistent().extend_ttl(
+            &DataKey::DelegationVersion(delegation_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         new_version
     }
 

@@ -1022,6 +1022,17 @@ pub struct GrantPauseChangedEvent {
     pub ledger: u32,
 }
 
+/// Emitted when an allowance decrease is queued for execution after the
+/// timelock, so indexers can observe the request before it is applied.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AllowanceDecreaseQueuedEvent {
+    pub owner: Address,
+    pub delegate: Address,
+    pub amount: i128,
+    pub execution_time: u64,
+}
+
 /// Emitted when an allowance decrease is successfully applied (issue #189).
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -5581,6 +5592,16 @@ impl PermissionsContract {
         };
 
         env.storage().persistent().set(&pend_key, &pending);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("allowdec_q")),
+            AllowanceDecreaseQueuedEvent {
+                owner,
+                delegate,
+                amount,
+                execution_time,
+            },
+        );
 
         Ok(())
     }
