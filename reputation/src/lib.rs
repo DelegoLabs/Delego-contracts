@@ -14,7 +14,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes, BytesN, Env,
     IntoVal, InvokeError, String, Symbol, Vec,
 };
 
@@ -49,6 +49,9 @@ pub use scoring::{
 };
 
 pub mod antisybil;
+/// Anonymous buyer reviews under ephemeral stealth keys (issue #588).
+pub mod stealth;
+pub use stealth::{AnonymousReview, AnonymousReviewSubmitted};
 pub use antisybil::{calculate_reviewer_weight, get_buyer_completed_orders, EscrowListPageMirror};
 
 /// Half-life of the reputation decay curve, in ledgers (~30 days at 5s/ledger).
@@ -3932,6 +3935,59 @@ impl ReputationContract {
         );
 
         Ok(())
+    }
+
+    // --- Anonymous Stealth Reviews (issue #588) ---
+
+    /// Admin (purchase attestor) only: register a single-use purchase-proof
+    /// ticket for `merchant`, committed as `sha256(ticket_secret)`. The ticket
+    /// carries no buyer address or escrow id, so redeeming it cannot be
+    /// linked back to the buyer's payment wallet.
+    pub fn issue_anonymous_review_ticket(
+        env: Env,
+        merchant: Address,
+        ticket_commitment: BytesN<32>,
+    ) -> Result<(), ReputationError> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        stealth::issue_ticket(&env, &merchant, &ticket_commitment)
+    }
+
+    /// Submit an encrypted review signed by a fresh stealth key.
+    ///
+    /// Requires no account authorization, so it can be relayed without
+    /// exposing the buyer. `signature` is the stealth key's Ed25519 signature
+    /// over [`stealth::signing_payload`]. The ticket and the stealth key are
+    /// both single-use.
+    pub fn submit_anonymous_review(
+        env: Env,
+        merchant: Address,
+        encrypted_payload: Bytes,
+        stealth_pubkey: BytesN<32>,
+        ticket_secret: BytesN<32>,
+        signature: BytesN<64>,
+    ) -> Result<u64, ReputationError> {
+        if Self::is_frozen(env.clone(), merchant.clone()) {
+            return Err(ReputationError::EntityFrozen);
+        }
+        stealth::submit_review(
+            &env,
+            &merchant,
+            encrypted_payload,
+            stealth_pubkey,
+            &ticket_secret,
+            &signature,
+        )
+    }
+
+    /// Read an anonymous review by id.
+    pub fn get_anonymous_review(env: Env, review_id: u64) -> Option<AnonymousReview> {
+        stealth::review(&env, review_id)
+    }
+
+    /// Number of anonymous reviews recorded for `merchant`.
+    pub fn get_anon_review_count(env: Env, merchant: Address) -> u64 {
+        stealth::merchant_review_count(&env, &merchant)
     }
 
     // --- Fraud Reporting ---
