@@ -39,6 +39,12 @@ impl Harness {
     pub fn config(env: Env, id: u64) -> Option<YieldBearingEscrowConfig> {
         blend_yield::config(&env, id)
     }
+    pub fn detach(env: Env, pool: Address) -> bool {
+        blend_yield::detach_pool(&env, &pool)
+    }
+    pub fn stranded(env: Env, pool: Address) -> i128 {
+        blend_yield::stranded_principal(&env, &pool)
+    }
 }
 
 #[contract]
@@ -422,4 +428,26 @@ fn no_configuration_keeps_funds_liquid() {
     assert_eq!(f.pool().get_positions(&f.escrow).supply.len(), 0);
     f.client().settle(&1, &f.seller, &f.token, &1_000);
     assert_eq!(f.balance(&f.seller), 1_000);
+}
+
+#[test]
+fn detached_pool_is_never_called_again() {
+    let f = Fixture::new();
+    f.configure(1);
+    f.fund(1, 1_000);
+    assert!(f.client().detach(&f.pool));
+    assert!(!f.client().detach(&f.pool));
+
+    // The pool is compromised; settlement must not depend on it.
+    f.pool().set_paused(&true);
+    token::StellarAssetClient::new(&f.env, &f.token).mint(&f.escrow, &1_000);
+    f.client().settle(&1, &f.seller, &f.token, &1_000);
+    assert_eq!(f.balance(&f.seller), 1_000);
+    assert_eq!(f.client().stranded(&f.pool), 1_000);
+    assert_eq!(f.pool().get_positions(&f.escrow).supply.get(0), Some(1_000));
+
+    // An escrow configured against the detached pool keeps its deposit.
+    f.configure(2);
+    f.fund(2, 500);
+    assert_eq!(f.balance(&f.escrow), 500);
 }

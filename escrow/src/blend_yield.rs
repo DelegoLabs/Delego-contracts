@@ -44,6 +44,10 @@ pub enum BlendYieldError {
 enum Key {
     BlendConfig(u64),
     BlendPosition(u64),
+    /// Pool isolated by an emergency detach (issue #597).
+    DetachedPool(Address),
+    /// Principal written off a detached pool and settled from reserves.
+    StrandedPrincipal(Address),
 }
 
 #[contracttype]
@@ -75,6 +79,35 @@ pub fn config(env: &Env, id: u64) -> Option<YieldBearingEscrowConfig> {
         bump(env, &key);
     }
     value
+}
+
+/// Whether `pool` has been isolated by an emergency detach (issue #597).
+pub fn is_pool_detached(env: &Env, pool: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .has(&Key::DetachedPool(pool.clone()))
+}
+
+/// Isolate `pool`: no further supply reaches it and redemptions stop calling
+/// it. The caller is responsible for authorization. Returns `false` when the
+/// pool was already detached.
+pub fn detach_pool(env: &Env, pool: &Address) -> bool {
+    let key = Key::DetachedPool(pool.clone());
+    if env.storage().persistent().has(&key) {
+        return false;
+    }
+    env.storage().persistent().set(&key, &env.ledger().sequence());
+    bump(env, &key);
+    true
+}
+
+/// Total principal of positions written off `pool` after it was detached.
+/// Those positions were settled from the contract's primary reserves.
+pub fn stranded_principal(env: &Env, pool: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&Key::StrandedPrincipal(pool.clone()))
+        .unwrap_or(0)
 }
 
 /// Called only after the parent escrow verifies Created status and both auths.
@@ -117,6 +150,15 @@ fn reserve(env: &Env, pool: &BlendPoolClient, asset: &Address) -> (u32, i128) {
 /// An unconfigured escrow retains the existing custody behavior.
 pub fn fund(env: &Env, id: u64, asset: &Address, amount: i128) {
     let Some(cfg) = config(env, id) else { return };
+    if is_pool_detached(env, &cfg.lending_pool_contract) {
+        // A detached pool never receives new funds; the deposit stays in the
+        // escrow's own custody (issue #597).
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("bl_skip"), id),
+            amount,
+        );
+        return;
+    }
     let key = Key::BlendPosition(id);
     if env.storage().persistent().has(&key) {
         fail(env, BlendYieldError::AlreadyFunded);
@@ -199,6 +241,24 @@ pub fn redeem(env: &Env, id: u64) {
         return;
     }
     let mut cfg = config(env, id).unwrap_or_else(|| fail(env, BlendYieldError::InvalidConfig));
+    if is_pool_detached(env, &cfg.lending_pool_contract) {
+        // Never call a detached pool: write the position off and let the
+        // caller settle principal from the contract's primary reserves.
+        let stranded_key = Key::StrandedPrincipal(cfg.lending_pool_contract.clone());
+        let stranded = checked(
+            env,
+            stranded_principal(env, &cfg.lending_pool_contract).checked_add(position.principal),
+        );
+        env.storage().persistent().set(&stranded_key, &stranded);
+        bump(env, &stranded_key);
+        position.shares = 0;
+        env.storage().persistent().set(&key, &position);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("bl_strand"), id),
+            position.principal,
+        );
+        return;
+    }
     let owner = env.current_contract_address();
     let pool = BlendPoolClient::new(env, &cfg.lending_pool_contract);
     let (index, rate) = reserve(env, &pool, &position.token);

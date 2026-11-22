@@ -14,3 +14,7 @@ pub mod fee_calculation;
 /// that all balance/fee/yield helpers return `MathOverflow` instead of wrapping
 /// (issue #536).
 pub mod overflow_arithmetic;
+
+/// Shared escrow + Blend-compatible pool fixture for the low-APY guard
+/// (issue #596) and emergency pool unwind (issue #597) tests.
+pub mod defi_fixture;
