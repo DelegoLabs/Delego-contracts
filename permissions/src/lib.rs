@@ -29,7 +29,9 @@
 mod recovery;
 mod recurring_quota;
 mod crypto;
+mod sponsorship;
 pub use recurring_quota::RecurringQuotaConfig;
+pub use sponsorship::{GasSponsorshipQuota, SponsorshipDataKey, SponsorshipPolicy};
 pub use crypto::{
     verify_passkey_signature, verify_passkey_signature_compressed, verify_passkey_signature_flexible,
 };
@@ -68,7 +70,14 @@ pub fn compute_versioned_domain_separator(env: &Env) -> BytesN<32> {
 /// versioned domain separator followed by the XDR-encoded message. Binding
 /// the separator into the signed payload is what makes signatures strictly
 /// version-scoped.
-fn relayed_spend_signing_payload(env: &Env, message: &RelayedSpendMessage) -> soroban_sdk::Bytes {
+///
+/// Reads `env.current_contract_address()`, so it must be evaluated in the
+/// permissions contract's context. Off-chain signers and tests should wrap
+/// the call in `env.as_contract(&permissions_contract_id, || ...)` (#690).
+pub fn relayed_spend_signing_payload(
+    env: &Env,
+    message: &RelayedSpendMessage,
+) -> soroban_sdk::Bytes {
     let mut payload = soroban_sdk::Bytes::new(env);
     payload.append(&compute_versioned_domain_separator(env).into());
     payload.append(&message.clone().to_xdr(env));
@@ -357,9 +366,78 @@ mod error_code_tests {
         PermissionError::SessionExpired as u32,
     ];
 
+    /// Compile-time completeness guard: this `match` has no wildcard arm, so
+    /// adding a `PermissionError` variant breaks the build until it is also
+    /// added here and to `PERMISSION_ERROR_CODES` (issue #691).
+    #[allow(dead_code)]
+    fn exhaustive_permission_error_guard(err: PermissionError) -> u32 {
+        use PermissionError::*;
+        match err {
+            PermissionNotFound
+            | NotFound
+            | Expired
+            | ExceedsPerTxLimit
+            | ExceedsTotalLimit
+            | MerchantNotAllowed
+            | Unauthorized
+            | InvalidParam
+            | PermissionPaused
+            | AlreadyPaused
+            | AlreadyActive
+            | GrantsPaused
+            | RelayerKeyNotSet
+            | InvalidNonce
+            | SignatureExpired
+            | AlreadyGranted
+            | SelfDelegationNotAllowed
+            | InsufficientSignatures
+            | UnknownSchema
+            | ParentNotFound
+            | ExceedsParentLimit
+            | VelocityLimitExceeded
+            | InactivityThresholdNotSet
+            | PendingDecreaseExists
+            | TimeLockActive
+            | LimitBelowSpent
+            | ExceedsAllowance
+            | InvalidExpiry
+            | NonceAlreadyUsed
+            | GrantNotYetActive
+            | OutsideAuthorizedWindow
+            | StaleEpoch
+            | UnauthorizedFunction
+            | NotInitialized
+            | DelegationNotExpired
+            | MaxHierarchyDepthExceeded
+            | VerificationBelowPolicy
+            | VerificationGracePeriod
+            | ProposalNotFound
+            | ProposalAlreadyExecuted
+            | ProposalExpired
+            | ProposalAlreadyApproved
+            | NoMultiOwnerGrant
+            | AmbiguousMultiOwnerGrant
+            | TooManyPendingProposals
+            | EphemeralRelayerUnsupported
+            | RelayerFrozen
+            | InvalidSignature
+            | SessionExpired => err as u32,
+        }
+    }
+
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 40);
+        // 49 = every `PermissionError` variant, each listed exactly once.
+        // `exhaustive_permission_error_guard` above fails to compile if a new
+        // variant is added without being accounted for here (issue #691).
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 49);
+        for code in PERMISSION_ERROR_CODES {
+            assert!(
+                (2001..=2500).contains(code),
+                "PermissionError code {} is outside 2001..=2500",
+                code
+            );
+        }
 
         let permission_range = ERROR_CODE_RANGES
             .iter()
@@ -4244,9 +4322,13 @@ impl PermissionsContract {
             expiration_ledger,
             epoch,
         };
-        let message_bytes = message.to_xdr(&env);
+        // #690: verify over the versioned, domain-separated payload rather
+        // than the bare message XDR, so a signature is bound to this exact
+        // contract deployment and semver and cannot be replayed across
+        // deployments or after an upgrade.
+        let signing_payload = relayed_spend_signing_payload(&env, &message);
         env.crypto()
-            .ed25519_verify(&public_key, &message_bytes, &signature);
+            .ed25519_verify(&public_key, &signing_payload, &signature);
 
         // Signature verified — apply the same validation rules as a direct
         // execute_spend before mutating state.
@@ -5869,6 +5951,72 @@ impl PermissionsContract {
             .instance()
             .get::<DataKey, bool>(&DataKey::FrozenRelayer(relayer))
             .unwrap_or(false)
+    }
+
+    // ── Gas sponsorship (issue #689) ────────────────────────────────────────
+
+    /// Create or replace the gas sponsorship policy funded by `sponsor`.
+    ///
+    /// Only `relayer` may draw reimbursements, each capped at
+    /// `max_fee_per_tx_stroops`, for at most `remaining_tx_count` transactions.
+    /// The budget is held in `fee_token` (normally the native XLM SAC). The
+    /// fee token cannot be switched while a non-zero balance remains.
+    pub fn configure_sponsorship(
+        env: Env,
+        sponsor: Address,
+        relayer: Address,
+        fee_token: Address,
+        max_fee_per_tx_stroops: i128,
+        remaining_tx_count: u32,
+    ) -> Result<(), PermissionError> {
+        sponsor.require_auth();
+        sponsorship::configure(
+            &env,
+            &sponsor,
+            &relayer,
+            &fee_token,
+            max_fee_per_tx_stroops,
+            remaining_tx_count,
+        )
+    }
+
+    /// Deposit `amount` of the policy's fee token from `sponsor` into the
+    /// sponsorship budget. Returns the new budget balance.
+    pub fn fund_sponsorship(
+        env: Env,
+        sponsor: Address,
+        amount: i128,
+    ) -> Result<i128, PermissionError> {
+        sponsor.require_auth();
+        sponsorship::fund(&env, &sponsor, amount)
+    }
+
+    /// Reimburse `relayer` `fee_stroops` from `sponsor`'s budget. Fails with
+    /// [`PermissionError::ExceedsPerTxLimit`] above the per-transaction cap,
+    /// [`PermissionError::ExceedsTotalLimit`] when the budget or transaction
+    /// count is exhausted, and [`PermissionError::Unauthorized`] for any relayer
+    /// other than the configured one. Returns the remaining budget balance.
+    pub fn charge_sponsored_fee(
+        env: Env,
+        sponsor: Address,
+        relayer: Address,
+        fee_stroops: i128,
+    ) -> Result<i128, PermissionError> {
+        relayer.require_auth();
+        if Self::is_relayer_frozen(env.clone(), relayer.clone()) {
+            return Err(PermissionError::RelayerFrozen);
+        }
+        sponsorship::charge_fee(&env, &sponsor, &relayer, fee_stroops)
+    }
+
+    /// Returns `sponsor`'s sponsorship policy, if one is configured.
+    pub fn get_sponsorship_policy(env: Env, sponsor: Address) -> Option<SponsorshipPolicy> {
+        sponsorship::read_policy(&env, &sponsor)
+    }
+
+    /// Returns `sponsor`'s remaining sponsorship budget in stroops (0 if unfunded).
+    pub fn get_sponsorship_balance(env: Env, sponsor: Address) -> i128 {
+        sponsorship::read_balance(&env, &sponsor)
     }
 
     /// Pause new grant creation. Admin-only.
