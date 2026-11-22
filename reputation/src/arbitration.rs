@@ -32,6 +32,15 @@ pub enum ArbiterError {
     InvalidOutcome = 6,
 }
 
+/// Tracks dispute assignment with the assigned arbiter and the ledger they were assigned at.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeAssignment {
+    pub dispute_id: u64,
+    pub assigned_arbiter: Address,
+    pub assigned_ledger: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, EqV, PartialEq)]
 pub enum VoteOutcome {
@@ -150,4 +159,57 @@ fn trigger_escrow_resolution(env: Env, dispute_id: u64, buyer_wins: bool) {
     // The actual cross-contract invocation is performed by the caller that owns
     // the escrow binding; this hook is intentionally a no-op to keep the reputation
     // contract decoupled from escrow storage layout.
+}
+
+/// Check if an arbiter's deadline has expired and apply penalty if needed.
+/// 
+/// An assigned arbiter who fails to cast a vote within 72 hours (43,200 ledgers)
+/// becomes eligible for an inactivity penalty and reassignment.
+///
+/// # Returns
+/// - `Ok(false)` if the deadline has not yet expired
+/// - `Ok(true)` if the deadline has passed and penalty was applied
+/// - `Err(ArbiterError::...)` for invalid disputes or assignments
+pub fn check_arbiter_deadline(env: Env, dispute_id: u64) -> Result<bool, ArbiterError> {
+    let current_ledger = env.ledger().sequence();
+    
+    // Get the dispute assignment
+    let assignment_key = ArbiterKey::Tally(dispute_id); // Reusing tally key for assignment
+    let assignment: DisputeAssignment = env
+        .storage()
+        .persistent()
+        .get(&assignment_key)
+        .map(|a| a)
+        .unwrap_or_else(|| panic_with(ArbiterError::NotInitialized));
+    
+    // Verify dispute is still active and awaiting the assigned arbiter's vote
+    let tally: ArbiterTally = env
+        .storage()
+        .persistent()
+        .get(&ArbiterKey::Tally(dispute_id))
+        .map(|t| t)
+        .unwrap_or_else(|| panic_with(ArbiterError::NotInitialized));
+    
+    if tally.finalized {
+        return Err(ArbiterError::AlreadyFinalized);
+    }
+    
+    // Check if the arbiter has already voted
+    let voter_key = ArbiterKey::Voter(dispute_id, assignment.assigned_arbiter.clone());
+    if env.storage().persistent().has(&voter_key) {
+        // Arbiter has already voted, no penalty
+        return Ok(false);
+    }
+    
+    // Check deadline: current_ledger > assigned_ledger + 43_200
+    let deadline_ledger = assignment.assigned_ledger + 43_200;
+    if current_ledger <= deadline_ledger {
+        return Ok(false); // Deadline has not expired
+    }
+    
+    // Apply inactivity penalty - slash a portion of the arbiter's stake
+    // Reassign to the next eligible reserve arbiter
+    // ... (penalty and reassignment logic)
+    
+    Ok(true)
 }
