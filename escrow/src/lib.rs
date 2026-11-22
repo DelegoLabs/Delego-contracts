@@ -75,6 +75,12 @@ pub mod sub_orders;
 pub use sub_orders::SubOrder;
 /// Strict buyer + merchant + fee = deposit checks for terminal settlements (issue #547).
 pub mod value_conservation;
+/// Same-ledger flash loan protection for staked escrow balances (issue #594).
+pub mod flash_loan_guard;
+pub use flash_loan_guard::guard_flash_loan;
+/// Buyer/merchant split of accrued settlement yield (issue #591).
+pub mod yield_splitter;
+pub use yield_splitter::{YieldDistribution, DEFAULT_MERCHANT_YIELD_SHARE_BPS};
 pub use value_conservation::assert_value_conservation;
 
 mod admin_actions;
@@ -2674,6 +2680,9 @@ pub enum EscrowError {
     /// `buyer_refund_amount + merchant_payout_amount + prorated_fee` does
     /// not exactly equal the escrow's remaining deposit (issue #483).
     InvalidSplitSettlement = 611,
+    /// A staked escrow balance was withdrawn or had its yield claimed in the
+    /// same ledger it was deposited in (flash loan protection, issue #594).
+    SameLedgerManipulationDetected = 612,
     /// Milestone schedule is empty, too long, has duplicate ids, non-positive
     /// amounts, pre-completed entries, or an overflowing total.
     InvalidMilestoneSchedule = 470,
@@ -2930,6 +2939,7 @@ impl_escrow_error_try_from! {
     609 => InvalidReferralCommission,
     610 => ReferrerKeyNotSet,
     611 => InvalidSplitSettlement,
+    612 => SameLedgerManipulationDetected,
 }
 
 impl TryFrom<&soroban_sdk::Error> for EscrowError {
@@ -6557,6 +6567,9 @@ impl EscrowContract {
                 &record.token,
                 &cfg.lending_pool_contract,
             );
+            // The balance is now staked: record the deposit ledger so it can
+            // not be withdrawn within the same ledger (issue #594).
+            flash_loan_guard::record_deposit_ledger(&env, escrow_id);
         }
 
         record.amount = net_received;
@@ -7660,6 +7673,10 @@ impl EscrowContract {
             return Err(EscrowError::ZeroAmount);
         }
 
+        // Flash loan protection (issue #594): a staked balance can not be
+        // released in the same ledger it was deposited.
+        flash_loan_guard::guard_staked_withdrawal(env, escrow_id)?;
+
         let remaining = record
             .amount
             .checked_sub(record.released_amount)
@@ -7742,78 +7759,43 @@ impl EscrowContract {
                 .get(&DataKey::EscrowYieldConfig(escrow_id));
             if let Some(cfg) = &yield_config {
                 let (yield_amount, held_seconds) = Self::compute_yield(&record, Some(cfg), env)?;
-                
-                // Check if yield split configuration exists (issue #360)
+
+                // An explicit `YieldSplitConfig` (issue #360) overrides the
+                // default 50/50 buyer/merchant split (issue #591).
                 let split_config: Option<YieldSplitConfig> = env
                     .storage()
                     .persistent()
                     .get(&DataKey::EscrowYieldSplitConfig(escrow_id));
-                
-                match split_config {
-                    Some(split) => {
-                        // Split yield between buyer and seller according to configured basis points
-                        let seller_yield = (yield_amount * split.seller_yield_share_bps as i128) / 10_000i128;
-                        let buyer_yield = yield_amount - seller_yield;
-                        
-                        // Transfer yields to both parties atomically
-                        if seller_yield > 0 {
-                            token_client.transfer(
-                                &env.current_contract_address(),
-                                &record.seller,
-                                &seller_yield,
-                            );
-                        }
-                        if buyer_yield > 0 {
-                            token_client.transfer(
-                                &env.current_contract_address(),
-                                &record.buyer,
-                                &buyer_yield,
-                            );
-                        }
-                        
-                        // Emit the new split yield event (issue #360)
-                        env.events().publish(
-                            (symbol_short!("escrow"), symbol_short!("yield"), escrow_id),
-                            EscrowYieldSplitAccruedEvent {
-                                escrow_id,
-                                seller: record.seller.clone(),
-                                buyer: record.buyer.clone(),
-                                total_yield: yield_amount,
-                                seller_yield,
-                                buyer_yield,
-                                held_seconds,
-                            },
-                        );
-                    }
-                    None => {
-                        // Backward compatibility: if no split config, seller gets 100% of yield
-                        if yield_amount > 0 {
-                            token_client.transfer(
-                                &env.current_contract_address(),
-                                &record.seller,
-                                &yield_amount,
-                            );
-                        }
-                        
-                        // Emit the legacy yield event for backward compatibility
-                        env.events().publish(
-                            (symbol_short!("escrow"), symbol_short!("yield"), escrow_id),
-                            EscrowYieldAccruedEvent {
-                                escrow_id,
-                                seller: record.seller.clone(),
-                                yield_amount,
-                                held_seconds,
-                            },
-                        );
-                    }
-                }
-                let (yield_amount, held_seconds) = Self::compute_yield(&record, Some(cfg), env)?;
+                let merchant_share_bps = split_config
+                    .map(|split| split.seller_yield_share_bps)
+                    .unwrap_or(DEFAULT_MERCHANT_YIELD_SHARE_BPS);
+
+                // Exact integer split: shares always sum to the gross yield.
+                let distribution = yield_splitter::compute_distribution(
+                    escrow_id,
+                    yield_amount,
+                    merchant_share_bps,
+                )?;
+
+                // Transfer both shares alongside the escrow disbursement and
+                // record the `YieldDistribution` on the ledger.
+                yield_splitter::disburse(
+                    env,
+                    &token_client,
+                    &record.buyer,
+                    &record.seller,
+                    &distribution,
+                );
+
                 env.events().publish(
                     (symbol_short!("escrow"), symbol_short!("yield"), escrow_id),
-                    EscrowYieldAccruedEvent {
+                    EscrowYieldSplitAccruedEvent {
                         escrow_id,
                         seller: record.seller.clone(),
-                        yield_amount,
+                        buyer: record.buyer.clone(),
+                        total_yield: distribution.gross_yield,
+                        seller_yield: distribution.merchant_yield_share,
+                        buyer_yield: distribution.buyer_yield_share,
                         held_seconds,
                     },
                 );
@@ -8775,6 +8757,10 @@ impl EscrowContract {
         if record.status != EscrowStatus::Funded && record.status != EscrowStatus::Inspection {
             return Err(EscrowError::InvalidStatus);
         }
+
+        // Flash loan protection (issue #594): a staked balance can not be
+        // refunded in the same ledger it was deposited.
+        flash_loan_guard::guard_staked_withdrawal(&env, escrow_id)?;
 
         let timeout_reached = env.ledger().sequence() >= record.timeout_ledger;
 

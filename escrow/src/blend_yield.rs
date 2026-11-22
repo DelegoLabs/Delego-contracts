@@ -198,6 +198,9 @@ pub fn redeem(env: &Env, id: u64) {
     if position.shares == 0 {
         return;
     }
+    // Flash loan protection (issue #594): the staked position can not be
+    // redeemed (withdrawn or yield-claimed) in the ledger it was deposited.
+    crate::flash_loan_guard::enforce_staked_withdrawal(env, id);
     let mut cfg = config(env, id).unwrap_or_else(|| fail(env, BlendYieldError::InvalidConfig));
     let owner = env.current_contract_address();
     let pool = BlendPoolClient::new(env, &cfg.lending_pool_contract);

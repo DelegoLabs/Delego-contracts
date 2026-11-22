@@ -14,3 +14,7 @@ pub mod fee_calculation;
 /// that all balance/fee/yield helpers return `MathOverflow` instead of wrapping
 /// (issue #536).
 pub mod overflow_arithmetic;
+
+/// Flash loan protection guard tests — same-ledger deposit and withdrawal of a
+/// staked escrow balance is rejected (issue #594).
+pub mod flash_loan_guard;

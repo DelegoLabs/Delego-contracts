@@ -648,6 +648,31 @@ pub enum ReputationError {
     /// The review appeal voting window is still open, so the appeal cannot be
     /// expired yet.
     AppealWindowNotExpired = 3040,
+    /// Review rating is outside the accepted `20..=100` range (issue #584).
+    InvalidRatingValue = 3046,
+}
+
+#[cfg(test)]
+mod rating_validation_tests {
+    use super::*;
+
+    #[test]
+    fn validate_rating_rejects_out_of_range_values() {
+        for rating in [0u32, 19, 101, u32::MAX] {
+            assert_eq!(
+                validate_rating(rating),
+                Err(ReputationError::InvalidRatingValue),
+                "rating {rating} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rating_accepts_in_range_values() {
+        for rating in [20u32, 60, 100] {
+            assert_eq!(validate_rating(rating), Ok(()), "rating {rating} should be accepted");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -701,6 +726,7 @@ mod error_code_allocation {
             ReputationError::InvalidAppealVerdict as u32,
             ReputationError::AppealWindowExpired as u32,
             ReputationError::AppealWindowNotExpired as u32,
+            ReputationError::InvalidRatingValue as u32,
         ];
         for code in codes {
             assert!(
@@ -1197,6 +1223,24 @@ const MIN_RATING: u32 = 1;
 
 /// Maximum rating value (5 stars).
 const MAX_RATING: u32 = 5;
+
+/// Minimum accepted review rating: 1.0 star mapped to 20 (issue #584).
+pub const MIN_REVIEW_RATING: u32 = 20;
+
+/// Maximum accepted review rating: 5.0 stars mapped to 100 (issue #584).
+pub const MAX_REVIEW_RATING: u32 = 100;
+
+/// Validates that a review rating lies within `20..=100` (1.0 to 5.0 stars).
+///
+/// # Errors
+///
+/// * [`ReputationError::InvalidRatingValue`] - `rating` is outside the range.
+pub fn validate_rating(rating: u32) -> Result<(), ReputationError> {
+    if !(MIN_REVIEW_RATING..=MAX_REVIEW_RATING).contains(&rating) {
+        return Err(ReputationError::InvalidRatingValue);
+    }
+    Ok(())
+}
 
 /// Quorum threshold for dispute voting (66% consensus).
 const DISPUTE_QUORUM_THRESHOLD_BPS: i128 = 6_600;
@@ -3304,10 +3348,8 @@ impl ReputationContract {
     ) -> Result<(), ReputationError> {
         caller.require_auth();
 
-        // Validate rating range (1-5 stars)
-        if rating < MIN_RATING || rating > MAX_RATING {
-            return Err(ReputationError::InvalidRating);
-        }
+        // Validate rating range (1.0-5.0 stars mapped to 20..=100)
+        validate_rating(rating)?;
 
         // Check if review already committed
         let commitment_key = DataKey::ReviewCommitment(escrow_id);
