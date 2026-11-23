@@ -558,6 +558,156 @@ fn test_sweep_expired_batch_empty_registry() {
     assert_eq!(result.rent_reclaimed_stroops, 0);
 }
 
+/// Populates the three per-delegation auxiliary keys that `sweep_auxiliary_keys`
+/// must clear. The keeper bounty ledger is seeded directly because writing it
+/// through `bump_delegation_ttl_with_reward` would require a live XLM SAC
+/// transfer and a low storage TTL.
+fn seed_auxiliary_config_keys(
+    env: &Env,
+    client: &DelegationRegistryClient<'_>,
+    delegation_id: u64,
+) {
+    client.set_spend_rate_limit(&delegation_id, &1_000u32, &10_000i128);
+
+    let mut allowed_merchants = Vec::new(env);
+    allowed_merchants.push_back(Address::generate(env));
+    client.set_merchant_filter(
+        &delegation_id,
+        &DelegationMerchantFilter {
+            allowed_merchants,
+            is_strict_whitelist: true,
+            max_per_merchant_stroops: 5_000,
+        },
+    );
+
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::KeeperLastBountyLedger(delegation_id), &1u32);
+    });
+}
+
+/// Asserts the presence (or absence) of all three auxiliary config keys
+/// directly in persistent contract storage.
+fn assert_auxiliary_config_keys(
+    env: &Env,
+    client: &DelegationRegistryClient<'_>,
+    delegation_id: u64,
+    present: bool,
+) {
+    env.as_contract(&client.address, || {
+        for key in [
+            DataKey::SpendRateLimit(delegation_id),
+            DataKey::MerchantFilter(delegation_id),
+            DataKey::KeeperLastBountyLedger(delegation_id),
+        ] {
+            assert_eq!(env.storage().persistent().has(&key), present);
+        }
+    });
+}
+
+#[test]
+fn test_sweep_expired_removes_spend_merchant_and_keeper_keys() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let id = client.create_delegation(
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &Symbol::new(&env, "Sweep_Config"),
+        &100,
+    );
+    let live_id = client.create_delegation(
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &Symbol::new(&env, "Sweep_Config_Live"),
+        &1_000,
+    );
+
+    seed_auxiliary_config_keys(&env, &client, id);
+    seed_auxiliary_config_keys(&env, &client, live_id);
+    assert_auxiliary_config_keys(&env, &client, id, true);
+    assert_auxiliary_config_keys(&env, &client, live_id, true);
+
+    env.ledger().set_sequence_number(300);
+    let mut ids = Vec::new(&env);
+    ids.push_back(id);
+    let swept = client.sweep_expired(&ids);
+    assert_eq!(swept.len(), 1);
+    assert_eq!(swept.get(0).unwrap(), id);
+
+    assert_auxiliary_config_keys(&env, &client, id, false);
+    assert_auxiliary_config_keys(&env, &client, live_id, true);
+    assert_eq!(
+        client.get_delegation(&live_id).status,
+        DelegationStatus::Active
+    );
+}
+
+#[test]
+fn test_sweep_expired_batch_removes_spend_merchant_and_keeper_keys() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let mut swept_ids = Vec::<u64>::new(&env);
+    for _ in 0..3 {
+        let label = Symbol::new(&env, "Batch_Config");
+        let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+        seed_auxiliary_config_keys(&env, &client, id);
+        swept_ids.push_back(id);
+    }
+    let live_id = client.create_delegation(
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &Symbol::new(&env, "Batch_Config_Live"),
+        &1_000,
+    );
+    seed_auxiliary_config_keys(&env, &client, live_id);
+
+    env.ledger().set_sequence_number(300);
+    let result = client.sweep_expired_batch(&1u64, &10u32);
+    assert_eq!(result.swept_records_count, 3);
+    assert_eq!(result.next_cursor_id, None);
+
+    for id in swept_ids.iter() {
+        assert_auxiliary_config_keys(&env, &client, id, false);
+        // The pre-existing auxiliary cleanup must still run alongside it.
+        assert_eq!(client.get_delegation_history(&id).len(), 0);
+    }
+    assert_auxiliary_config_keys(&env, &client, live_id, true);
+    assert!(!client.get_delegation_history(&live_id).is_empty());
+}
+
+#[test]
+fn test_sweep_expired_batch_tolerates_missing_auxiliary_keys() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let id = client.create_delegation(
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &Symbol::new(&env, "Batch_No_Config"),
+        &100,
+    );
+
+    env.ledger().set_sequence_number(300);
+    let first = client.sweep_expired_batch(&1u64, &10u32);
+    assert_eq!(first.swept_records_count, 1);
+    assert_auxiliary_config_keys(&env, &client, id, false);
+
+    // A second pass must stay a no-op rather than failing on the missing keys.
+    let second = client.sweep_expired_batch(&1u64, &10u32);
+    assert_eq!(second.swept_records_count, 0);
+    assert_eq!(second.rent_reclaimed_stroops, 0);
+}
+
 #[test]
 fn test_get_expired_delegations_returns_correct_list() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();

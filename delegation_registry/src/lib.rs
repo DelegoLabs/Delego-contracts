@@ -2075,6 +2075,10 @@ impl DelegationRegistry {
     /// `Expired`/`Revoked` are silently skipped, making repeated sweeps of
     /// the same batch safe and gas-efficient.
     ///
+    /// Swept delegations also have their per-delegation configuration keys
+    /// (spend rate limit, merchant filter and keeper bounty ledger) removed so
+    /// no orphaned state is left in persistent storage.
+    ///
     /// Returns the ids that were actually swept.
     pub fn sweep_expired(env: Env, delegation_ids: Vec<u64>) -> Result<Vec<u64>, DelegationError> {
         if delegation_ids.is_empty() || delegation_ids.len() > MAX_SWEEP_BATCH_SIZE {
@@ -2097,6 +2101,8 @@ impl DelegationRegistry {
                     Self::write_delegation_v2(&env, &record);
 
                     Self::store_snapshot(&env, id, &record);
+
+                    Self::remove_auxiliary_config_keys(&env, id);
 
                     // Topics: (contract, action, entity_id) — entity_id is the delegation id.
                     env.events().publish(
@@ -2201,9 +2207,9 @@ impl DelegationRegistry {
     }
 
     /// Removes the auxiliary storage keys belonging to a delegation (snapshot
-    /// entries, version history, version counter, schema marker and nonce)
-    /// and returns the number of entries removed, used to estimate reclaimed
-    /// rent.
+    /// entries, version history, version counter, schema marker, nonce, spend
+    /// rate limit, merchant filter and keeper bounty ledger) and returns the
+    /// number of entries removed, used to estimate reclaimed rent.
     fn sweep_auxiliary_keys(env: &Env, delegation_id: u64) -> u32 {
         let mut entries_removed: u32 = 0;
 
@@ -2243,6 +2249,32 @@ impl DelegationRegistry {
                 .persistent()
                 .remove(&DataKey::DelegationNonce(delegation_id));
             entries_removed += 1;
+        }
+
+        entries_removed += Self::remove_auxiliary_config_keys(env, delegation_id);
+
+        entries_removed
+    }
+
+    /// Removes the per-delegation configuration keys that are meaningless once
+    /// a delegation is no longer live: the sliding-window spend rate limit, the
+    /// merchant whitelist filter and the keeper bounty ledger.
+    ///
+    /// Returns the number of entries actually removed so callers can include
+    /// them in rent-reclaim estimates. Absent keys are skipped, keeping the
+    /// sweep correct for delegations that never configured them.
+    fn remove_auxiliary_config_keys(env: &Env, delegation_id: u64) -> u32 {
+        let mut entries_removed: u32 = 0;
+
+        for key in [
+            DataKey::SpendRateLimit(delegation_id),
+            DataKey::MerchantFilter(delegation_id),
+            DataKey::KeeperLastBountyLedger(delegation_id),
+        ] {
+            if env.storage().persistent().has(&key) {
+                env.storage().persistent().remove(&key);
+                entries_removed += 1;
+            }
         }
 
         entries_removed
