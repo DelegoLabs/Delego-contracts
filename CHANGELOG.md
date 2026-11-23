@@ -103,6 +103,15 @@ will reject the change.
 
 ### Unreleased
 
+- Repair the account recovery module (issue #686): valid SDK v22 storage calls with TTL extension, the
+  `RecoveryKey::Quorum` key, and typed `RecoveryError` codes (2701-2711). The 48-hour cool-down is now measured in
+  ledgers.
+- Repair the multi-sig module and wire it into `PermissionsContract` (issue #687): `init_multisig`,
+  `get_multisig_config`, `propose_multisig`, `approve_multisig` and `get_multisig_proposal`, with `MultiSigError`
+  (2601-2607). The unfinished envelope executor, which never compiled, is removed.
+- Replace the uncompiled one-time tickets with bounded spend tickets and wire them into `PermissionsContract`
+  (issue #688): `issue_spend_ticket`, `redeem_spend_ticket`, `revoke_spend_ticket` and `get_spend_ticket`, with
+  `TicketError` (2801-2807).
 - Wire the gas sponsorship module into `PermissionsContract` (issue #689):
   `configure_sponsorship`, `fund_sponsorship`, `charge_sponsored_fee`,
   `get_sponsorship_policy` and `get_sponsorship_balance`, backed by
