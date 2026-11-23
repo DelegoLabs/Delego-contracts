@@ -3,6 +3,99 @@
 //! Provides decay weighting functions and decayed score aggregation
 //! to weight older feedback ratings lower than fresh reviews.
 
+use soroban_sdk::contracttype;
+
+/// Basis-point scale (100%).
+const DECAY_BPS: u64 = 10_000;
+
+/// Configuration for staked-reputation exponential decay (issue #478).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReputationDecayConfig {
+    /// Epochs after which the decay multiplier halves.
+    pub half_life_epochs: u32,
+    /// Lower bound of the multiplier, in basis points.
+    pub min_decay_floor: u32,
+    /// Elapsed epochs are capped at this value before computing decay.
+    pub max_epochs_supported: u32,
+}
+
+/// Fixed-point one (Q64).
+const FP_ONE: u128 = 1u128 << 64;
+
+/// Fixed-point (Q64) multiply of two values `<= FP_ONE`; `None` on overflow.
+fn fp_mul(a: u128, b: u128) -> Option<u128> {
+    let (ah, al) = (a >> 32, a & 0xFFFF_FFFF);
+    let (bh, bl) = (b >> 32, b & 0xFFFF_FFFF);
+    let hh = ah.checked_mul(bh)?;
+    let mid = ah
+        .checked_mul(bl)?
+        .checked_add(al.checked_mul(bh)?)?
+        .checked_add(al.checked_mul(bl)? >> 32)?;
+    hh.checked_add(mid >> 32)
+}
+
+/// Per-epoch decay factor `2^(-1/half_life) = exp(-ln2 / h)` in Q64,
+/// evaluated with a short Taylor series (t <= ln 2).
+fn per_epoch_factor(half_life_epochs: u32) -> Option<u128> {
+    let h = half_life_epochs.max(1) as u128;
+    // ln(2) in Q64.
+    const LN2_Q64: u128 = 12_786_308_645_202_655_660;
+    let t = LN2_Q64.checked_div(h)?;
+    let t2 = fp_mul(t, t)?;
+    let t3 = fp_mul(t2, t)?;
+    let t4 = fp_mul(t3, t)?;
+    let t5 = fp_mul(t4, t)?;
+    FP_ONE
+        .checked_sub(t)?
+        .checked_add(t2 / 2)?
+        .checked_sub(t3 / 6)?
+        .checked_add(t4 / 24)?
+        .checked_sub(t5 / 120)
+}
+
+/// Decay multiplier in basis points after `elapsed_epochs`, computed with
+/// binary square-and-multiply fixed-point exponentiation of the per-epoch
+/// factor. `elapsed_epochs` is capped at `max_epochs_supported`; any
+/// overflow/underflow, or a result below the floor, yields
+/// `min_decay_floor`. Never panics.
+pub fn compute_staked_decay_bps(config: &ReputationDecayConfig, elapsed_epochs: u32) -> u32 {
+    let floor = config.min_decay_floor.min(DECAY_BPS as u32);
+    let epochs = elapsed_epochs.min(config.max_epochs_supported);
+    if epochs == 0 {
+        return DECAY_BPS as u32;
+    }
+    let result = (|| -> Option<u32> {
+        let mut base = per_epoch_factor(config.half_life_epochs)?;
+        let mut acc = FP_ONE;
+        let mut e = epochs;
+        while e > 0 {
+            if e & 1 == 1 {
+                acc = fp_mul(acc, base)?;
+            }
+            e >>= 1;
+            if e > 0 {
+                base = fp_mul(base, base)?;
+            }
+        }
+        let bps = acc.checked_mul(DECAY_BPS as u128)? >> 64;
+        u32::try_from(bps).ok()
+    })();
+    match result {
+        Some(bps) if bps >= floor => bps.min(DECAY_BPS as u32),
+        _ => floor,
+    }
+}
+
+/// Applies [`compute_staked_decay_bps`] to a staked score without overflow.
+pub fn apply_staked_decay(score: u64, config: &ReputationDecayConfig, elapsed_epochs: u32) -> u64 {
+    let bps = compute_staked_decay_bps(config, elapsed_epochs) as u64;
+    match score.checked_mul(bps) {
+        Some(v) => v / DECAY_BPS,
+        None => (score / DECAY_BPS).saturating_mul(bps),
+    }
+}
+
 /// Computes the exponential decay weight for a review based on its age.
 ///
 /// Applies exponential decay half-life weighting:
@@ -174,6 +267,55 @@ mod tests {
             now,
         );
         assert_eq!(iterator_score, decayed_score);
+    }
+
+    fn decay_cfg() -> ReputationDecayConfig {
+        ReputationDecayConfig {
+            half_life_epochs: 10,
+            min_decay_floor: 500,
+            max_epochs_supported: 1_000,
+        }
+    }
+
+    #[test]
+    fn staked_decay_half_life_is_about_half() {
+        let bps = compute_staked_decay_bps(&decay_cfg(), 10);
+        assert!((4_990..=5_010).contains(&bps), "got {bps}");
+        assert_eq!(compute_staked_decay_bps(&decay_cfg(), 0), 10_000);
+    }
+
+    #[test]
+    fn staked_decay_large_spans_converge_to_floor_without_panic() {
+        let cfg = decay_cfg();
+        let mut prev = u32::MAX;
+        for epochs in [1u32, 5, 20, 50, 100, 150, 500, 1_000, 10_000, u32::MAX] {
+            let bps = compute_staked_decay_bps(&cfg, epochs);
+            assert!(bps <= prev, "decay must be monotonic");
+            assert!(bps >= cfg.min_decay_floor);
+            prev = bps;
+        }
+        assert_eq!(compute_staked_decay_bps(&cfg, 100), cfg.min_decay_floor);
+        assert_eq!(compute_staked_decay_bps(&cfg, u32::MAX), cfg.min_decay_floor);
+        assert_eq!(
+            apply_staked_decay(u64::MAX, &cfg, u32::MAX),
+            u64::MAX / 10_000 * 500
+        );
+    }
+
+    #[test]
+    fn staked_decay_degenerate_config_is_safe() {
+        let cfg = ReputationDecayConfig {
+            half_life_epochs: 0,
+            min_decay_floor: 20_000,
+            max_epochs_supported: 0,
+        };
+        assert_eq!(compute_staked_decay_bps(&cfg, 500), 10_000);
+        let cfg = ReputationDecayConfig {
+            half_life_epochs: 1,
+            min_decay_floor: 0,
+            max_epochs_supported: u32::MAX,
+        };
+        assert_eq!(compute_staked_decay_bps(&cfg, u32::MAX), 0);
     }
 
     #[test]

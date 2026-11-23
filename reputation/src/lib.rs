@@ -29,7 +29,7 @@ mod appeals_test;
 mod blinded_review_test;
 #[cfg(test)]
 mod fraud_report_test;
-mod oracle_proof;
+#[cfg(test)]
 mod rehabilitation_test;
 #[cfg(test)]
 mod reputation_reader_test;
@@ -45,8 +45,10 @@ pub use oracle_proof::{CarrierProof, CarrierProofVerifiedEvent};
 pub mod scoring;
 pub use scoring::{
     aggregate_decayed_score, calculate_decayed_merchant_score, compute_decayed_weight,
-    FeedbackReview,
+    compute_staked_decay_bps, FeedbackReview, ReputationDecayConfig,
 };
+pub mod snapshot;
+pub use snapshot::{ReputationSnapshot, SNAPSHOT_INTERVAL_LEDGERS};
 
 pub mod antisybil;
 pub use antisybil::{calculate_reviewer_weight, get_buyer_completed_orders, EscrowListPageMirror};
@@ -685,6 +687,8 @@ mod error_code_allocation {
             ReputationError::InvalidFraudBond as u32,
             ReputationError::InvalidReportStatus as u32,
             ReputationError::CarrierOracleNotAuthorized as u32,
+            ReputationError::NoMatchingPrecedentRule as u32,
+            ReputationError::PrecedentAttestationMismatch as u32,
             ReputationError::ReviewCooldownActive as u32,
             ReputationError::ReviewNotFound as u32,
             ReputationError::FlagNotFound as u32,
@@ -1572,6 +1576,9 @@ impl ReputationContract {
 
         record.rating = Some(rating);
         env.storage().persistent().set(&record_key, &record);
+
+        // Periodic snapshot checkpointing (issue #589).
+        snapshot::record_review(&env, &entity, rating);
 
         Self::recompute_score(&env, &entity)?;
 
@@ -4663,6 +4670,22 @@ impl ReputationContract {
     /// Returns the bond forfeited to `charity` so far, in stroops.
     pub fn get_charity_balance(env: Env, charity: Address) -> i128 {
         appeals::charity_balance(&env, &charity)
+    }
+
+    /// Latest persisted weekly reputation checkpoint for `merchant` (issue #589).
+    pub fn get_reputation_snapshot(env: Env, merchant: Address) -> Option<ReputationSnapshot> {
+        snapshot::latest_snapshot(&env, &merchant)
+    }
+
+    /// Cumulative score and review count, combining the latest checkpoint with
+    /// the reviews recorded since `snapshot_ledger` (issue #589).
+    pub fn get_snapshot_score(env: Env, merchant: Address) -> (u64, u32) {
+        snapshot::current_totals(&env, &merchant)
+    }
+
+    /// Average review rating in basis points derived from the snapshot path.
+    pub fn get_snapshot_average(env: Env, merchant: Address) -> u32 {
+        snapshot::current_average(&env, &merchant)
     }
 }
 
