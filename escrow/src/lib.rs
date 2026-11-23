@@ -29,6 +29,12 @@
 //! | `escrow` | `bounty` | `u64` escrow_id | `KeeperBountyPaidEvent` |
 //! | `escrow` | `fee_sched` | — | `ConfigChangeScheduledEvent` |
 //! | `escrow` | `dispsplit` | `u64` escrow_id | `DisputeResolvedEvent` |
+//! | `escrow` | `amm_route` | — | `AmmRouteExecuted` |
+//! | `escrow` | `yld_bypas` | `u64` escrow_id | `YieldBypassedLowApy` |
+//! | `escrow` | `pl_dt_apr` | — | `DefiPoolDetachApproved` |
+//! | `escrow` | `pl_detach` | — | `DefiPoolDetachedEvent` |
+//! | `escrow` | `bl_skip` | `u64` escrow_id | `i128` amount kept in custody |
+//! | `escrow` | `bl_strand` | `u64` escrow_id | `i128` principal settled from reserves |
 //! # Cancellation protection (issue #355)
 //!
 //! A seller may only cancel an escrow that is still `Created`, but a created
@@ -62,6 +68,22 @@ pub use blend_yield::YieldBearingEscrowConfig;
 /// Timelocked emergency recovery for inactive escrow parties.
 pub mod emergency;
 pub use emergency::{EmergencyFundRecovered, EmergencyRecoveryTrait};
+
+/// Multi-hop AMM liquidity-pool routing for cross-border payments (issue #595).
+pub mod amm_router;
+pub use amm_router::{AmmPoolPair, AmmRouteExecuted, AmmRouteHop};
+
+/// Emergency detach of compromised external DeFi pools (issue #597).
+pub mod emergency_unwind;
+pub use emergency_unwind::{DefiPoolDetachApproved, DefiPoolDetachedEvent, EmergencyUnwindTrait};
+
+/// Minimum yield threshold guard for escrow staking (issue #596).
+pub mod yield_guard;
+pub use yield_guard::{is_yield_viable, YieldBypassedLowApy};
+
+/// MasterChef-style yield accrual checkpointing for pro-rata returns (issue #598).
+pub mod checkpoint;
+pub use checkpoint::{YieldCheckpoint, YieldPoolState, YieldPosition};
 
 /// Multi-hop path payment validation and surplus refund helper.
 pub mod path_payment;
@@ -2714,6 +2736,11 @@ pub enum EscrowError {
     /// The requested minimum fee floor is negative or above
     /// [`MAX_MIN_FEE_STROOPS`] (issue #362).
     InvalidMinFee = 490,
+    /// The external DeFi pool has been emergency-detached and accepts no new
+    /// deposits (issue #597).
+    DefiPoolDetached = 612,
+    /// The external DeFi pool is already detached (issue #597).
+    DefiPoolAlreadyDetached = 613,
 }
 
 pub fn execute_atomic_operation<F, T>(env: &Env, f: F) -> Result<T, EscrowError>
@@ -6492,6 +6519,7 @@ impl EscrowContract {
         {
             return Err(EscrowError::InvalidYieldConfig);
         }
+        emergency_unwind::assert_pool_accepting_deposits(&env, &config.lending_pool_contract)?;
         blend_yield::configure(&env, escrow_id, config);
         Ok(())
     }
@@ -6548,7 +6576,20 @@ impl EscrowContract {
             record.amount,
         )?;
 
-        blend_yield::fund(&env, escrow_id, &record.token, net_received);
+        // Keep the deposit in the standard vault when the pool's supply rate
+        // is below the minimum viable yield (issue #596).
+        let stake = match blend_yield::config(&env, escrow_id) {
+            Some(cfg) => yield_guard::should_stake(
+                &env,
+                escrow_id,
+                &cfg.lending_pool_contract,
+                net_received,
+            ),
+            None => false,
+        };
+        if stake {
+            blend_yield::fund(&env, escrow_id, &record.token, net_received);
+        }
         // Revoke any residual allowance the pool may hold after the deposit
         // (issue #599).
         if let Some(cfg) = blend_yield::config(&env, escrow_id) {
@@ -17565,7 +17606,7 @@ mod error_code_allocation_tests {
         (3_000, 3_999),
         (4_000, 4_999),
     ];
-    fn escrow_error_codes() -> [u32; 122] {
+    fn escrow_error_codes() -> [u32; 124] {
         [
             EscrowError::AlreadyInitialized as u32,
             EscrowError::NotFound as u32,
@@ -17689,6 +17730,8 @@ mod error_code_allocation_tests {
             EscrowError::ExceedsTotalEscrowAmount as u32,
             EscrowError::SubItemAlreadyResolved as u32,
             EscrowError::OracleInvocationFailed as u32,
+            EscrowError::DefiPoolDetached as u32,
+            EscrowError::DefiPoolAlreadyDetached as u32,
         ]
     }
 
