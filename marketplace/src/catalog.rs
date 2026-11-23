@@ -30,8 +30,8 @@
 //! validation pass and the write pass within one invocation.
 
 use crate::{
-    DataKey, MarketplaceContract, MarketplaceError, PERSISTENT_BUMP_AMOUNT,
-    PERSISTENT_BUMP_THRESHOLD,
+    DataKey, MarketplaceContract, MarketplaceError, LISTING_BUMP_LEDGERS,
+    LISTING_THRESHOLD_LEDGERS, PERSISTENT_BUMP_AMOUNT, PERSISTENT_BUMP_THRESHOLD,
 };
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
@@ -284,11 +284,8 @@ pub fn decrement_stock(
     record.available_quantity = record.available_quantity.saturating_sub(quantity);
 
     env.storage().persistent().set(&record_key, &record);
-    env.storage().persistent().extend_ttl(
-        &record_key,
-        PERSISTENT_BUMP_THRESHOLD,
-        PERSISTENT_BUMP_AMOUNT,
-    );
+    // Purchase path keeps the whole listing alive (issue #477).
+    bump_listing_ttl(&env, merchant_id, &sku_id);
 
     env.events().publish(
         (
@@ -508,10 +505,13 @@ pub fn get_sku_record(
     merchant_id: u64,
     sku_id: Symbol,
 ) -> Result<SkuRecord, MarketplaceError> {
-    env.storage()
+    let record = env
+        .storage()
         .persistent()
-        .get(&DataKey::SkuRecord(merchant_id, sku_id))
-        .ok_or(MarketplaceError::SkuNotFound)
+        .get(&DataKey::SkuRecord(merchant_id, sku_id.clone()))
+        .ok_or(MarketplaceError::SkuNotFound)?;
+    bump_listing_ttl(&env, merchant_id, &sku_id);
+    Ok(record)
 }
 
 /// Return the list of all SKU IDs registered for `merchant_id`.
@@ -540,18 +540,47 @@ pub fn get_listing(
     merchant_id: u64,
     sku_id: Symbol,
 ) -> Result<ListingRecord, MarketplaceError> {
-    env.storage()
+    let record = env
+        .storage()
         .persistent()
-        .get(&DataKey::ListingRecord(merchant_id, sku_id))
-        .ok_or(MarketplaceError::SkuNotFound)
+        .get(&DataKey::ListingRecord(merchant_id, sku_id.clone()))
+        .ok_or(MarketplaceError::SkuNotFound)?;
+    bump_listing_ttl(&env, merchant_id, &sku_id);
+    Ok(record)
 }
 
 /// Return all SKU IDs in the catalog for `merchant_id`.
 pub fn get_merchant_listings(env: Env, merchant_id: u64) -> Vec<Symbol> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::MerchantListingSkuList(merchant_id))
-        .unwrap_or_else(|| Vec::new(&env))
+    let key = DataKey::MerchantListingSkuList(merchant_id);
+    let list: Option<Vec<Symbol>> = env.storage().persistent().get(&key);
+    match list {
+        Some(list) => {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LISTING_THRESHOLD_LEDGERS, LISTING_BUMP_LEDGERS);
+            list
+        }
+        None => Vec::new(&env),
+    }
+}
+
+/// Extend the persistent TTL of every storage entry backing a listing
+/// (`ListingRecord`, `SkuRecord`, and the merchant's listing/catalog
+/// indexes) that currently exists (issue #477). Missing keys are skipped,
+/// so this never panics on an absent entry.
+pub fn bump_listing_ttl(env: &Env, merchant_id: u64, sku_id: &Symbol) {
+    let storage = env.storage().persistent();
+    let keys = [
+        DataKey::ListingRecord(merchant_id, sku_id.clone()),
+        DataKey::SkuRecord(merchant_id, sku_id.clone()),
+        DataKey::MerchantListingSkuList(merchant_id),
+        DataKey::MerchantCatalogSkuList(merchant_id),
+    ];
+    for key in keys.iter() {
+        if storage.has(key) {
+            storage.extend_ttl(key, LISTING_THRESHOLD_LEDGERS, LISTING_BUMP_LEDGERS);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

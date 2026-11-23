@@ -24,6 +24,9 @@ pub use fees::*;
 pub mod oracle;
 pub mod catalog;
 pub use oracle::*;
+/// Listing storage TTL constants and metadata (issue #477).
+pub mod constants;
+pub use constants::*;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -5749,10 +5752,17 @@ impl MarketplaceContract {
         sku_id: String,
     ) -> Result<SkuInventory, MarketplaceError> {
         let sku_key = DataKey::SkuInventory(merchant_id, sku_id);
-        env.storage()
+        let inventory: SkuInventory = env
+            .storage()
             .persistent()
             .get(&sku_key)
-            .ok_or(MarketplaceError::SkuNotFound)
+            .ok_or(MarketplaceError::SkuNotFound)?;
+        env.storage().persistent().extend_ttl(
+            &sku_key,
+            LISTING_THRESHOLD_LEDGERS,
+            LISTING_BUMP_LEDGERS,
+        );
+        Ok(inventory)
     }
 
     /// Get all SKU IDs for a merchant.
@@ -5913,6 +5923,27 @@ impl MarketplaceContract {
     /// Return all catalog SKU IDs registered for `merchant_id`.
     pub fn get_merchant_listings(env: Env, merchant_id: u64) -> Vec<Symbol> {
         catalog::get_merchant_listings(env, merchant_id)
+    }
+
+    /// Refresh the storage TTL of a listing (and its SKU record / merchant
+    /// listing index when present) so it is not evicted (issue #477).
+    /// Permissionless: intended for indexers and frontends.
+    pub fn bump_listing_ttl(
+        env: Env,
+        merchant_id: u64,
+        sku_id: Symbol,
+    ) -> Result<ListingStorageMetadata, MarketplaceError> {
+        catalog::bump_listing_ttl(&env, merchant_id, &sku_id);
+        let listing = catalog::get_listing(env.clone(), merchant_id, sku_id)?;
+        let merchant = Self::get_merchant(env.clone(), merchant_id)?
+            .owner
+            .ok_or(MarketplaceError::MerchantNotFound)?;
+        Ok(ListingStorageMetadata {
+            merchant,
+            price_stroops: listing.price,
+            stock: u32::try_from(listing.available_stock).unwrap_or(u32::MAX),
+            last_bumped_ledger: env.ledger().sequence(),
+        })
     }
 }
 
@@ -6662,5 +6693,130 @@ mod merchant_operational_view_tests {
         assert_eq!(view.status, MerchantStatus::Suspended);
         assert!(view.verified);
         assert_eq!(view.tier, MerchantTier::Suspended);
+    }
+}
+
+#[cfg(test)]
+mod listing_ttl_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+
+    struct Ctx {
+        env: Env,
+        id: Address,
+        client: MarketplaceContractClient<'static>,
+        owner: Address,
+        merchant_id: u64,
+        sku: Symbol,
+    }
+
+    fn setup() -> Ctx {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.max_entry_ttl = 3_110_400);
+        let admin = Address::generate(&env);
+        let id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &id);
+        let owner = Address::generate(&env);
+        let params = RegisterParams {
+            name: String::from_str(&env, "TTL Merchant"),
+            description: String::from_str(&env, "listing ttl tests"),
+            category: symbol_short!("retail"),
+            image_url: String::from_str(&env, "https://example.com/img.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 0,
+        };
+        let merchant_id =
+            testutil::register_merchant_with_deposit(&env, &client, &owner, &params);
+        let sku = Symbol::new(&env, "ttl_item");
+        let mut listings = Vec::new(&env);
+        listings.push_back(catalog::ListingParams {
+            sku_id: sku.clone(),
+            price: 1_000,
+            token: Address::generate(&env),
+            initial_stock: 5,
+        });
+        client.batch_register_listings(&owner, &listings);
+        Ctx { env, id, client, owner, merchant_id, sku }
+    }
+
+    fn listing_ttl(ctx: &Ctx) -> u32 {
+        ctx.env.as_contract(&ctx.id, || {
+            ctx.env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::ListingRecord(ctx.merchant_id, ctx.sku.clone()))
+        })
+    }
+
+    fn advance(env: &Env, ledgers: u32) {
+        env.ledger().with_mut(|l| l.sequence_number += ledgers);
+    }
+
+    #[test]
+    fn constants_match_spec() {
+        assert_eq!(LISTING_BUMP_LEDGERS, 518_400);
+        assert_eq!(LISTING_THRESHOLD_LEDGERS, 172_800);
+    }
+
+    #[test]
+    fn reads_bump_listing_ttl_across_eviction_window() {
+        let ctx = setup();
+        // Cross the threshold, read, then outlive the original expiry.
+        advance(&ctx.env, LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1);
+        assert!(listing_ttl(&ctx) < LISTING_THRESHOLD_LEDGERS);
+        ctx.client.get_listing(&ctx.merchant_id, &ctx.sku);
+        assert_eq!(listing_ttl(&ctx), LISTING_BUMP_LEDGERS);
+
+        advance(&ctx.env, LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1);
+        let listing = ctx.client.get_listing(&ctx.merchant_id, &ctx.sku);
+        assert_eq!(listing.available_stock, 5);
+        assert_eq!(ctx.client.get_merchant_listings(&ctx.merchant_id).len(), 1);
+    }
+
+    #[test]
+    fn bump_listing_ttl_refreshes_and_returns_metadata() {
+        let ctx = setup();
+        advance(&ctx.env, LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1);
+        let meta = ctx.client.bump_listing_ttl(&ctx.merchant_id, &ctx.sku);
+        assert_eq!(listing_ttl(&ctx), LISTING_BUMP_LEDGERS);
+        assert_eq!(meta.merchant, ctx.owner);
+        assert_eq!(meta.price_stroops, 1_000);
+        assert_eq!(meta.stock, 5);
+        assert_eq!(meta.last_bumped_ledger, ctx.env.ledger().sequence());
+    }
+
+    #[test]
+    fn reads_above_threshold_do_not_rebump() {
+        let ctx = setup();
+        advance(&ctx.env, 1_000);
+        let before = listing_ttl(&ctx);
+        ctx.client.get_listing(&ctx.merchant_id, &ctx.sku);
+        assert_eq!(listing_ttl(&ctx), before);
+    }
+
+    #[test]
+    fn purchase_decrement_bumps_sku_ttl() {
+        let ctx = setup();
+        let sku = Symbol::new(&ctx.env, "sku_buy");
+        ctx.client.register_sku(
+            &ctx.owner,
+            &ctx.merchant_id,
+            &sku,
+            &100i128,
+            &Address::generate(&ctx.env),
+            &10u32,
+        );
+        let admin = ctx.client.get_admin();
+        advance(&ctx.env, LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1);
+        ctx.client.decrement_stock(&admin, &ctx.merchant_id, &sku, &1u32);
+        let ttl = ctx.env.as_contract(&ctx.id, || {
+            ctx.env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::SkuRecord(ctx.merchant_id, sku.clone()))
+        });
+        assert_eq!(ttl, LISTING_BUMP_LEDGERS);
     }
 }
