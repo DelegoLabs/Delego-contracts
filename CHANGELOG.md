@@ -20,6 +20,8 @@ will reject the change.
 
 ### Unreleased
 
+- Add pro-rata partial refund settlement (issue #539): `resolve_partial_refund` (buyer and merchant authorization)
+  and `arbitrate_partial_refund` (arbiter authorization on disputed escrows), emitting `PartialRefundSettled`.
 - `create_delegation` and `create_scoped_delegation` now reject a zero `owner` or `permissions_contract`
   address with the new `DelegationError::InvalidParam` (4020), mirroring the escrow `is_zero_address`
   guard (issue #92).
@@ -88,6 +90,9 @@ will reject the change.
 
 ### Unreleased
 
+- Add merchant security bonds (issue #551): `deposit_bond`, governance-admin-gated `slash_bond`, and the
+  `get_security_bond` view.
+
 ### 0.0.1 - 2026-09-30
 
 - Fix pre-existing build breakage: restore missing `[features]` table header in `marketplace/Cargo.toml` so the `testutils` feature is correctly declared.
@@ -103,6 +108,8 @@ will reject the change.
 
 ### Unreleased
 
+- `grant` and `grant_child` now reject `ttl_ledgers == 0` with the new `PermissionError::InvalidTtl` (2433)
+  (issue #10).
 - Wire the gas sponsorship module into `PermissionsContract` (issue #689):
   `configure_sponsorship`, `fund_sponsorship`, `charge_sponsored_fee`,
   `get_sponsorship_policy` and `get_sponsorship_balance`, backed by

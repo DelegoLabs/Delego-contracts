@@ -24,6 +24,11 @@ pub use fees::*;
 pub mod oracle;
 pub mod catalog;
 pub use oracle::*;
+/// Merchant security bond staking and slash enforcement (issue #551).
+pub mod bond;
+pub use bond::{
+    BondDepositedEvent, BondSlashedEvent, BondStakingTrait, MerchantBond, BOND_LOCK_PERIOD_SECS,
+};
 /// Listing storage TTL constants and metadata (issue #477).
 pub mod constants;
 pub use constants::*;

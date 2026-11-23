@@ -612,6 +612,56 @@ pub struct SplitSettlementRequest {
     pub merchant_signature: BytesN<64>,
 }
 
+/// Agreed or arbitrated pro-rata split of an escrow's remaining balance
+/// (issue #539).
+///
+/// The shares are expressed in basis points and must sum to exactly
+/// [`BPS_DENOMINATOR`]. The platform fee is deducted from the merchant's share
+/// only; the buyer's refund is fee-free.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartialRefundResolution {
+    /// Escrow being resolved.
+    pub order_id: u64,
+    /// Buyer's share of the remaining balance, in basis points (4000 = 40%).
+    pub buyer_bps: u32,
+    /// Merchant's gross share of the remaining balance, in basis points.
+    pub merchant_bps: u32,
+}
+
+/// Pro-rata partial refund settlement (issue #539).
+pub trait PartialRefundTrait {
+    /// Settles an escrow by mutual consent: both the buyer and the merchant
+    /// must authorize the exact `resolution`.
+    ///
+    /// # Errors
+    /// - [`EscrowError::InvalidSplitSettlement`] if
+    ///   `buyer_bps + merchant_bps != 10_000`.
+    /// - [`EscrowError::NotFound`] if the escrow does not exist.
+    /// - [`EscrowError::InvalidStatus`] if the escrow is not `Funded`,
+    ///   `Disputed`, or `Inspection`.
+    fn resolve_partial_refund(
+        env: Env,
+        resolution: PartialRefundResolution,
+    ) -> Result<bool, EscrowError>;
+
+    /// Settles a `Disputed` escrow on the authorization of an arbiter holding
+    /// [`ContractRole::Arbitrator`], without the parties' signatures.
+    ///
+    /// # Errors
+    /// - [`EscrowError::InvalidSplitSettlement`] if
+    ///   `buyer_bps + merchant_bps != 10_000`.
+    /// - [`EscrowError::NotFound`] if the escrow does not exist.
+    /// - [`EscrowError::NotDisputed`] if the escrow is not `Disputed`.
+    /// - [`EscrowError::Unauthorized`] if `arbiter` lacks the role or is a
+    ///   party to the escrow.
+    fn arbitrate_partial_refund(
+        env: Env,
+        arbiter: Address,
+        resolution: PartialRefundResolution,
+    ) -> Result<bool, EscrowError>;
+}
+
 /// Buyer/seller authorization envelope for an absolute timeout extension.
 ///
 /// The signatures are included in the canonical authorization arguments. The
@@ -884,6 +934,30 @@ pub struct EscrowSplitSettledEvent {
     pub merchant_payout_amount: i128,
     /// Prorated platform fee taken from the merchant's gross share.
     pub prorated_fee: i128,
+}
+
+/// Emitted when an escrow is settled via a pro-rata partial refund
+/// (issue #539). `buyer_refund + merchant_payout + platform_fee` always equals
+/// the escrow's remaining balance at settlement time.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartialRefundSettled {
+    /// Unique identifier for the escrow.
+    pub order_id: u64,
+    /// Buyer's address.
+    pub buyer: Address,
+    /// Merchant's address.
+    pub merchant: Address,
+    /// Token in which the settlement was paid.
+    pub token: Address,
+    /// Amount refunded to the buyer.
+    pub buyer_refund: i128,
+    /// Net amount paid to the merchant.
+    pub merchant_payout: i128,
+    /// Platform fee taken from the merchant's gross share.
+    pub platform_fee: i128,
+    /// Arbiter that imposed the split, or `None` for a mutual settlement.
+    pub arbiter: Option<Address>,
 }
 
 /// Emitted when an oracle relayer is reimbursed for the transaction cost of
@@ -3509,6 +3583,23 @@ fn apply_fee_floor(amount: i128, fee_bps: u32, fee: i128, min_fee_stroops: i128)
 fn bps_fee(amount: i128, bps: u32) -> i128 {
     (amount / BPS_DENOMINATOR) * bps as i128
         + ((amount % BPS_DENOMINATOR) * bps as i128) / BPS_DENOMINATOR
+}
+
+/// Checked, overflow-free `amount * bps / BPS_DENOMINATOR`, rounded down.
+///
+/// Like [`bps_fee`], the amount is split into whole and fractional basis-point
+/// units so no precision is lost and the intermediate products stay in range
+/// for any `bps <= BPS_DENOMINATOR`.
+fn pro_rata_share(amount: i128, bps: u32) -> Result<i128, EscrowError> {
+    let bps = i128::from(bps);
+    let whole = (amount / BPS_DENOMINATOR)
+        .checked_mul(bps)
+        .ok_or(EscrowError::MathOverflow)?;
+    let fraction = (amount % BPS_DENOMINATOR)
+        .checked_mul(bps)
+        .ok_or(EscrowError::MathOverflow)?
+        / BPS_DENOMINATOR;
+    whole.checked_add(fraction).ok_or(EscrowError::MathOverflow)
 }
 
 /// Computes the release fee for `amount` at `fee_bps`, floored at
@@ -13559,6 +13650,181 @@ impl EscrowContract {
     }
 }
 
+#[contractimpl]
+impl PartialRefundTrait for EscrowContract {
+    fn resolve_partial_refund(
+        env: Env,
+        resolution: PartialRefundResolution,
+    ) -> Result<bool, EscrowError> {
+        Self::validate_refund_resolution(&resolution)?;
+        let record = Self::load_refundable_escrow(&env, resolution.order_id)?;
+
+        // Plain `require_auth` binds each signature to this invocation's
+        // arguments, i.e. to the exact split being settled.
+        record.buyer.require_auth();
+        record.seller.require_auth();
+
+        Self::settle_refund_resolution(&env, record, &resolution, None)
+    }
+
+    fn arbitrate_partial_refund(
+        env: Env,
+        arbiter: Address,
+        resolution: PartialRefundResolution,
+    ) -> Result<bool, EscrowError> {
+        arbiter.require_auth();
+        Self::validate_refund_resolution(&resolution)?;
+        Self::require_role(&env, &arbiter, ContractRole::Arbitrator)?;
+
+        let record = Self::load_refundable_escrow(&env, resolution.order_id)?;
+        // An arbiter may only impose a split on a live dispute, and never on
+        // one it is itself a party to.
+        if record.status != EscrowStatus::Disputed {
+            return Err(EscrowError::NotDisputed);
+        }
+        if arbiter == record.buyer || arbiter == record.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        Self::settle_refund_resolution(&env, record, &resolution, Some(arbiter))
+    }
+}
+
+/// Internal helpers backing [`PartialRefundTrait`] (issue #539).
+impl EscrowContract {
+    /// Rejects splits whose shares do not sum to exactly 100%.
+    fn validate_refund_resolution(resolution: &PartialRefundResolution) -> Result<(), EscrowError> {
+        match resolution.buyer_bps.checked_add(resolution.merchant_bps) {
+            Some(total) if i128::from(total) == BPS_DENOMINATOR => Ok(()),
+            _ => Err(EscrowError::InvalidSplitSettlement),
+        }
+    }
+
+    /// Loads an escrow whose remaining balance may be split pro rata.
+    fn load_refundable_escrow(env: &Env, escrow_id: u64) -> Result<EscrowRecord, EscrowError> {
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+
+        match record.status {
+            EscrowStatus::Funded | EscrowStatus::Disputed | EscrowStatus::Inspection => {}
+            _ => return Err(EscrowError::InvalidStatus),
+        }
+
+        // Scheduled escrows must be paid out through their own entry points.
+        Self::ensure_not_milestone_escrow(env, escrow_id)?;
+        Self::ensure_not_tranche_escrow(env, escrow_id)?;
+
+        Ok(record)
+    }
+
+    /// Splits the remaining balance, deducts the platform fee from the
+    /// merchant's share, and pays every party in one atomic transaction.
+    /// Callers are responsible for authorization.
+    fn settle_refund_resolution(
+        env: &Env,
+        mut record: EscrowRecord,
+        resolution: &PartialRefundResolution,
+        arbiter: Option<Address>,
+    ) -> Result<bool, EscrowError> {
+        Self::enter_release(env)?;
+
+        let escrow_id = resolution.order_id;
+        // Flash loan protection (issue #594): a staked balance can not be
+        // settled in the same ledger it was deposited.
+        flash_loan_guard::guard_staked_withdrawal(env, escrow_id)?;
+
+        let remaining = record
+            .amount
+            .checked_sub(record.released_amount)
+            .and_then(|balance| balance.checked_sub(record.refunded_amount))
+            .ok_or(EscrowError::MathOverflow)?;
+        if remaining <= 0 {
+            return Err(EscrowError::InsufficientEscrowBalance);
+        }
+
+        // The merchant's gross share is the exact complement of the buyer's,
+        // so rounding can never strand dust in the contract.
+        let buyer_refund = pro_rata_share(remaining, resolution.buyer_bps)?;
+        let merchant_gross = remaining
+            .checked_sub(buyer_refund)
+            .ok_or(EscrowError::MathOverflow)?;
+        let payout = Self::compute_payout(env, &record.seller, merchant_gross)?;
+        if payout.seller_net < 0 {
+            return Err(EscrowError::InvalidSplitSettlement);
+        }
+
+        Self::assert_value_conservation_invariant(&record, merchant_gross, buyer_refund)?;
+        assert_value_conservation(remaining, buyer_refund, payout.seller_net, payout.fee)?;
+
+        // Commit the terminal state before any external token call.
+        // `released_amount` tracks the gross merchant share, as in a release.
+        record.released_amount = record
+            .released_amount
+            .checked_add(merchant_gross)
+            .ok_or(EscrowError::MathOverflow)?;
+        record.refunded_amount = record
+            .refunded_amount
+            .checked_add(buyer_refund)
+            .ok_or(EscrowError::MathOverflow)?;
+        record.status = EscrowStatus::SettledWithPartialRefund;
+        record.updated_at = env.ledger().timestamp();
+
+        let key = DataKey::Escrow(escrow_id);
+        let settled_key = DataKey::SettledLedger(escrow_id);
+        let storage = env.storage().persistent();
+        storage.set(&key, &record);
+        storage.extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        storage.set(&settled_key, &env.ledger().sequence());
+        storage.extend_ttl(
+            &settled_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        if merchant_gross > 0 {
+            update_merchant_volume_and_tier(env, &record.seller, merchant_gross);
+        }
+
+        blend_yield::redeem(env, escrow_id);
+        let token_client = soroban_sdk::token::Client::new(env, &record.token);
+        let contract_address = env.current_contract_address();
+        if buyer_refund > 0 {
+            token_client.transfer(&contract_address, &record.buyer, &buyer_refund);
+        }
+        if payout.seller_net > 0 {
+            token_client.transfer(&contract_address, &record.seller, &payout.seller_net);
+        }
+        // Referral commission (if any) comes out of the platform's own fee
+        // share, same as a normal release (issue #492).
+        let treasury_fee =
+            Self::disburse_referral_commission(env, &token_client, escrow_id, payout.fee)?;
+        Self::distribute_fee(env, &token_client, treasury_fee)?;
+
+        env.events().publish(
+            (
+                symbol_short!("escrow"),
+                symbol_short!("prsettled"),
+                escrow_id,
+            ),
+            PartialRefundSettled {
+                order_id: escrow_id,
+                buyer: record.buyer,
+                merchant: record.seller,
+                token: record.token,
+                buyer_refund,
+                merchant_payout: payout.seller_net,
+                platform_fee: payout.fee,
+                arbiter,
+            },
+        );
+
+        Self::exit_release(env);
+        Ok(true)
+    }
+}
+
 /// Cancellation protection for created (unfunded) orders — issue #355.
 ///
 /// A buyer broadcasts `deposit` for an accepted order while a seller
@@ -19893,5 +20159,369 @@ mod split_settlement_tests {
             f.client.try_settle_partial_refund(&request),
             Err(Ok(EscrowError::InvalidSplitSettlement))
         );
+    }
+}
+
+/// Tests for pro-rata partial refund settlement (issue #539).
+#[cfg(test)]
+mod partial_refund_resolution_tests {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke},
+        token::{Client as TokenClient, StellarAssetClient},
+        TryIntoVal,
+    };
+
+    const BUYER_FUNDS: i128 = 1_000_000;
+
+    struct Fixture<'a> {
+        env: Env,
+        client: EscrowContractClient<'a>,
+        contract_id: Address,
+        admin: Address,
+        treasury: Address,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+    }
+
+    impl Fixture<'_> {
+        fn deposit(&self, amount: i128) -> u64 {
+            self.client.deposit(
+                &self.buyer,
+                &self.seller,
+                &self.token,
+                &amount,
+                &BytesN::from_array(&self.env, &[1u8; 32]),
+                &10_000u32,
+                &None::<BytesN<32>>,
+                &None::<Symbol>,
+            )
+        }
+
+        fn disputed(&self, amount: i128) -> u64 {
+            let escrow_id = self.deposit(amount);
+            self.client.dispute(&escrow_id, &self.buyer);
+            escrow_id
+        }
+
+        fn arbiter(&self) -> Address {
+            let arbiter = Address::generate(&self.env);
+            self.client
+                .grant_role(&self.admin, &arbiter, &ContractRole::Arbitrator);
+            arbiter
+        }
+
+        fn balance(&self, address: &Address) -> i128 {
+            TokenClient::new(&self.env, &self.token).balance(address)
+        }
+    }
+
+    fn setup(env: &Env) -> Fixture<'_> {
+        soroban_sdk::testutils::Ledger::with_mut(&env.ledger(), |l| {
+            l.min_persistent_entry_ttl = PERSISTENT_BUMP_AMOUNT;
+        });
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 1_000, // 10%
+            treasury: treasury.clone(),
+            min_amount: 100,
+            max_amount: BUYER_FUNDS,
+            min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(env, &contract_id);
+        StellarAssetClient::new(env, &token).mint(&buyer, &BUYER_FUNDS);
+        admin_actions_test::approve(env, &client, &admin, AdminAction::AddToken(token.clone()));
+        Fixture {
+            env: env.clone(),
+            client,
+            contract_id,
+            admin,
+            treasury,
+            buyer,
+            seller,
+            token,
+        }
+    }
+
+    fn split(order_id: u64, buyer_bps: u32, merchant_bps: u32) -> PartialRefundResolution {
+        PartialRefundResolution {
+            order_id,
+            buyer_bps,
+            merchant_bps,
+        }
+    }
+
+    #[test]
+    fn mutual_settlement_pays_exact_split_and_fee() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.disputed(10_000);
+
+        assert!(f
+            .client
+            .resolve_partial_refund(&split(escrow_id, 4_000, 6_000)));
+
+        // `auths` and `events` reflect the settlement invocation, so read them
+        // before any further call.
+        let auths = env.auths();
+        let events = env.events().all();
+        assert!(auths.iter().any(|(signer, _)| signer == &f.buyer));
+        assert!(auths.iter().any(|(signer, _)| signer == &f.seller));
+
+        let (contract, _, data) = events.last().unwrap();
+        assert_eq!(contract, f.contract_id);
+        let event: PartialRefundSettled = data.try_into_val(&env).unwrap();
+        assert_eq!(
+            event,
+            PartialRefundSettled {
+                order_id: escrow_id,
+                buyer: f.buyer.clone(),
+                merchant: f.seller.clone(),
+                token: f.token.clone(),
+                buyer_refund: 4_000,
+                merchant_payout: 5_400,
+                platform_fee: 600,
+                arbiter: None,
+            }
+        );
+
+        assert_eq!(f.balance(&f.buyer), BUYER_FUNDS - 10_000 + 4_000);
+        assert_eq!(f.balance(&f.seller), 5_400);
+        assert_eq!(f.balance(&f.treasury), 600);
+        assert_eq!(f.balance(&f.contract_id), 0);
+
+        let record = f.client.get_escrow(&escrow_id);
+        assert_eq!(record.status, EscrowStatus::SettledWithPartialRefund);
+        assert_eq!(record.refunded_amount, 4_000);
+        assert_eq!(record.released_amount, 6_000);
+    }
+
+    #[test]
+    fn uneven_split_leaves_no_dust() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.disputed(10_001);
+
+        // Buyer: floor(10_001 * 33.33%) = 3_333; merchant gross: 6_668, fee 666.
+        f.client
+            .resolve_partial_refund(&split(escrow_id, 3_333, 6_667));
+
+        assert_eq!(f.balance(&f.buyer), BUYER_FUNDS - 10_001 + 3_333);
+        assert_eq!(f.balance(&f.seller), 6_002);
+        assert_eq!(f.balance(&f.treasury), 666);
+        assert_eq!(f.balance(&f.contract_id), 0);
+    }
+
+    #[test]
+    fn full_refund_split_charges_no_fee() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.disputed(10_000);
+
+        f.client
+            .resolve_partial_refund(&split(escrow_id, 10_000, 0));
+
+        assert_eq!(f.balance(&f.buyer), BUYER_FUNDS);
+        assert_eq!(f.balance(&f.seller), 0);
+        assert_eq!(f.balance(&f.treasury), 0);
+    }
+
+    #[test]
+    fn full_merchant_split_charges_the_whole_fee() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.disputed(10_000);
+
+        f.client
+            .resolve_partial_refund(&split(escrow_id, 0, 10_000));
+
+        assert_eq!(f.balance(&f.buyer), BUYER_FUNDS - 10_000);
+        assert_eq!(f.balance(&f.seller), 9_000);
+        assert_eq!(f.balance(&f.treasury), 1_000);
+    }
+
+    #[test]
+    fn split_applies_only_to_the_remaining_balance() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.deposit(10_000);
+        f.client.partial_refund(&escrow_id, &f.seller, &2_000);
+
+        // 8_000 remain: buyer 2_000, merchant gross 6_000 less a 600 fee.
+        f.client
+            .resolve_partial_refund(&split(escrow_id, 2_500, 7_500));
+
+        assert_eq!(f.balance(&f.buyer), BUYER_FUNDS - 10_000 + 4_000);
+        assert_eq!(f.balance(&f.seller), 5_400);
+        assert_eq!(f.balance(&f.treasury), 600);
+        assert_eq!(f.balance(&f.contract_id), 0);
+
+        let record = f.client.get_escrow(&escrow_id);
+        assert_eq!(record.refunded_amount, 4_000);
+        assert_eq!(record.released_amount, 6_000);
+    }
+
+    #[test]
+    fn rejects_shares_that_do_not_sum_to_ten_thousand() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.disputed(10_000);
+        let arbiter = f.arbiter();
+
+        for (buyer_bps, merchant_bps) in [
+            (4_000, 5_999),
+            (4_000, 6_001),
+            (0, 0),
+            // Would wrap around to 10_000 without checked arithmetic.
+            (u32::MAX, 10_001),
+        ] {
+            let resolution = split(escrow_id, buyer_bps, merchant_bps);
+            assert_eq!(
+                f.client.try_resolve_partial_refund(&resolution),
+                Err(Ok(EscrowError::InvalidSplitSettlement))
+            );
+            assert_eq!(
+                f.client.try_arbitrate_partial_refund(&arbiter, &resolution),
+                Err(Ok(EscrowError::InvalidSplitSettlement))
+            );
+        }
+        assert_eq!(f.balance(&f.contract_id), 10_000);
+    }
+
+    #[test]
+    fn rejects_unknown_and_already_settled_escrows() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.disputed(10_000);
+
+        assert_eq!(
+            f.client
+                .try_resolve_partial_refund(&split(escrow_id + 99, 4_000, 6_000)),
+            Err(Ok(EscrowError::NotFound))
+        );
+
+        let resolution = split(escrow_id, 4_000, 6_000);
+        f.client.resolve_partial_refund(&resolution);
+        assert_eq!(
+            f.client.try_resolve_partial_refund(&resolution),
+            Err(Ok(EscrowError::InvalidStatus))
+        );
+    }
+
+    #[test]
+    fn one_party_alone_cannot_settle() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.disputed(10_000);
+        let resolution = split(escrow_id, 4_000, 6_000);
+
+        for signer in [&f.buyer, &f.seller] {
+            let result = f
+                .client
+                .mock_auths(&[MockAuth {
+                    address: signer,
+                    invoke: &MockAuthInvoke {
+                        contract: &f.contract_id,
+                        fn_name: "resolve_partial_refund",
+                        args: (resolution.clone(),).into_val(&env),
+                        sub_invokes: &[],
+                    },
+                }])
+                .try_resolve_partial_refund(&resolution);
+            assert!(result.is_err());
+        }
+
+        assert_eq!(f.balance(&f.contract_id), 10_000);
+        assert_eq!(
+            f.client.get_escrow(&escrow_id).status,
+            EscrowStatus::Disputed
+        );
+    }
+
+    #[test]
+    fn arbiter_settles_a_dispute_without_party_signatures() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.disputed(10_000);
+        let arbiter = f.arbiter();
+        let resolution = split(escrow_id, 4_000, 6_000);
+
+        assert!(f
+            .client
+            .mock_auths(&[MockAuth {
+                address: &arbiter,
+                invoke: &MockAuthInvoke {
+                    contract: &f.contract_id,
+                    fn_name: "arbitrate_partial_refund",
+                    args: (arbiter.clone(), resolution.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .arbitrate_partial_refund(&arbiter, &resolution));
+
+        let (_, _, data) = env.events().all().last().unwrap();
+        let event: PartialRefundSettled = data.try_into_val(&env).unwrap();
+        assert_eq!(event.arbiter, Some(arbiter));
+
+        assert_eq!(f.balance(&f.buyer), BUYER_FUNDS - 10_000 + 4_000);
+        assert_eq!(f.balance(&f.seller), 5_400);
+        assert_eq!(f.balance(&f.treasury), 600);
+    }
+
+    #[test]
+    fn arbiter_path_requires_the_role_and_neutrality() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.disputed(10_000);
+        let resolution = split(escrow_id, 4_000, 6_000);
+
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            f.client
+                .try_arbitrate_partial_refund(&stranger, &resolution),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+
+        // Holding the role does not let a party rule on its own escrow.
+        f.client
+            .grant_role(&f.admin, &f.seller, &ContractRole::Arbitrator);
+        assert_eq!(
+            f.client
+                .try_arbitrate_partial_refund(&f.seller, &resolution),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn arbiter_cannot_split_an_undisputed_escrow() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.deposit(10_000);
+        let arbiter = f.arbiter();
+
+        assert_eq!(
+            f.client
+                .try_arbitrate_partial_refund(&arbiter, &split(escrow_id, 4_000, 6_000)),
+            Err(Ok(EscrowError::NotDisputed))
+        );
+    }
+
+    #[test]
+    fn pro_rata_share_is_exact_at_the_numeric_limits() {
+        assert_eq!(pro_rata_share(i128::MAX, 10_000), Ok(i128::MAX));
+        assert_eq!(pro_rata_share(i128::MAX, 0), Ok(0));
+        assert_eq!(pro_rata_share(10_001, 3_333), Ok(3_333));
+        assert_eq!(pro_rata_share(1, 9_999), Ok(0));
     }
 }
