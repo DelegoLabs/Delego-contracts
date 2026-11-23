@@ -30,6 +30,11 @@ use soroban_sdk::{
     Symbol, Vec,
 };
 
+pub mod heartbeat;
+pub use heartbeat::{
+    DelegationKeepers, KeeperHeartbeat, KeeperHeartbeatMissed, KEEPER_HEARTBEAT_TIMEOUT_SECS,
+};
+
 /// Persistent entries are bumped when they approach expiry and kept alive
 /// for roughly 30 days, matching the repository's persistent-storage policy.
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
@@ -621,6 +626,10 @@ pub enum DataKey {
     /// Cumulative stroops spent by a delegation with a specific merchant
     /// (issue #493).
     MerchantSpent(u64, Address),
+    /// Latest liveness heartbeat submitted by a keeper (issue #576).
+    KeeperHeartbeat(Address),
+    /// Primary/secondary keeper assignment for a delegation (issue #576).
+    DelegationKeepers(u64),
 }
 
 /// Current delegation storage schema version.
@@ -689,7 +698,7 @@ impl DelegationRecordV1 {
 /// | `ReputationError`   | 3_000..=3_999   |
 /// | `DelegationError`   | 4_000..=4_999   |
 /// | `MarketplaceError`  | 5_000..=5_999   |
-/// `DelegationError` currently occupies codes 4_001..=4_020.
+/// `DelegationError` currently occupies codes 4_001..=4_032.
 /// New variants must use the next unused code within 4_000..=4_999.
 #[contracterror]
 #[allow(missing_docs)]
@@ -760,6 +769,11 @@ pub enum DelegationError {
     /// The supplied sub-account address is already registered to another
     /// sub-account (issue #698).
     SubAccountAddressTaken = 4030,
+    /// No primary/secondary keepers are assigned to the delegation (issue #576).
+    KeepersNotConfigured = 4031,
+    /// Both the primary and secondary keepers missed their heartbeat window
+    /// (issue #576).
+    NoLiveKeeper = 4032,
 }
 
 /// The delegation registry contract.
@@ -3550,6 +3564,8 @@ mod error_code_uniqueness_tests {
             (DelegationError::MerchantSpendLimitExceeded, 4028u32),
             (DelegationError::InvalidMerchantFilter, 4029u32),
             (DelegationError::SubAccountAddressTaken, 4030u32),
+            (DelegationError::KeepersNotConfigured, 4031u32),
+            (DelegationError::NoLiveKeeper, 4032u32),
         ];
 
         for (variant, expected) in codes {
@@ -3587,6 +3603,8 @@ mod error_code_uniqueness_tests {
             DelegationError::MerchantSpendLimitExceeded as u32,
             DelegationError::InvalidMerchantFilter as u32,
             DelegationError::SubAccountAddressTaken as u32,
+            DelegationError::KeepersNotConfigured as u32,
+            DelegationError::NoLiveKeeper as u32,
         ];
         seen.sort_unstable();
         for pair in seen.windows(2) {

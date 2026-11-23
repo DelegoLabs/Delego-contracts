@@ -18,3 +18,7 @@ pub mod overflow_arithmetic;
 /// Shared escrow + Blend-compatible pool fixture for the low-APY guard
 /// (issue #596) and emergency pool unwind (issue #597) tests.
 pub mod defi_fixture;
+
+/// Flash loan protection guard tests — same-ledger deposit and withdrawal of a
+/// staked escrow balance is rejected (issue #594).
+pub mod flash_loan_guard;
