@@ -98,6 +98,16 @@ pub use sub_orders::SubOrder;
 /// Strict buyer + merchant + fee = deposit checks for terminal settlements (issue #547).
 pub mod value_conservation;
 pub use value_conservation::assert_value_conservation;
+/// Blend lending pool adapter: supply escrowed stablecoins and redeem bTokens
+/// for principal plus accrued interest (issue #590).
+pub mod blend;
+pub use blend::{BlendLendingPool, BlendLendingPoolTrait};
+/// Liquid staking token (LST) escrow collateral tracked in shares (issue #592).
+pub mod lst_support;
+pub use lst_support::LstCollateralRecord;
+/// Health factor floor enforcement for staked escrow vaults (issue #593).
+pub mod vault_safety;
+pub use vault_safety::{assert_vault_health, HealthFactorWarning};
 
 mod admin_actions;
 #[cfg(test)]
@@ -2696,6 +2706,25 @@ pub enum EscrowError {
     /// `buyer_refund_amount + merchant_payout_amount + prorated_fee` does
     /// not exactly equal the escrow's remaining deposit (issue #483).
     InvalidSplitSettlement = 611,
+    /// A Blend pool `submit` supply call failed or minted no bTokens
+    /// (issue #590).
+    BlendSupplyFailed = 620,
+    /// A Blend pool `submit` withdraw call failed, burnt an unexpected bToken
+    /// amount, or returned less than requested (issue #590).
+    BlendWithdrawFailed = 621,
+    /// The token is not on the admin-managed liquid staking token whitelist
+    /// (issue #592).
+    LstTokenNotWhitelisted = 622,
+    /// The LST exchange rate is non-positive or could not be read
+    /// (issue #592).
+    InvalidLstExchangeRate = 623,
+    /// No LST collateral record exists for the requested order (issue #592).
+    LstCollateralNotFound = 624,
+    /// An LST collateral record already exists for this order (issue #592).
+    LstCollateralAlreadyRecorded = 625,
+    /// The operation would push a staked vault's health factor
+    /// (`collateral_value / debt_value`) below the 1.25 floor (issue #593).
+    UnsafeHealthFactor = 626,
     /// Milestone schedule is empty, too long, has duplicate ids, non-positive
     /// amounts, pre-completed entries, or an overflowing total.
     InvalidMilestoneSchedule = 470,
@@ -2957,6 +2986,13 @@ impl_escrow_error_try_from! {
     609 => InvalidReferralCommission,
     610 => ReferrerKeyNotSet,
     611 => InvalidSplitSettlement,
+    620 => BlendSupplyFailed,
+    621 => BlendWithdrawFailed,
+    622 => LstTokenNotWhitelisted,
+    623 => InvalidLstExchangeRate,
+    624 => LstCollateralNotFound,
+    625 => LstCollateralAlreadyRecorded,
+    626 => UnsafeHealthFactor,
 }
 
 impl TryFrom<&soroban_sdk::Error> for EscrowError {
@@ -6527,6 +6563,79 @@ impl EscrowContract {
     /// Read the immutable Blend configuration and realized interest.
     pub fn get_blend_yield_config(env: Env, escrow_id: u64) -> Option<YieldBearingEscrowConfig> {
         blend_yield::config(&env, escrow_id)
+    }
+
+    /// Admin-only: add or remove a liquid staking token from the LST
+    /// collateral whitelist (issue #592).
+    pub fn set_lst_whitelisted(
+        env: Env,
+        admin: Address,
+        lst_token: Address,
+        allowed: bool,
+    ) -> Result<(), EscrowError> {
+        Self::require_admin(&env, &admin)?;
+        lst_support::set_whitelisted(&env, &lst_token, allowed);
+        Ok(())
+    }
+
+    /// Whether `lst_token` is accepted as LST escrow collateral.
+    pub fn is_lst_whitelisted(env: Env, lst_token: Address) -> bool {
+        lst_support::is_whitelisted(&env, &lst_token)
+    }
+
+    /// Lock `shares` of a whitelisted liquid staking token as collateral for
+    /// an open escrow. The share balance and current exchange rate are
+    /// recorded so staking appreciation accrued during inspection can be
+    /// returned to the buyer at settlement (issue #592).
+    pub fn fund_with_lst(
+        env: Env,
+        escrow_id: u64,
+        buyer: Address,
+        lst_token: Address,
+        shares: i128,
+    ) -> Result<LstCollateralRecord, EscrowError> {
+        buyer.require_auth();
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        if buyer != record.buyer {
+            return Err(EscrowError::Unauthorized);
+        }
+        if record.status != EscrowStatus::Created && record.status != EscrowStatus::Funded {
+            return Err(EscrowError::InvalidStatus);
+        }
+        lst_support::lock_collateral(&env, escrow_id, &buyer, &lst_token, shares)
+    }
+
+    /// Read the LST collateral record locked for `escrow_id`, if any.
+    pub fn get_lst_collateral(env: Env, escrow_id: u64) -> Option<LstCollateralRecord> {
+        lst_support::collateral(&env, escrow_id)
+    }
+
+    /// Settle LST collateral once the escrow is terminal. On `Released` the
+    /// seller receives shares worth the original locked value at the current
+    /// exchange rate and the buyer receives the remaining appreciated shares;
+    /// on refund or cancellation every share returns to the buyer. Anyone may
+    /// trigger settlement because the payout split is fully determined.
+    pub fn settle_lst_collateral(
+        env: Env,
+        escrow_id: u64,
+    ) -> Result<lst_support::LstSettlement, EscrowError> {
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        let completed = match record.status {
+            EscrowStatus::Released => true,
+            EscrowStatus::Refunded
+            | EscrowStatus::Cancelled
+            | EscrowStatus::CancelledByMutualConsent => false,
+            _ => return Err(EscrowError::InvalidStatus),
+        };
+        lst_support::settle(&env, escrow_id, &record.seller, completed)
     }
 
     /// Full settlement alias; preserves all existing release authorization and fee rules.
