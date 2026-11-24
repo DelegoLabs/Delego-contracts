@@ -2986,9 +2986,16 @@ impl MarketplaceContract {
     /// the insurance pool so no tokens are left behind.
     pub fn route_fee_disbursements(
         env: Env,
+        admin: Address,
         token: Address,
         amount: i128,
     ) -> Result<(), MarketplaceError> {
+        // Authenticate the caller - admin only
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone())? {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
         if amount <= 0 {
             return Err(MarketplaceError::InvalidParam);
         }
