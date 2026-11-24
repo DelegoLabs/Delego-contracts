@@ -34,4 +34,16 @@ pub enum PermissionError {
 
     #[msg("Master key confirmation required")]
     MasterKeyConfirmationRequired,
+
+    #[msg("Delegation is still active and cannot be swept")]
+    DelegationNotExpired,
+
+    #[msg("Sweep batch exceeds maximum of 50 delegations")]
+    SweepBatchTooLarge,
+
+    #[msg("Delegation record not found")]
+    DelegationNotFound,
+
+    #[msg("Gas rebate pool has insufficient funds for keeper reward")]
+    InsufficientRebatePool,
 }

@@ -321,6 +321,26 @@ fn test_resumed_event_emitted() {
 }
 
 #[test]
+fn test_sweep_expired_delegations_rejects_active() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Agent_Active");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    let keeper = Address::generate(&env);
+    let mut keys = Vec::new(&env);
+    keys.push_back(BytesN::from_array(&env, &[7u8; 32]));
+    let result = client.try_sweep_expired_delegations(&keeper, &keys);
+    assert!(result.is_err());
+
+    // Active record must remain intact.
+    let record = client.get_delegation(&id);
+    assert_eq!(record.status, DelegationStatus::Active);
+}
+
+#[test]
 fn test_sweep_expired_updates_expired_delegations() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
