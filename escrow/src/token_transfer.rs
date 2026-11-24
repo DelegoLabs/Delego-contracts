@@ -81,6 +81,26 @@ mod sac_error_code {
 /// - call fails with a recognized SAC error code     -> `Err(TokenInsufficientBalance)` /
 ///   `Err(TokenAllowanceExceeded)` / `Err(TokenFrozen)` / `Err(TokenInvalidTokenContract)`
 /// - call traps / fails with an unrecognized code    -> `Err(TokenTransferFailed)`
+/// Maximum priority surcharge, in stroops, that may ever be applied to a
+/// single transfer. Enforced in addition to the congestion-based formula so
+/// relayer compensation can never exceed this bound.
+pub const MAX_PRIORITY_SURCHARGE_STROOPS: i128 = 10_000;
+
+/// Compute the priority surcharge owed to a relayer during ledger congestion.
+///
+/// Returns `0` when there is no congestion (`congestion_multiplier <= 1`).
+/// Otherwise returns `base_fee * congestion_multiplier`, clamped to the range
+/// `[0, MAX_PRIORITY_SURCHARGE_STROOPS]`.
+pub fn compute_priority_surcharge(congestion_multiplier: u32, base_fee: i128) -> i128 {
+    if congestion_multiplier > 1 {
+        base_fee
+            .saturating_mul(congestion_multiplier as i128)
+            .clamp(0, MAX_PRIORITY_SURCHARGE_STROOPS)
+    } else {
+        0
+    }
+}
+
 pub fn safe_token_transfer(
     env: &Env,
     token: &Address,

@@ -2,6 +2,9 @@
 //!
 //! This module provides transient storage-based reentrancy guards to protect
 //! against cross-contract reentrancy attacks during external token calls.
+//!
+//! Note: the priority surcharge helper described in the issue lives in
+//! `escrow/src/gas_surcharge.rs` and is intentionally not implemented here.
 
 use soroban_sdk::{contracttype, Env};
 
