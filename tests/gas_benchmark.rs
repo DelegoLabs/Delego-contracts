@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use delego_escrow::{AdminAction, EscrowConfig, EscrowContract, EscrowContractClient, Milestone};
-use soroban_sdk::{testutils::Address as _, token, Address, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger as _},
+    token, Address, BytesN, Env, Symbol, Vec,
+};
 
 fn milestone(env: &Env, id: u32, amount: i128, label: &str) -> Milestone {
     Milestone {
@@ -38,13 +41,15 @@ fn gas_benchmark() {
     };
     let escrow_id = env.register(EscrowContract, (config,));
     let client = EscrowContractClient::new(&env, &escrow_id);
+    client.set_security_guardian(&admin, &Address::generate(&env));
+    let action = AdminAction::AddToken(token.clone());
+    let queued = client.queue_admin_action(&admin, &action);
+    let proposal = client.get_admin_action(&queued).unwrap();
+    env.ledger().with_mut(|l| {
+        l.sequence_number = proposal.pending.unlock_ledger;
+        l.timestamp = proposal.unlock_timestamp;
+    });
     client.add_token(&admin, &token);
-    // approve queued action if needed - the test setup above shows it auto-unlocks
-    // but if it fails due to lock, try to handle
-    let _ = client.queue_admin_action(&admin, &AdminAction::AddToken(token.clone()));
-    let id = client.queue_admin_action(&admin, &AdminAction::AddToken(token.clone()));
-    // simple: just call add again may work if already added? or execute queued
-    // but easier to skip if already exists
 
     let milestones = Vec::from_array(
         &env,

@@ -1,10 +1,27 @@
 #![cfg(test)]
 
-use delego_escrow::{EscrowConfig, EscrowContract, EscrowContractClient};
+use delego_escrow::{AdminAction, EscrowConfig, EscrowContract, EscrowContractClient};
 use delego_interfaces::{LendingPoolClient, MockLendingPool, MockLendingPoolClient};
 use delego_tests::fixtures::create_mock_token_contract;
 use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{token, Address, BytesN, Env};
+
+fn authorize_token(
+    env: &Env,
+    escrow: &EscrowContractClient<'_>,
+    admin: &Address,
+    token: &Address,
+) {
+    escrow.set_security_guardian(admin, &Address::generate(env));
+    let action = AdminAction::AddToken(token.clone());
+    let queued = escrow.queue_admin_action(admin, &action);
+    let proposal = escrow.get_admin_action(&queued).unwrap();
+    env.ledger().with_mut(|l| {
+        l.sequence_number = proposal.pending.unlock_ledger;
+        l.timestamp = proposal.unlock_timestamp;
+    });
+    escrow.add_token(admin, token);
+}
 
 /// Cross-contract integration: the escrow contract drives an external lending
 /// pool exclusively through the shared `LendingPoolInterface` client (issue
@@ -36,7 +53,7 @@ fn escrow_delegates_yield_to_lending_pool() {
     };
     let escrow_id_addr = env.register(EscrowContract, (escrow_config,));
     let escrow = EscrowContractClient::new(&env, &escrow_id_addr);
-    escrow.add_token(&admin, &token);
+    authorize_token(&env, &escrow, &admin, &token);
 
     let order_id = BytesN::from_array(&env, &[96u8; 32]);
     let escrow_id = escrow.deposit(
@@ -99,7 +116,7 @@ fn escrow_falls_back_when_pool_paused() {
     };
     let escrow_id_addr = env.register(EscrowContract, (escrow_config,));
     let escrow = EscrowContractClient::new(&env, &escrow_id_addr);
-    escrow.add_token(&admin, &token);
+    authorize_token(&env, &escrow, &admin, &token);
 
     let order_id = BytesN::from_array(&env, &[97u8; 32]);
     let escrow_id = escrow.deposit(
@@ -156,7 +173,7 @@ fn escrow_falls_back_when_pool_reports_zero() {
     };
     let escrow_id_addr = env.register(EscrowContract, (escrow_config,));
     let escrow = EscrowContractClient::new(&env, &escrow_id_addr);
-    escrow.add_token(&admin, &token);
+    authorize_token(&env, &escrow, &admin, &token);
 
     let order_id = BytesN::from_array(&env, &[98u8; 32]);
     let escrow_id = escrow.deposit(

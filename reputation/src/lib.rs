@@ -1539,8 +1539,6 @@ impl ReputationContract {
             return Err(ReputationError::InvalidParam);
         }
 
-        Self::check_review_cooldown(&env, &rater, &entity)?;
-
         let rated_key = DataKey::RatedEscrows(rater.clone());
         let mut rated: Vec<u64> = env
             .storage()
@@ -1550,6 +1548,8 @@ impl ReputationContract {
         if rated.contains(escrow_id) {
             return Err(ReputationError::DuplicateRating);
         }
+
+        Self::check_review_cooldown(&env, &rater, &entity)?;
         rated.push_back(escrow_id);
         env.storage().persistent().set(&rated_key, &rated);
 
@@ -1557,7 +1557,7 @@ impl ReputationContract {
 
         // Record review commitment with verified_purchase=false for regular ratings
         let content_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[0u8; 32]); // Placeholder
-        let _ = Self::record_review(
+        let _ = Self::record_review_internal(
             env.clone(),
             rater.clone(),
             entity.clone(),
@@ -4215,6 +4215,26 @@ impl ReputationContract {
         verified_purchase: bool,
     ) -> Result<(), ReputationError> {
         reviewer.require_auth();
+        Self::record_review_internal(
+            env,
+            reviewer,
+            merchant,
+            review_id,
+            rating,
+            content_hash,
+            verified_purchase,
+        )
+    }
+
+    fn record_review_internal(
+        env: Env,
+        reviewer: Address,
+        merchant: Address,
+        review_id: u64,
+        rating: u32,
+        content_hash: BytesN<32>,
+        verified_purchase: bool,
+    ) -> Result<(), ReputationError> {
         if rating < MIN_RATING || rating > MAX_RATING {
             return Err(ReputationError::InvalidRating);
         }
