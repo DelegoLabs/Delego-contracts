@@ -4233,6 +4233,19 @@ impl EscrowContract {
             .ok_or(EscrowError::DualControlTimeoutNotConfigured)
     }
 
+    /// Read-only getter for the dual control configuration of an escrow.
+    ///
+    /// Returns the secondary approver address and approval status for high-value
+    /// escrows that require finance team authorization.
+    ///
+    /// # Errors
+    /// Returns `None` when no dual control configuration exists for the escrow.
+    pub fn get_dual_control_config(env: Env, escrow_id: u64) -> Option<DualControlConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DualControlConfig(escrow_id))
+    }
+
     /// Read-only check for whether the secondary-approver window has closed.
     ///
     /// Returns `false` when no deadline is configured, so callers must gate on
