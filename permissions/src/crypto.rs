@@ -3,9 +3,18 @@
 //! Modern mobile passkeys and hardware authenticators use the Secp256r1 curve.
 //! This module provides verification using Soroban's cryptographic host functions.
 
-use soroban_sdk::{BytesN, Env};
+use soroban_sdk::{crypto::Hash, BytesN, Env};
+
+#[allow(deprecated)]
+use soroban_sdk::TryFromValForContractFn;
 
 use crate::PermissionError;
+
+#[allow(deprecated)]
+fn digest_from_bytes(env: &Env, digest: &BytesN<32>) -> Result<Hash<32>, PermissionError> {
+    Hash::<32>::try_from_val_for_contract_fn(env, &digest.to_val())
+        .map_err(|_| PermissionError::InvalidSignature)
+}
 
 /// Verifies a Secp256r1 (P-256) signature.
 ///
@@ -33,7 +42,9 @@ pub fn verify_passkey_signature(
     message_digest: &BytesN<32>,
     signature: &BytesN<64>,
 ) -> Result<bool, PermissionError> {
-    env.crypto().secp256r1_verify(public_key, message_digest, signature);
+    let digest = digest_from_bytes(env, message_digest)?;
+    env.crypto()
+        .secp256r1_verify(public_key, &digest, signature);
     Ok(true)
 }
 
@@ -57,8 +68,10 @@ pub fn verify_passkey_signature_compressed(
     message_digest: &BytesN<32>,
     signature: &BytesN<64>,
 ) -> Result<bool, PermissionError> {
-    env.crypto().secp256r1_verify(public_key, message_digest, signature);
-    Ok(true)
+    let _ = (public_key, message_digest, signature);
+    // The Soroban host only exposes uncompressed (65-byte) Secp256r1 keys.
+    // Compressed keys must be expanded off-chain before verification.
+    Err(PermissionError::InvalidSignature)
 }
 
 /// Verifies a Secp256r1 signature, automatically detecting the public key format.
@@ -87,12 +100,18 @@ pub fn verify_passkey_signature_flexible(
     match pk_len {
         65 => {
             // Uncompressed: 0x04 || x (32) || y (32)
-            let pk_array: BytesN<65> = public_key.clone().try_into().map_err(|_| PermissionError::InvalidSignature)?;
+            let pk_array: BytesN<65> = public_key
+                .clone()
+                .try_into()
+                .map_err(|_| PermissionError::InvalidSignature)?;
             verify_passkey_signature(env, &pk_array, message_digest, signature)
         }
         33 => {
             // Compressed: 0x02/0x03 || x (32)
-            let pk_array: BytesN<33> = public_key.clone().try_into().map_err(|_| PermissionError::InvalidSignature)?;
+            let pk_array: BytesN<33> = public_key
+                .clone()
+                .try_into()
+                .map_err(|_| PermissionError::InvalidSignature)?;
             verify_passkey_signature_compressed(env, &pk_array, message_digest, signature)
         }
         _ => Err(PermissionError::InvalidSignature),

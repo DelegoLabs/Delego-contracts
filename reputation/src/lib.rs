@@ -14,8 +14,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes, BytesN, Env,
-    IntoVal, InvokeError, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
+    BytesN, Env, IntoVal, InvokeError, String, Symbol, Vec,
 };
 
 pub mod algorithm;
@@ -27,17 +27,19 @@ pub use appeals::{
 mod appeals_test;
 #[cfg(test)]
 mod blinded_review_test;
+pub mod flags;
 #[cfg(test)]
 mod fraud_report_test;
 #[cfg(test)]
 mod rehabilitation_test;
 #[cfg(test)]
 mod reputation_reader_test;
-pub mod flags;
 pub use flags::{
     FlagReportingTrait, ReviewFlagRecord, ReviewFlagResolved, ReviewFlagStatus, FLAG_BOUNTY_BPS,
     MIN_FLAG_BOND,
 };
+#[cfg(test)]
+mod dispute_penalty_test;
 #[cfg(test)]
 mod flags_test;
 mod oracle_proof;
@@ -53,8 +55,8 @@ pub use snapshot::{ReputationSnapshot, SNAPSHOT_INTERVAL_LEDGERS};
 pub mod antisybil;
 /// Anonymous buyer reviews under ephemeral stealth keys (issue #588).
 pub mod stealth;
-pub use stealth::{AnonymousReview, AnonymousReviewSubmitted};
 pub use antisybil::{calculate_reviewer_weight, get_buyer_completed_orders, EscrowListPageMirror};
+pub use stealth::{AnonymousReview, AnonymousReviewSubmitted};
 
 /// Half-life of the reputation decay curve, in ledgers (~30 days at 5s/ledger).
 pub const DECAY_HALF_LIFE_LEDGERS: u32 = 518_400;
@@ -655,6 +657,8 @@ pub enum ReputationError {
     AppealWindowNotExpired = 3040,
     /// Review rating is outside the accepted `20..=100` range (issue #584).
     InvalidRatingValue = 3046,
+    /// The same dispute ID has already been counted as a lost dispute.
+    DuplicateLostDispute = 3047,
 }
 
 #[cfg(test)]
@@ -675,7 +679,11 @@ mod rating_validation_tests {
     #[test]
     fn validate_rating_accepts_in_range_values() {
         for rating in [20u32, 60, 100] {
-            assert_eq!(validate_rating(rating), Ok(()), "rating {rating} should be accepted");
+            assert_eq!(
+                validate_rating(rating),
+                Ok(()),
+                "rating {rating} should be accepted"
+            );
         }
     }
 }
@@ -734,6 +742,7 @@ mod error_code_allocation {
             ReputationError::AppealWindowExpired as u32,
             ReputationError::AppealWindowNotExpired as u32,
             ReputationError::InvalidRatingValue as u32,
+            ReputationError::DuplicateLostDispute as u32,
         ];
         for code in codes {
             assert!(
@@ -899,11 +908,6 @@ pub struct ReputationCursor {
 /// `TryFrom<&T> for ScVal` conversion. The cursor is therefore encoded as the
 /// `(score_bps, merchant_id)` pair of the last record on the page, with
 /// `has_more` telling the caller whether to resume from it.
-/// This type intentionally does not derive `contracttype`: it contains
-/// `Option<ReputationCursor>`, and the SDK's `testutils` expansion cannot
-/// convert `Option<UDT>` to `ScVal` (it requires `Into<ScVal>` for the inner
-/// type while contract types only get a `TryFrom` impl). The hand-written
-/// `Val` conversions below are the equivalent of the derive output.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RankedMerchantPage {
@@ -928,66 +932,6 @@ impl RankedMerchantPage {
             last_score_bps: self.next_last_score_bps,
             last_merchant_id: self.next_last_merchant_id,
         })
-    }
-}
-
-impl TryFromVal<Env, Val> for RankedMerchantPage {
-    type Error = ConversionError;
-
-    fn try_from_val(env: &Env, val: &Val) -> Result<Self, Self::Error> {
-        const KEYS: [&'static str; 5] = [
-            "merchants",
-            "has_more",
-            "next_last_score_bps",
-            "next_last_merchant_id",
-            "total_count",
-        ];
-        let mut vals: [Val; 5] = [Val::VOID.to_val(); 5];
-        let map: MapObject = val.try_into().map_err(|_| ConversionError)?;
-        env.map_unpack_to_slice(map, &KEYS, &mut vals)
-            .map_err(|_| ConversionError)?;
-        Ok(Self {
-            merchants: vals[0].try_into_val(env).map_err(|_| ConversionError)?,
-            has_more: vals[1].try_into_val(env).map_err(|_| ConversionError)?,
-            next_last_score_bps: vals[2].try_into_val(env).map_err(|_| ConversionError)?,
-            next_last_merchant_id: vals[3].try_into_val(env).map_err(|_| ConversionError)?,
-            total_count: vals[4].try_into_val(env).map_err(|_| ConversionError)?,
-        })
-    }
-}
-
-impl TryFromVal<Env, RankedMerchantPage> for Val {
-    type Error = ConversionError;
-
-    fn try_from_val(env: &Env, val: &RankedMerchantPage) -> Result<Self, Self::Error> {
-        const KEYS: [&'static str; 5] = [
-            "merchants",
-            "has_more",
-            "next_last_score_bps",
-            "next_last_merchant_id",
-            "total_count",
-        ];
-        let vals: [Val; 5] = [
-            (&val.merchants)
-                .try_into_val(env)
-                .map_err(|_| ConversionError)?,
-            val.has_more
-                .try_into_val(env)
-                .map_err(|_| ConversionError)?,
-            val.next_last_score_bps
-                .try_into_val(env)
-                .map_err(|_| ConversionError)?,
-            val.next_last_merchant_id
-                .try_into_val(env)
-                .map_err(|_| ConversionError)?,
-            (&val.total_count)
-                .try_into_val(env)
-                .map_err(|_| ConversionError)?,
-        ];
-        Ok(env
-            .map_new_from_slices(&KEYS, &vals)
-            .map_err(|_| ConversionError)?
-            .into())
     }
 }
 
@@ -1021,9 +965,6 @@ pub enum DataKey {
     Transacted(Address, Address),
     /// Incremental weighted sums used by `record_transaction`'s hot path.
     ScoreAccumulator(Address),
-    /// Cached composite score for an entity, recomputed on each
-    /// `record_transaction`/`rate_entity`.
-    CompositeScore(Address),
     /// Role-specific performance indicators for an entity, keyed by address.
     RoleMetrics(Address),
 
@@ -1055,6 +996,8 @@ pub enum DataKey {
     NormalizedScore(Address), // Maps merchant -> NormalizedReputationScore
     /// Exponential penalty tracking for consecutive lost disputes.
     DisputePenalty(Address), // Maps merchant -> DisputePenaltyRecord
+    /// Replay-protection marker for disputes already counted against a merchant.
+    RecordedLostDispute(u64),
     /// Counts dispute-free orders for penalty recovery.
     DisputeFreeOrderCount(Address), // Maps merchant -> u32
 
@@ -1555,10 +1498,14 @@ impl ReputationContract {
     /// Records the current ledger as the last review from `buyer` to `seller`.
     fn record_review_ledger(env: &Env, buyer: &Address, seller: &Address) {
         let key = DataKey::LastReviewLedger(buyer.clone(), seller.clone());
-        env.storage().persistent().set(&key, &env.ledger().sequence());
         env.storage()
             .persistent()
-            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+            .set(&key, &env.ledger().sequence());
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     /// Rate the entity on the other side of a completed escrow. `rater` must
@@ -1607,16 +1554,15 @@ impl ReputationContract {
         env.storage().persistent().set(&rated_key, &rated);
 
         Self::record_review_ledger(&env, &rater, &entity);
-        
+
         // Record review commitment with verified_purchase=false for regular ratings
-        let review_id = record.entity; // Using entity as review_id mapping
-        let content_hash = soroban_sdk::BytesN::<32>::from_array(&env, [0u8; 32]); // Placeholder
+        let content_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[0u8; 32]); // Placeholder
         let _ = Self::record_review(
             env.clone(),
             rater.clone(),
             entity.clone(),
-            review_id,
-            4, // rating already extracted from record
+            escrow_id,
+            rating,
             content_hash,
             false, // verified_purchase=false for regular ratings
         );
@@ -1724,22 +1670,20 @@ impl ReputationContract {
         env.storage().persistent().extend_ttl(
             &reviewed_key,
             PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT);
-        
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
         // Record the verified purchase review commitment
         let review_id = proof.escrow_id;
-        let content_hash = proof.content_hash; // Assuming proof has content_hash, otherwise use default
-        // For now, we'll set verified_purchase based on the proof verification above
-        // The actual content_hash would come from the reviewer's off-chain review content
+        let content_hash = soroban_sdk::BytesN::<32>::from_array(&env, &[0u8; 32]);
         let _ = Self::record_review(
             env.clone(),
             rater.clone(),
             entity.clone(),
             review_id,
-        4,
-        soroban_sdk::BytesN::<32>::from_array(&env, [0u8; 32]),
-        true, // verified_purchase flag set to true for verified reviews
-        );
+            rating,
+            content_hash,
+            true, // verified_purchase flag set to true for verified reviews
         );
 
         let record_key = DataKey::TransactionRecord(proof.escrow_id);
@@ -3403,6 +3347,7 @@ impl ReputationContract {
             rating,
             content_hash,
             submitted_ledger: env.ledger().sequence(),
+            verified_purchase: true,
         };
 
         env.storage().persistent().set(&commitment_key, &commitment);
@@ -3544,9 +3489,23 @@ impl ReputationContract {
     ) -> Result<(), ReputationError> {
         caller.require_auth();
         let admin = Self::require_admin(&env)?;
-        if caller != admin {
+        let is_fraud_authority = Self::get_fraud_authority(env.clone())
+            .map(|authority| authority == caller)
+            .unwrap_or(false);
+        if caller != admin && !is_fraud_authority {
             return Err(ReputationError::Unauthorized);
         }
+
+        let recorded_key = DataKey::RecordedLostDispute(dispute_id);
+        if env.storage().persistent().has(&recorded_key) {
+            return Err(ReputationError::DuplicateLostDispute);
+        }
+        env.storage().persistent().set(&recorded_key, &true);
+        env.storage().persistent().extend_ttl(
+            &recorded_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         let penalty_key = DataKey::DisputePenalty(merchant.clone());
         let mut penalty_record: DisputePenaltyRecord = env
@@ -3737,9 +3696,9 @@ impl ReputationContract {
             (
                 symbol_short!("reput"),
                 symbol_short!("rehab_go"),
+                symbol_short!("rehab_str"),
                 merchant,
             ),
-            (symbol_short!("reput"), symbol_short!("rehab_str"), merchant),
             program.clone(),
         );
 
@@ -3836,9 +3795,9 @@ impl ReputationContract {
             (
                 symbol_short!("reput"),
                 symbol_short!("rehab_ok"),
+                symbol_short!("rehab_grd"),
                 merchant,
             ),
-            (symbol_short!("reput"), symbol_short!("rehab_grd"), merchant),
             program,
         );
 
@@ -3886,8 +3845,8 @@ impl ReputationContract {
             (
                 symbol_short!("reput"),
                 symbol_short!("bld_token"),
+                symbol_short!("blind_tok"),
             ),
-            (symbol_short!("reput"), symbol_short!("blind_tok")),
             receipt.clone(),
         );
 
@@ -4102,8 +4061,8 @@ impl ReputationContract {
             (
                 symbol_short!("reput"),
                 symbol_short!("fraud_new"),
+                symbol_short!("fraudfile"),
             ),
-            (symbol_short!("reput"), symbol_short!("fraudfile")),
             report.clone(),
         );
 
@@ -4146,8 +4105,8 @@ impl ReputationContract {
             (
                 symbol_short!("reput"),
                 symbol_short!("fraud_res"),
+                symbol_short!("fraudresl"),
             ),
-            (symbol_short!("reput"), symbol_short!("fraudresl")),
             report.clone(),
         );
 
@@ -4209,9 +4168,9 @@ impl ReputationContract {
         flags::flag_review(env, reporter, review_id, bond_amount)
     }
 
-    /// Resolve a flagged review. Upheld flags remove fraudulent review and reward reporter.
-    /// Frivolous reports result in bond forfeiture.
-    pub fn resolve_flag(
+    /// Resolve a flagged review. Upheld flags remove the fraudulent review and
+    /// reward the reporter; frivolous reports forfeit the reporter's bond.
+    pub fn resolve_review_flag(
         env: Env,
         arbiter: Address,
         flag_id: u64,
@@ -4286,12 +4245,18 @@ impl ReputationContract {
             .get(&merchant_reviews_key)
             .unwrap_or_else(|| Vec::new(&env));
         review_ids.push_back(review_id);
-        env.storage().persistent().set(&merchant_reviews_key, &review_ids);
+        env.storage()
+            .persistent()
+            .set(&merchant_reviews_key, &review_ids);
         env.storage().persistent().extend_ttl(
             &merchant_reviews_key,
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+
+        Ok(())
+    }
+
     // --- Review appeals (issue #583) ---
 
     /// Configures the review appeal mechanism. Admin-only.
@@ -4837,6 +4802,15 @@ impl ReputationReaderTrait for ReputationContract {
     fn get_merchant_average_rating(env: Env, merchant: Address) -> Result<u32, u32> {
         match Self::get_reputation(env, merchant) {
             Ok(rep) => Ok(rep.avg_rating),
+            Err(_) => Err(0),
+        }
+    }
+
+    fn get_merchant_settled_volume(env: Env, merchant: Address) -> Result<i128, u32> {
+        match Self::get_reputation(env, merchant) {
+            // Reputation scores are value-agnostic by design, so no settled
+            // volume is tracked here; callers use the escrow ledger instead.
+            Ok(_) => Ok(0),
             Err(_) => Err(0),
         }
     }

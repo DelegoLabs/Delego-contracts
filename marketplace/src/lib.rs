@@ -16,13 +16,13 @@ use soroban_sdk::{
     InvokeError, String, Symbol, Vec,
 };
 
-/// Storefront metadata storage and update support.
-pub mod storefront;
 /// Fee discount calculator for merchants staking platform governance tokens.
 pub mod fees;
+/// Storefront metadata storage and update support.
+pub mod storefront;
 pub use fees::*;
-pub mod oracle;
 pub mod catalog;
+pub mod oracle;
 pub use oracle::*;
 /// Listing storage TTL constants and metadata (issue #477).
 pub mod constants;
@@ -161,7 +161,7 @@ pub struct LiquidationReserve {
 /// Dispute reserve fund pool tracking a merchant's solvency against its open
 /// escrow book (issue #509).
 ///
-/// `reserve_balance_stroops` must cover `active_escrow_liability_stroops` at
+/// `reserve_balance_stroops` must cover `active_escrow_liability` at
 /// `reserve_ratio_basis_points` (e.g. `1000` == 10%) or new order intake is
 /// refused via [`MarketplaceContract::report_order_opened`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,7 +169,7 @@ pub struct LiquidationReserve {
 pub struct MerchantReservePool {
     pub merchant: Address,
     pub reserve_balance_stroops: i128,
-    pub active_escrow_liability_stroops: i128,
+    pub active_escrow_liability: i128,
     pub reserve_ratio_basis_points: u32,
 }
 
@@ -335,7 +335,7 @@ impl From<MerchantValidationError> for MarketplaceError {
 /// | `ReputationError`   | 2000..=2999      |
 /// | `DelegationError`   | 3000..=3999      |
 /// | `MarketplaceError`  | 4000..=5999      |
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum MarketplaceError {
@@ -424,7 +424,7 @@ pub enum MarketplaceError {
     /// Batch exceeds the maximum allowed listing count.
     BatchTooLarge = 4048,
     /// No [`CancellationPenaltyConfig`] has been set by the admin yet.
-    CancellationPenaltyNotConfigured = 4050,
+    CancellationPenaltyNotSet = 4050,
     /// No dispute reserve pool has been configured for this merchant (issue #509).
     ReservePoolNotFound = 5031,
     /// Merchant's reserve balance does not cover the active escrow liability
@@ -436,7 +436,7 @@ pub enum MarketplaceError {
     InvalidReserveRatio = 5034,
     /// A product hash attestation has already been committed for this
     /// `product_id`; attestations are immutable once committed (issue #507).
-    ProductAttestationAlreadyCommitted = 5035,
+    AttestationAlreadyCommitted = 5035,
     /// No product hash attestation has been committed for this `product_id`.
     ProductAttestationNotFound = 5036,
 }
@@ -667,7 +667,7 @@ pub struct CancellationPenaltyConfig {
     pub penalty_amount_stroops: i128,
     /// Number of merchant-initiated cancellations tolerated before the
     /// merchant is automatically suspended.
-    pub max_cancellations_before_suspension: u32,
+    pub max_cancellations: u32,
 }
 
 #[contracttype]
@@ -878,7 +878,7 @@ pub struct SkuInventory {
 
 // --- Storage Keys ---
 
-#[contracttype]
+#[contracttype(export = false)]
 pub enum DataKey {
     Admin,
     PendingAdmin,
@@ -1108,13 +1108,6 @@ pub const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_000; // 100 XLM
 /// Fraction of the settlement amount held as a liquidation reserve, in basis points.
 /// 1000 bps = 10%.
 pub const RESERVE_BPS: u32 = 1000;
-
-/// Number of ledgers the liquidation reserve is locked before the merchant can withdraw.
-/// ~24 hours at 5 s/ledger.
-pub const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_000; // 100 XLM
-
-/// Fraction of a high-value settlement held as a liquidation reserve, in basis points.
-pub const RESERVE_BPS: u32 = 1000; // 10%
 
 /// Ledger lock period for a liquidation reserve (~24 h at 5 s/ledger).
 pub const RESERVE_LOCK_LEDGERS: u32 = 17_280;
@@ -2371,8 +2364,7 @@ impl MarketplaceContract {
 
         // Check merchant status - must be active (Verified or Registered)
         match merchant.status {
-            MerchantStatus::Verified | MerchantStatus::Registered => {
-            }
+            MerchantStatus::Verified | MerchantStatus::Registered => {}
             MerchantStatus::Suspended => return Err(MarketplaceError::MerchantFrozen),
             MerchantStatus::Closed => return Err(MarketplaceError::MerchantClosed),
             MerchantStatus::Banned => return Err(MarketplaceError::MerchantBanned),
@@ -3190,7 +3182,7 @@ impl MarketplaceContract {
         if config.penalty_amount_stroops <= 0 {
             return Err(MarketplaceError::InvalidParam);
         }
-        if config.max_cancellations_before_suspension == 0 {
+        if config.max_cancellations == 0 {
             return Err(MarketplaceError::InvalidParam);
         }
         env.storage()
@@ -3208,7 +3200,7 @@ impl MarketplaceContract {
 
     /// Return the number of penalised merchant-initiated cancellations
     /// charged against `merchant_id` so far.
-    pub fn get_merchant_cancellation_strikes(env: Env, merchant_id: u64) -> u32 {
+    pub fn get_cancellation_strikes(env: Env, merchant_id: u64) -> u32 {
         env.storage()
             .persistent()
             .get(&DataKey::MerchantCancellationStrikes(merchant_id))
@@ -3220,7 +3212,7 @@ impl MarketplaceContract {
     /// merchant's staked registration deposit and pays it to `buyer` as
     /// compensation for the inconvenience, then increments the merchant's
     /// strike counter. Once the strike counter reaches
-    /// `max_cancellations_before_suspension`, the merchant is automatically
+    /// `max_cancellations`, the merchant is automatically
     /// suspended exactly like [`Self::suspend_merchant`] would.
     ///
     /// Callable only by the platform admin or the configured authorized
@@ -3232,7 +3224,7 @@ impl MarketplaceContract {
     /// # Errors
     /// * [`MarketplaceError::Unauthorized`] — caller is neither admin nor the
     ///   authorized escrow contract.
-    /// * [`MarketplaceError::CancellationPenaltyNotConfigured`] — no config
+    /// * [`MarketplaceError::CancellationPenaltyNotSet`] — no config
     ///   has been set via [`Self::set_cancellation_penalty_config`].
     /// * [`MarketplaceError::MerchantClosed`] / [`MarketplaceError::MerchantBanned`]
     ///   — merchant is not in a state that can be penalised further.
@@ -3263,7 +3255,7 @@ impl MarketplaceContract {
             .storage()
             .instance()
             .get(&DataKey::CancellationPenaltyConfig)
-            .ok_or(MarketplaceError::CancellationPenaltyNotConfigured)?;
+            .ok_or(MarketplaceError::CancellationPenaltyNotSet)?;
 
         let deposit_amount: i128 = env
             .storage()
@@ -3314,7 +3306,7 @@ impl MarketplaceContract {
         );
 
         let mut auto_suspended = false;
-        if strike_count >= config.max_cancellations_before_suspension
+        if strike_count >= config.max_cancellations
             && merchant.status != MerchantStatus::Suspended
             && merchant.status != MerchantStatus::Inactive
         {
@@ -3348,7 +3340,11 @@ impl MarketplaceContract {
         }
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("cnclpen"), merchant_id),
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("cnclpen"),
+                merchant_id,
+            ),
             MerchantCancellationPenalizedEvent {
                 merchant_id,
                 buyer,
@@ -3662,17 +3658,22 @@ impl MarketplaceContract {
 
         let key = DataKey::MerchantReservePool(merchant_id);
         let mut pool: MerchantReservePool =
-            env.storage().persistent().get(&key).unwrap_or(MerchantReservePool {
-                merchant: owner,
-                reserve_balance_stroops: 0,
-                active_escrow_liability_stroops: 0,
-                reserve_ratio_basis_points,
-            });
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(MerchantReservePool {
+                    merchant: owner,
+                    reserve_balance_stroops: 0,
+                    active_escrow_liability: 0,
+                    reserve_ratio_basis_points,
+                });
         pool.reserve_ratio_basis_points = reserve_ratio_basis_points;
         env.storage().persistent().set(&key, &pool);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         Ok(pool)
     }
 
@@ -3705,20 +3706,25 @@ impl MarketplaceContract {
 
         let key = DataKey::MerchantReservePool(merchant_id);
         let mut pool: MerchantReservePool =
-            env.storage().persistent().get(&key).unwrap_or(MerchantReservePool {
-                merchant: merchant_owner,
-                reserve_balance_stroops: 0,
-                active_escrow_liability_stroops: 0,
-                reserve_ratio_basis_points: DEFAULT_RESERVE_RATIO_BPS,
-            });
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(MerchantReservePool {
+                    merchant: merchant_owner,
+                    reserve_balance_stroops: 0,
+                    active_escrow_liability: 0,
+                    reserve_ratio_basis_points: DEFAULT_RESERVE_RATIO_BPS,
+                });
         pool.reserve_balance_stroops = pool
             .reserve_balance_stroops
             .checked_add(amount)
             .ok_or(MarketplaceError::InvalidReserveAmount)?;
         env.storage().persistent().set(&key, &pool);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         Ok(pool.reserve_balance_stroops)
     }
 
@@ -3753,15 +3759,18 @@ impl MarketplaceContract {
 
         let key = DataKey::MerchantReservePool(merchant_id);
         let mut pool: MerchantReservePool =
-            env.storage().persistent().get(&key).unwrap_or(MerchantReservePool {
-                merchant: owner,
-                reserve_balance_stroops: 0,
-                active_escrow_liability_stroops: 0,
-                reserve_ratio_basis_points: DEFAULT_RESERVE_RATIO_BPS,
-            });
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(MerchantReservePool {
+                    merchant: owner,
+                    reserve_balance_stroops: 0,
+                    active_escrow_liability: 0,
+                    reserve_ratio_basis_points: DEFAULT_RESERVE_RATIO_BPS,
+                });
 
         let projected_liability = pool
-            .active_escrow_liability_stroops
+            .active_escrow_liability
             .checked_add(order_amount)
             .ok_or(MarketplaceError::InvalidReserveAmount)?;
         let required_reserve = projected_liability
@@ -3773,11 +3782,13 @@ impl MarketplaceContract {
             return Err(MarketplaceError::InsufficientReserveCoverage);
         }
 
-        pool.active_escrow_liability_stroops = projected_liability;
+        pool.active_escrow_liability = projected_liability;
         env.storage().persistent().set(&key, &pool);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         Ok(())
     }
 
@@ -3806,12 +3817,13 @@ impl MarketplaceContract {
             .get(&key)
             .ok_or(MarketplaceError::ReservePoolNotFound)?;
 
-        pool.active_escrow_liability_stroops =
-            (pool.active_escrow_liability_stroops - order_amount).max(0);
+        pool.active_escrow_liability = (pool.active_escrow_liability - order_amount).max(0);
         env.storage().persistent().set(&key, &pool);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         Ok(())
     }
 
@@ -3826,7 +3838,7 @@ impl MarketplaceContract {
     /// Commits `content_hash` for `product_id`, immutably. Requires an auth
     /// entry from `merchant`, who must be the registered owner of
     /// `merchant_id`. Fails with
-    /// [`MarketplaceError::ProductAttestationAlreadyCommitted`] if this
+    /// [`MarketplaceError::AttestationAlreadyCommitted`] if this
     /// `product_id` already has a commitment — attestations cannot be
     /// overwritten.
     pub fn commit_product_attestation(
@@ -3844,7 +3856,7 @@ impl MarketplaceContract {
 
         let key = DataKey::ProductAttestation(product_id);
         if env.storage().persistent().has(&key) {
-            return Err(MarketplaceError::ProductAttestationAlreadyCommitted);
+            return Err(MarketplaceError::AttestationAlreadyCommitted);
         }
 
         let committed_ledger = env.ledger().sequence();
@@ -3854,9 +3866,11 @@ impl MarketplaceContract {
             committed_ledger,
         };
         env.storage().persistent().set(&key, &attestation);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         env.events().publish(
             (
@@ -5888,6 +5902,8 @@ impl MarketplaceContract {
     /// Return all SKU IDs in the catalog for `merchant_id`.
     pub fn get_merchant_catalog(env: Env, merchant_id: u64) -> Vec<Symbol> {
         catalog::get_merchant_catalog(env, merchant_id)
+    }
+
     // Bulk Listing Registration (issue #559) — delegates to catalog module
     // -----------------------------------------------------------------------
 
@@ -6727,8 +6743,7 @@ mod listing_ttl_tests {
             metadata_uri: None,
             required_verifications: 0,
         };
-        let merchant_id =
-            testutil::register_merchant_with_deposit(&env, &client, &owner, &params);
+        let merchant_id = testutil::register_merchant_with_deposit(&env, &client, &owner, &params);
         let sku = Symbol::new(&env, "ttl_item");
         let mut listings = Vec::new(&env);
         listings.push_back(catalog::ListingParams {
@@ -6738,7 +6753,14 @@ mod listing_ttl_tests {
             initial_stock: 5,
         });
         client.batch_register_listings(&owner, &listings);
-        Ctx { env, id, client, owner, merchant_id, sku }
+        Ctx {
+            env,
+            id,
+            client,
+            owner,
+            merchant_id,
+            sku,
+        }
     }
 
     fn listing_ttl(ctx: &Ctx) -> u32 {
@@ -6764,12 +6786,18 @@ mod listing_ttl_tests {
     fn reads_bump_listing_ttl_across_eviction_window() {
         let ctx = setup();
         // Cross the threshold, read, then outlive the original expiry.
-        advance(&ctx.env, LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1);
+        advance(
+            &ctx.env,
+            LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1,
+        );
         assert!(listing_ttl(&ctx) < LISTING_THRESHOLD_LEDGERS);
         ctx.client.get_listing(&ctx.merchant_id, &ctx.sku);
         assert_eq!(listing_ttl(&ctx), LISTING_BUMP_LEDGERS);
 
-        advance(&ctx.env, LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1);
+        advance(
+            &ctx.env,
+            LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1,
+        );
         let listing = ctx.client.get_listing(&ctx.merchant_id, &ctx.sku);
         assert_eq!(listing.available_stock, 5);
         assert_eq!(ctx.client.get_merchant_listings(&ctx.merchant_id).len(), 1);
@@ -6778,7 +6806,10 @@ mod listing_ttl_tests {
     #[test]
     fn bump_listing_ttl_refreshes_and_returns_metadata() {
         let ctx = setup();
-        advance(&ctx.env, LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1);
+        advance(
+            &ctx.env,
+            LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1,
+        );
         let meta = ctx.client.bump_listing_ttl(&ctx.merchant_id, &ctx.sku);
         assert_eq!(listing_ttl(&ctx), LISTING_BUMP_LEDGERS);
         assert_eq!(meta.merchant, ctx.owner);
@@ -6809,8 +6840,12 @@ mod listing_ttl_tests {
             &10u32,
         );
         let admin = ctx.client.get_admin();
-        advance(&ctx.env, LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1);
-        ctx.client.decrement_stock(&admin, &ctx.merchant_id, &sku, &1u32);
+        advance(
+            &ctx.env,
+            LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1,
+        );
+        ctx.client
+            .decrement_stock(&admin, &ctx.merchant_id, &sku, &1u32);
         let ttl = ctx.env.as_contract(&ctx.id, || {
             ctx.env
                 .storage()

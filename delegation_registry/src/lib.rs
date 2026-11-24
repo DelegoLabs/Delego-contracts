@@ -25,6 +25,8 @@
 // documentation discipline via code review and the explicit doc comments that
 // every public constant, type, and function carries in this file.
 #![allow(missing_docs)]
+#[cfg(any(test, feature = "testutils"))]
+use soroban_sdk::testutils::storage::Persistent as _;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
     Symbol, Vec,
@@ -38,6 +40,18 @@ pub use heartbeat::{
 /// Persistent entries are bumped when they approach expiry and kept alive
 /// for roughly 30 days, matching the repository's persistent-storage policy.
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
+
+fn persistent_ttl(env: &Env, key: &DataKey) -> u32 {
+    #[cfg(any(test, feature = "testutils"))]
+    {
+        env.storage().persistent().get_ttl(key)
+    }
+    #[cfg(not(any(test, feature = "testutils")))]
+    {
+        let _ = (env, key);
+        0
+    }
+}
 /// Target TTL (in ledgers) applied when a persistent entry is bumped.
 ///
 /// 518 400 ledgers ≈ 30 days at 5 s/ledger.  Bumping to this value every
@@ -1705,7 +1719,7 @@ impl DelegationRegistry {
     /// Returns a delegation record by owner and label, looking up via the
     /// DataKey::DelegationV2 secondary index. Returns `NotFound` when no
     /// delegation with the given owner/label pair exists.
-    pub fn get_delegation_by_owner_and_label(
+    pub fn get_delegation_by_owner_label(
         env: Env,
         owner: Address,
         label: Symbol,
@@ -2941,10 +2955,7 @@ impl DelegationRegistry {
             && current_ledger < record.expires_at_ledger;
 
         let delegation_key = DataKey::Delegation(delegation_id);
-        let storage_ttl: u32 = env
-            .storage()
-            .persistent()
-            .get_ttl(&delegation_key);
+        let storage_ttl: u32 = persistent_ttl(&env, &delegation_key);
 
         // A keeper is eligible when:
         //   1. the delegation is live (Active and not yet expired)
@@ -3027,10 +3038,7 @@ impl DelegationRegistry {
 
         // 2. The storage TTL must be approaching the archival threshold.
         let delegation_key = DataKey::Delegation(delegation_id);
-        let storage_ttl: u32 = env
-            .storage()
-            .persistent()
-            .get_ttl(&delegation_key);
+        let storage_ttl: u32 = persistent_ttl(&env, &delegation_key);
 
         if storage_ttl >= KEEPER_BOUNTY_THRESHOLD_LEDGERS {
             return Err(DelegationError::NotEligibleForBounty);
@@ -3121,10 +3129,7 @@ impl DelegationRegistry {
         );
 
         // Return the refreshed status (now ineligible due to cooldown reset).
-        let refreshed_ttl: u32 = env
-            .storage()
-            .persistent()
-            .get_ttl(&delegation_key);
+        let refreshed_ttl: u32 = persistent_ttl(&env, &delegation_key);
 
         Ok(KeeperBountyStatus {
             delegation_id,

@@ -103,7 +103,7 @@ pub(crate) fn consume(
     record.last_reset_ledger = env.ledger().sequence();
     let key = DataKey::RecurringQuota(record.owner.clone(), record.delegate.clone());
     env.storage().persistent().set(&key, &state);
-    Self::extend_persistent_ttl_if_needed(&env, &key);
+    crate::bump_persistent_ttl(&env, &key);
     env.events().publish(
         (
             symbol_short!("perm"),
@@ -176,7 +176,10 @@ impl PermissionsContract {
                 epoch_spent: 0,
             },
         );
-        Self::extend_persistent_ttl_if_needed(&env, &DataKey::RecurringQuota(owner.clone(), delegate.clone()));
+        crate::bump_persistent_ttl(
+            &env,
+            &DataKey::RecurringQuota(owner.clone(), delegate.clone()),
+        );
         env.events().publish(
             (
                 symbol_short!("perm"),

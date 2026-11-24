@@ -1,16 +1,29 @@
 #![cfg(test)]
 
-use crate::*;
-use soroban_sdk::{testutils::Address as TestAddress, BytesN, Env};
+use crate::{
+    FlagReportingTrait, ReputationConfig, ReputationContract, ReputationContractClient,
+    ReputationError, ReviewFlagStatus, BPS_SCALE, FLAG_BOUNTY_BPS,
+};
+use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
 
-fn setup_env() -> (Env, Address, Address, Address, Address) {
+struct Setup {
+    env: Env,
+    client: ReputationContractClient<'static>,
+    contract_id: Address,
+    admin: Address,
+    merchant: Address,
+    reviewer: Address,
+    reporter: Address,
+}
+
+fn setup() -> Setup {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin = TestAddress::random(&env);
-    let merchant = TestAddress::random(&env);
-    let reviewer = TestAddress::random(&env);
-    let reporter = TestAddress::random(&env);
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let reviewer = Address::generate(&env);
+    let reporter = Address::generate(&env);
 
     let config = ReputationConfig {
         decay_window_seconds: 2_592_000,
@@ -19,295 +32,211 @@ fn setup_env() -> (Env, Address, Address, Address, Address) {
         freeze_threshold_flags: 3,
     };
 
-    ReputationContract::__constructor(&env, admin.clone(), config).unwrap();
+    let contract_id = env.register(ReputationContract, (admin.clone(), config));
+    let client = ReputationContractClient::new(&env, &contract_id);
 
-    (env, admin, merchant, reviewer, reporter)
+    Setup {
+        env,
+        client,
+        contract_id,
+        admin,
+        merchant,
+        reviewer,
+        reporter,
+    }
+}
+
+fn record_review(s: &Setup, review_id: u64, rating: u32) {
+    let content_hash = BytesN::<32>::from_array(&s.env, &[9u8; 32]);
+    s.client.record_review(
+        &s.reviewer,
+        &s.merchant,
+        &review_id,
+        &rating,
+        &content_hash,
+        &false,
+    );
 }
 
 #[test]
 fn test_flag_review_success() {
-    let (env, _admin, merchant, reviewer, reporter) = setup_env();
-
+    let s = setup();
     let review_id = 100u64;
-    let content_hash = BytesN::<32>::from_array(&env, [9u8; 32]);
-    ReputationContract::record_review(
-        env.clone(),
-        reviewer,
-        merchant,
-        review_id,
-        4,
-        content_hash,
-    
-        false,
-    )
-    .expect("Should record review");
+    record_review(&s, review_id, 4);
 
     let bond = 100_000_000i128; // 10 USDC
-    let flagged = ReputationContract::flag_review(env.clone(), reporter.clone(), review_id, bond)
-        .expect("Should flag review");
+    let flagged = s.client.flag_review(&s.reporter, &review_id, &bond);
     assert!(flagged);
 
-    // Retrieve flag record
-    let flag = ReputationContract::get_review_flag(env.clone(), 1).expect("Flag should exist");
+    let flag = s.client.get_review_flag(&1).expect("Flag should exist");
     assert_eq!(flag.flag_id, 1);
-    assert_eq!(flag.reporter, reporter);
+    assert_eq!(flag.reporter, s.reporter);
     assert_eq!(flag.review_id, review_id);
     assert_eq!(flag.bond_amount, bond);
     assert_eq!(flag.status, ReviewFlagStatus::Pending);
     assert_eq!(flag.resolved_at, None);
     assert_eq!(flag.arbiter, None);
 
-    // Review should still exist while pending
-    assert!(!ReputationContract::is_review_removed(env, review_id));
+    assert!(!s.client.is_review_removed(&review_id));
 }
 
 #[test]
 fn test_flag_review_insufficient_bond() {
-    let (env, _admin, merchant, reviewer, reporter) = setup_env();
-
+    let s = setup();
     let review_id = 101u64;
-    let content_hash = BytesN::<32>::from_array(&env, [9u8; 32]);
-    ReputationContract::record_review(
-        env.clone(),
-        reviewer,
-        merchant,
-        review_id,
-        5,
-        content_hash,
-    
-        false,
-    )
-    .expect("Should record review");
+    record_review(&s, review_id, 5);
 
-    let insufficient_bond = 50_000_000i128; // Less than MIN_FLAG_BOND
-    let result = ReputationContract::flag_review(env, reporter, review_id, insufficient_bond);
-    assert!(matches!(result, Err(ReputationError::InvalidFraudBond)));
+    let insufficient_bond = 50_000_000i128;
+    assert_eq!(
+        s.client
+            .try_flag_review(&s.reporter, &review_id, &insufficient_bond),
+        Err(Ok(ReputationError::InvalidFraudBond))
+    );
 }
 
 #[test]
 fn test_flag_review_nonexistent() {
-    let (env, _admin, _merchant, _reviewer, reporter) = setup_env();
+    let s = setup();
 
-    let nonexistent_review_id = 9999u64;
-    let bond = 100_000_000i128;
-    let result = ReputationContract::flag_review(env, reporter, nonexistent_review_id, bond);
-    assert!(matches!(result, Err(ReputationError::ReviewNotFound)));
+    assert_eq!(
+        s.client
+            .try_flag_review(&s.reporter, &9999u64, &100_000_000i128),
+        Err(Ok(ReputationError::ReviewNotFound))
+    );
 }
 
 #[test]
 fn test_flag_review_already_flagged_by_same_reporter() {
-    let (env, _admin, merchant, reviewer, reporter) = setup_env();
-
+    let s = setup();
     let review_id = 102u64;
-    let content_hash = BytesN::<32>::from_array(&env, [9u8; 32]);
-    ReputationContract::record_review(
-        env.clone(),
-        reviewer,
-        merchant,
-        review_id,
-        3,
-        content_hash,
-    
-        false,
-    )
-    .expect("Should record review");
+    record_review(&s, review_id, 3);
 
     let bond = 100_000_000i128;
-    ReputationContract::flag_review(env.clone(), reporter.clone(), review_id, bond)
-        .expect("Should flag first time");
+    s.client.flag_review(&s.reporter, &review_id, &bond);
 
-    // Second flag by same reporter while pending must fail
-    let result = ReputationContract::flag_review(env, reporter, review_id, bond);
-    assert!(matches!(result, Err(ReputationError::AlreadyFlagged)));
+    assert_eq!(
+        s.client.try_flag_review(&s.reporter, &review_id, &bond),
+        Err(Ok(ReputationError::AlreadyFlagged))
+    );
 }
 
 #[test]
 fn test_resolve_flag_upheld_removes_review_and_rewards_reporter() {
-    let (env, admin, merchant, reviewer, reporter) = setup_env();
-
+    let s = setup();
     let review_id = 103u64;
-    let content_hash = BytesN::<32>::from_array(&env, [9u8; 32]);
-    ReputationContract::record_review(
-        env.clone(),
-        reviewer,
-        merchant,
-        review_id,
-        1,
-        content_hash,
-    
-        false,
-    )
-    .expect("Should record review");
+    record_review(&s, review_id, 1);
 
     let bond = 100_000_000i128;
-    ReputationContract::flag_review(env.clone(), reporter.clone(), review_id, bond)
-        .expect("Should flag review");
+    s.client.flag_review(&s.reporter, &review_id, &bond);
 
-    // Arbiter resolves flag as upheld (true)
-    let resolved = ReputationContract::resolve_flag(env.clone(), admin.clone(), 1, true)
-        .expect("Should resolve flag");
+    let resolved = s.client.resolve_review_flag(&s.admin, &1, &true);
     assert!(resolved);
 
-    // Verify flag status is Upheld
-    let flag = ReputationContract::get_review_flag(env.clone(), 1).unwrap();
+    let flag = s.client.get_review_flag(&1).unwrap();
     assert_eq!(flag.status, ReviewFlagStatus::Upheld);
-    assert_eq!(flag.arbiter, Some(admin));
+    assert_eq!(flag.arbiter, Some(s.admin.clone()));
     assert!(flag.resolved_at.is_some());
-    let expected_bounty = (bond * FLAG_BOUNTY_BPS) / (BPS_SCALE as i128); // 10% = 10_000_000
+    let expected_bounty = (bond * FLAG_BOUNTY_BPS) / BPS_SCALE;
     assert_eq!(flag.bounty_amount, expected_bounty);
 
-    // Verify fraudulent review was removed
-    assert!(ReputationContract::is_review_removed(env.clone(), review_id));
+    assert!(s.client.is_review_removed(&review_id));
 
-    // Verify reporter was rewarded (bond refunded + bounty)
-    let reward = ReputationContract::get_reporter_reward(env.clone(), reporter);
+    let reward = s.client.get_reporter_reward(&s.reporter);
     assert_eq!(reward, bond + expected_bounty);
 
-    // Cannot re-flag a removed review
-    let other_reporter = TestAddress::random(&env);
-    let reflag_result = ReputationContract::flag_review(env, other_reporter, review_id, bond);
-    assert!(matches!(reflag_result, Err(ReputationError::ReviewNotFound)));
+    let other_reporter = Address::generate(&s.env);
+    assert_eq!(
+        s.client.try_flag_review(&other_reporter, &review_id, &bond),
+        Err(Ok(ReputationError::ReviewNotFound))
+    );
 }
 
 #[test]
 fn test_resolve_flag_frivolous_slashes_bond_and_keeps_review() {
-    let (env, admin, merchant, reviewer, reporter) = setup_env();
-
+    let s = setup();
     let review_id = 104u64;
-    let content_hash = BytesN::<32>::from_array(&env, [9u8; 32]);
-    ReputationContract::record_review(
-        env.clone(),
-        reviewer,
-        merchant,
-        review_id,
-        5,
-        content_hash,
-    
-        false,
-    )
-    .expect("Should record review");
+    record_review(&s, review_id, 5);
 
     let bond = 100_000_000i128;
-    ReputationContract::flag_review(env.clone(), reporter.clone(), review_id, bond)
-        .expect("Should flag review");
+    s.client.flag_review(&s.reporter, &review_id, &bond);
 
-    // Arbiter resolves flag as frivolous/rejected (false)
-    let resolved = ReputationContract::resolve_flag(env.clone(), admin.clone(), 1, false)
-        .expect("Should resolve flag");
+    let resolved = s.client.resolve_review_flag(&s.admin, &1, &false);
     assert!(resolved);
 
-    // Verify flag status is Frivolous
-    let flag = ReputationContract::get_review_flag(env.clone(), 1).unwrap();
+    let flag = s.client.get_review_flag(&1).unwrap();
     assert_eq!(flag.status, ReviewFlagStatus::Frivolous);
     assert_eq!(flag.bounty_amount, 0);
 
-    // Review must NOT be removed
-    assert!(!ReputationContract::is_review_removed(env.clone(), review_id));
-
-    // Reporter received 0 reward
-    let reward = ReputationContract::get_reporter_reward(env.clone(), reporter);
-    assert_eq!(reward, 0);
-
-    // Slashed bond pool increased by the full bond
-    let slashed = ReputationContract::get_total_slashed_bonds(env);
-    assert_eq!(slashed, bond);
+    assert!(!s.client.is_review_removed(&review_id));
+    assert_eq!(s.client.get_reporter_reward(&s.reporter), 0);
+    assert_eq!(s.client.get_total_slashed_bonds(), bond);
 }
 
 #[test]
 fn test_resolve_flag_unauthorized() {
-    let (env, _admin, merchant, reviewer, reporter) = setup_env();
-
+    let s = setup();
     let review_id = 105u64;
-    let content_hash = BytesN::<32>::from_array(&env, [9u8; 32]);
-    ReputationContract::record_review(
-        env.clone(),
-        reviewer,
-        merchant,
-        review_id,
-        5,
-        content_hash,
-    
-        false,
-    )
-    .expect("Should record review");
+    record_review(&s, review_id, 5);
 
     let bond = 100_000_000i128;
-    ReputationContract::flag_review(env.clone(), reporter, review_id, bond).unwrap();
+    s.client.flag_review(&s.reporter, &review_id, &bond);
 
-    let unauthorized_caller = TestAddress::random(&env);
-    let result = ReputationContract::resolve_flag(env, unauthorized_caller, 1, true);
-    assert!(matches!(result, Err(ReputationError::Unauthorized)));
+    let unauthorized_caller = Address::generate(&s.env);
+    assert_eq!(
+        s.client
+            .try_resolve_review_flag(&unauthorized_caller, &1, &true),
+        Err(Ok(ReputationError::Unauthorized))
+    );
 }
 
 #[test]
 fn test_resolve_flag_already_resolved() {
-    let (env, admin, merchant, reviewer, reporter) = setup_env();
-
+    let s = setup();
     let review_id = 106u64;
-    let content_hash = BytesN::<32>::from_array(&env, [9u8; 32]);
-    ReputationContract::record_review(
-        env.clone(),
-        reviewer,
-        merchant,
-        review_id,
-        5,
-        content_hash,
-    
-        false,
-    )
-    .expect("Should record review");
+    record_review(&s, review_id, 5);
 
     let bond = 100_000_000i128;
-    ReputationContract::flag_review(env.clone(), reporter, review_id, bond).unwrap();
+    s.client.flag_review(&s.reporter, &review_id, &bond);
 
-    ReputationContract::resolve_flag(env.clone(), admin.clone(), 1, true).unwrap();
+    s.client.resolve_review_flag(&s.admin, &1, &true);
 
-    // Second resolution must fail
-    let result = ReputationContract::resolve_flag(env, admin, 1, false);
-    assert!(matches!(result, Err(ReputationError::FlagAlreadyResolved)));
+    assert_eq!(
+        s.client.try_resolve_review_flag(&s.admin, &1, &false),
+        Err(Ok(ReputationError::FlagAlreadyResolved))
+    );
 }
 
 #[test]
 fn test_resolve_flag_nonexistent() {
-    let (env, admin, _merchant, _reviewer, _reporter) = setup_env();
+    let s = setup();
 
-    let result = ReputationContract::resolve_flag(env, admin, 9999, true);
-    assert!(matches!(result, Err(ReputationError::FlagNotFound)));
+    assert_eq!(
+        s.client.try_resolve_review_flag(&s.admin, &9999, &true),
+        Err(Ok(ReputationError::FlagNotFound))
+    );
 }
 
 #[test]
 fn test_flag_reporting_via_trait() {
-    let (env, admin, merchant, reviewer, reporter) = setup_env();
-
+    let s = setup();
     let review_id = 107u64;
-    let content_hash = BytesN::<32>::from_array(&env, [9u8; 32]);
-    ReputationContract::record_review(
-        env.clone(),
-        reviewer,
-        merchant,
-        review_id,
-        2,
-        content_hash,
-    )
-    .expect("Should record review");
+    record_review(&s, review_id, 2);
 
     let bond = 100_000_000i128;
-    // Call via trait implementation
-    let flagged = <ReputationContract as FlagReportingTrait>::flag_review(
-        env.clone(),
-        reporter,
-        review_id,
-        bond,
-    )
-    .expect("Should flag via trait");
+    let env = s.env.clone();
+    let reporter = s.reporter.clone();
+    let flagged = env
+        .as_contract(&s.contract_id, || {
+            <ReputationContract as FlagReportingTrait>::flag_review(
+                env.clone(),
+                reporter,
+                review_id,
+                bond,
+            )
+        })
+        .expect("Should flag via trait");
     assert!(flagged);
 
-    let resolved = <ReputationContract as FlagReportingTrait>::resolve_flag(
-        env,
-        admin,
-        1,
-        true,
-    )
-    .expect("Should resolve via trait");
+    let resolved = s.client.resolve_review_flag(&s.admin, &1, &true);
     assert!(resolved);
 }

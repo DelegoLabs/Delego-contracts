@@ -33,7 +33,6 @@ use crate::{
     DataKey, MarketplaceContract, MarketplaceError, LISTING_BUMP_LEDGERS,
     LISTING_THRESHOLD_LEDGERS, PERSISTENT_BUMP_AMOUNT, PERSISTENT_BUMP_THRESHOLD,
 };
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
 
 // ---------------------------------------------------------------------------
@@ -70,6 +69,8 @@ pub struct SkuRecord {
     /// Whether this SKU accepts new orders. Stock decrements are refused when
     /// `is_active` is `false`.
     pub is_active: bool,
+}
+
 /// Parameters for a single listing inside a batch registration call.
 ///
 /// Each `ListingParams` describes one product / digital-good entry:
@@ -208,9 +209,11 @@ pub fn register_sku(
         .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
     sku_list.push_back(sku_id.clone());
     env.storage().persistent().set(&list_key, &sku_list);
-    env.storage()
-        .persistent()
-        .extend_ttl(&list_key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    env.storage().persistent().extend_ttl(
+        &list_key,
+        PERSISTENT_BUMP_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
 
     env.events().publish(
         (
@@ -443,23 +446,16 @@ pub fn batch_register_listings(
         PERSISTENT_BUMP_AMOUNT,
     );
 
-    let remaining = record.available_quantity;
-
     env.events().publish(
         (
             symbol_short!("mkplc"),
-            symbol_short!("sku_dec"),
+            symbol_short!("bulk_lst"),
             merchant_id,
         ),
-        SkuStockDecrementedEvent {
-            merchant_id,
-            sku_id,
-            quantity,
-            remaining,
-        },
+        BatchListingsRegisteredEvent { merchant_id, count },
     );
 
-    Ok(remaining)
+    Ok(count)
 }
 
 /// Set (or clear) the authorised escrow contract address.
@@ -483,19 +479,14 @@ pub fn set_authorized_escrow(
             .storage()
             .instance()
             .set(&DataKey::AuthorizedEscrow, &addr),
-        None => env
-            .storage()
-            .instance()
-            .remove(&DataKey::AuthorizedEscrow),
+        None => env.storage().instance().remove(&DataKey::AuthorizedEscrow),
     }
     Ok(())
 }
 
 /// Return the currently configured authorised escrow address, if any.
 pub fn get_authorized_escrow(env: Env) -> Option<Address> {
-    env.storage()
-        .instance()
-        .get(&DataKey::AuthorizedEscrow)
+    env.storage().instance().get(&DataKey::AuthorizedEscrow)
 }
 
 /// Return the [`SkuRecord`] for `(merchant_id, sku_id)`, or
@@ -520,17 +511,6 @@ pub fn get_merchant_catalog(env: Env, merchant_id: u64) -> soroban_sdk::Vec<Symb
         .persistent()
         .get(&DataKey::MerchantCatalogSkuList(merchant_id))
         .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
-    // Emit a single summary event for the whole batch.
-    env.events().publish(
-        (
-            symbol_short!("mkplc"),
-            symbol_short!("bulk_lst"),
-            merchant_id,
-        ),
-        BatchListingsRegisteredEvent { merchant_id, count },
-    );
-
-    Ok(count)
 }
 
 /// Return the [`ListingRecord`] for `(merchant_id, sku_id)`, or
@@ -555,9 +535,11 @@ pub fn get_merchant_listings(env: Env, merchant_id: u64) -> Vec<Symbol> {
     let list: Option<Vec<Symbol>> = env.storage().persistent().get(&key);
     match list {
         Some(list) => {
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, LISTING_THRESHOLD_LEDGERS, LISTING_BUMP_LEDGERS);
+            env.storage().persistent().extend_ttl(
+                &key,
+                LISTING_THRESHOLD_LEDGERS,
+                LISTING_BUMP_LEDGERS,
+            );
             list
         }
         None => Vec::new(&env),
@@ -594,11 +576,10 @@ fn is_authorized_decrementer(env: &Env, caller: &Address) -> Result<bool, Market
     if caller == &admin {
         return Ok(true);
     }
-    let auth_escrow: Option<Address> = env
-        .storage()
-        .instance()
-        .get(&DataKey::AuthorizedEscrow);
+    let auth_escrow: Option<Address> = env.storage().instance().get(&DataKey::AuthorizedEscrow);
     Ok(auth_escrow.as_ref() == Some(caller))
+}
+
 /// Measure the byte length of a [`Symbol`] by inspecting its XDR encoding.
 ///
 /// Returns 0 for an empty symbol.  Soroban `Symbol` values are limited to 32
@@ -626,11 +607,6 @@ fn sku_id_byte_len(env: &Env, sym: &Symbol) -> u32 {
 mod tests {
     use super::*;
     use crate::{MarketplaceContract, MarketplaceContractClient, RegisterParams};
-    use soroban_sdk::{
-        symbol_short,
-        testutils::Address as _,
-        Address, Env, String,
-    };
     use soroban_sdk::{symbol_short, testutils::Address as _, Address, Env, String};
 
     // -----------------------------------------------------------------------
@@ -667,20 +643,6 @@ mod tests {
         };
         let merchant_id =
             crate::testutil::register_merchant_with_deposit(&env, &client, &owner, &params);
-        let merchant_id = crate::testutil::register_merchant_with_deposit(
-            &env,
-            &client,
-            &owner,
-            &RegisterParams {
-                name: String::from_str(&env, "Bulk Merchant"),
-                description: String::from_str(&env, "Merchant for bulk listing tests"),
-                category: symbol_short!("retail"),
-                image_url: String::from_str(&env, "https://example.com/img.png"),
-                metadata: None,
-                metadata_uri: None,
-                required_verifications: 0,
-            },
-        );
 
         let token = Address::generate(&env);
         Ctx {
@@ -714,9 +676,7 @@ mod tests {
             &50u32,
         );
 
-        let record = ctx
-            .client
-            .get_sku_record(&ctx.merchant_id, &sku(&ctx.env));
+        let record = ctx.client.get_sku_record(&ctx.merchant_id, &sku(&ctx.env));
         assert_eq!(record.available_quantity, 50);
         assert_eq!(record.price, 100);
         assert!(record.is_active);
@@ -741,6 +701,9 @@ mod tests {
                 &10u32,
             ),
             Err(Ok(MarketplaceError::Unauthorized))
+        );
+    }
+
     /// Build a single valid [`ListingParams`] with a given sku symbol.
     fn listing(env: &Env, sku: Symbol, token: &Address) -> ListingParams {
         ListingParams {
@@ -759,10 +722,26 @@ mod tests {
         for i in 0..n {
             // Build a short unique name "s0", "s1", ..., "s19"
             let name = match i {
-                0 => "s0", 1 => "s1", 2 => "s2", 3 => "s3", 4 => "s4",
-                5 => "s5", 6 => "s6", 7 => "s7", 8 => "s8", 9 => "s9",
-                10 => "s10", 11 => "s11", 12 => "s12", 13 => "s13", 14 => "s14",
-                15 => "s15", 16 => "s16", 17 => "s17", 18 => "s18", 19 => "s19",
+                0 => "s0",
+                1 => "s1",
+                2 => "s2",
+                3 => "s3",
+                4 => "s4",
+                5 => "s5",
+                6 => "s6",
+                7 => "s7",
+                8 => "s8",
+                9 => "s9",
+                10 => "s10",
+                11 => "s11",
+                12 => "s12",
+                13 => "s13",
+                14 => "s14",
+                15 => "s15",
+                16 => "s16",
+                17 => "s17",
+                18 => "s18",
+                19 => "s19",
                 _ => "sX",
             };
             v.push_back(listing(env, Symbol::new(env, name), token));
@@ -870,8 +849,7 @@ mod tests {
         };
         // Stranger is not a registered merchant → MerchantNotFound.
         assert_eq!(
-            ctx.client
-                .try_batch_register_listings(&stranger, &listings),
+            ctx.client.try_batch_register_listings(&stranger, &listings),
             Err(Ok(MarketplaceError::MerchantNotFound))
         );
     }
@@ -888,6 +866,11 @@ mod tests {
                 &ctx.token,
                 &10u32,
             ),
+            Err(Ok(MarketplaceError::InvalidSku))
+        );
+    }
+
+    #[test]
     fn unregistered_merchant_returns_not_found() {
         let ctx = setup();
         let nobody = Address::generate(&ctx.env);
@@ -897,8 +880,7 @@ mod tests {
             v
         };
         assert_eq!(
-            ctx.client
-                .try_batch_register_listings(&nobody, &listings),
+            ctx.client.try_batch_register_listings(&nobody, &listings),
             Err(Ok(MarketplaceError::MerchantNotFound))
         );
     }
@@ -989,7 +971,8 @@ mod tests {
         let escrow = Address::generate(&ctx.env);
 
         // Register the escrow as the authorised decrementer.
-        ctx.client.set_authorized_escrow(&ctx.admin, &Some(escrow.clone()));
+        ctx.client
+            .set_authorized_escrow(&ctx.admin, &Some(escrow.clone()));
 
         ctx.client.register_sku(
             &ctx.owner,
@@ -1000,9 +983,9 @@ mod tests {
             &10u32,
         );
 
-        let remaining = ctx
-            .client
-            .decrement_stock(&escrow, &ctx.merchant_id, &sku(&ctx.env), &3u32);
+        let remaining =
+            ctx.client
+                .decrement_stock(&escrow, &ctx.merchant_id, &sku(&ctx.env), &3u32);
         assert_eq!(remaining, 7);
 
         let record = ctx.client.get_sku_record(&ctx.merchant_id, &sku(&ctx.env));
@@ -1040,12 +1023,8 @@ mod tests {
         );
 
         assert_eq!(
-            ctx.client.try_decrement_stock(
-                &ctx.admin,
-                &ctx.merchant_id,
-                &sku(&ctx.env),
-                &6u32,
-            ),
+            ctx.client
+                .try_decrement_stock(&ctx.admin, &ctx.merchant_id, &sku(&ctx.env), &6u32,),
             Err(Ok(MarketplaceError::OutOfStock))
         );
 
@@ -1068,12 +1047,8 @@ mod tests {
 
         let random = Address::generate(&ctx.env);
         assert_eq!(
-            ctx.client.try_decrement_stock(
-                &random,
-                &ctx.merchant_id,
-                &sku(&ctx.env),
-                &1u32,
-            ),
+            ctx.client
+                .try_decrement_stock(&random, &ctx.merchant_id, &sku(&ctx.env), &1u32,),
             Err(Ok(MarketplaceError::Unauthorized))
         );
     }
@@ -1100,12 +1075,13 @@ mod tests {
         });
 
         assert_eq!(
-            ctx.client.try_decrement_stock(
-                &ctx.admin,
-                &ctx.merchant_id,
-                &sku(&ctx.env),
-                &1u32,
-            ),
+            ctx.client
+                .try_decrement_stock(&ctx.admin, &ctx.merchant_id, &sku(&ctx.env), &1u32,),
+            Err(Ok(MarketplaceError::InvalidSku))
+        );
+    }
+
+    #[test]
     fn intra_batch_duplicate_sku_rejects_entire_batch() {
         let ctx = setup();
         let listings = {
@@ -1150,7 +1126,8 @@ mod tests {
         assert_eq!(ctx.client.get_authorized_escrow(), None);
 
         let escrow = Address::generate(&ctx.env);
-        ctx.client.set_authorized_escrow(&ctx.admin, &Some(escrow.clone()));
+        ctx.client
+            .set_authorized_escrow(&ctx.admin, &Some(escrow.clone()));
         assert_eq!(ctx.client.get_authorized_escrow(), Some(escrow));
 
         // Clear it.
@@ -1164,10 +1141,12 @@ mod tests {
         let other = Address::generate(&ctx.env);
         let escrow = Address::generate(&ctx.env);
         assert_eq!(
-            ctx.client
-                .try_set_authorized_escrow(&other, &Some(escrow)),
+            ctx.client.try_set_authorized_escrow(&other, &Some(escrow)),
             Err(Ok(MarketplaceError::Unauthorized))
         );
+    }
+
+    #[test]
     fn pre_existing_sku_rejects_entire_batch() {
         let ctx = setup();
         // Register "exist" first.
@@ -1186,8 +1165,7 @@ mod tests {
             v
         };
         assert_eq!(
-            ctx.client
-                .try_batch_register_listings(&ctx.owner, &second),
+            ctx.client.try_batch_register_listings(&ctx.owner, &second),
             Err(Ok(MarketplaceError::InvalidSku))
         );
         // "new" must NOT have been committed.

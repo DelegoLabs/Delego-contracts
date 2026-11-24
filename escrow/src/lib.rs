@@ -136,7 +136,7 @@ pub use admin_actions::{
     ADMIN_ACTION_DELAY_SECONDS,
 };
 pub use storage::{
-    ReentrancyGuard, ReentrancyGuardHandle, ReentrancyKey, ReentrancyStatus, with_reentrancy_guard,
+    ReentrancyGuardHandle, ReentrancyKey, ReentrancyStatus, with_reentrancy_guard,
 };
 
 /// Lifecycle state of an escrow.
@@ -2087,7 +2087,7 @@ pub enum ContractRole {
     Pauser = 4,
 }
 
-#[contracttype]
+#[contracttype(export = false)]
 pub enum DataKey {
     Admin,
     Escrow(u64),
@@ -2490,7 +2490,7 @@ pub enum EscrowError {
     /// Escrow has already been cancelled
     AlreadyCancelled = 27,
     /// Cannot cancel an unfunded escrow (only merchant/relayer can, after 300 ledger grace period)
-    UnfundedCancellationNotAllowed = 28,
+    UnfundedCancellationNotAllowed = 627,
     /// Escrow has already been funded
     AlreadyFunded = 28,
     /// Extension length must be > 0
@@ -2646,7 +2646,7 @@ pub enum EscrowError {
     /// Timelock extension not yet approved by both parties.
     TimelockExtensionPendingApproval = 455,
     /// Requested storage TTL extension is outside the supported bounds.
-    InvalidTtlExtension = 450,
+    InvalidTtlExtension = 628,
     /// Buyer refund + merchant payout + platform fee does not equal the
     /// deposited escrow principal (issue #547).
     ValueConservationViolation = 461,
@@ -2662,7 +2662,7 @@ pub enum EscrowError {
     /// Invalid checkpoint proof signature for tranche unlock (Issue #484).
     InvalidTrancheProof = 460,
     /// Courier public key not configured for this tranche escrow (Issue #484).
-    CourierPubkeyNotSet = 461,
+    CourierPubkeyNotSet = 629,
     /// Tranche escrows must be paid out through `unlock_tranche`.
     TrancheReleaseRequired = 462,
     /// Relayed release authorization nonce was already consumed.
@@ -2673,7 +2673,7 @@ pub enum EscrowError {
     BuyerReleaseKeyNotSet = 482,
     /// Escrow has already been shipped; mutual cancellation is no longer
     /// permitted (issue #487).
-    AlreadyShipped = 456,
+    AlreadyShipped = 630,
     /// Cross-contract token `transfer`/`transfer_from` call failed and no
     /// more specific reason could be determined (issue #481).
     TokenTransferFailed = 600,
@@ -2776,9 +2776,25 @@ pub enum EscrowError {
     InvalidMinFee = 490,
     /// The external DeFi pool has been emergency-detached and accepts no new
     /// deposits (issue #597).
-    DefiPoolDetached = 612,
+    DefiPoolDetached = 631,
     /// The external DeFi pool is already detached (issue #597).
     DefiPoolAlreadyDetached = 613,
+    /// Emergency rescue proposal not found.
+    EmergencyRescueProposalNotFound = 632,
+    /// Emergency rescue timelock has not elapsed.
+    EmergencyRescueTimelockNotElapsed = 633,
+    /// Emergency rescue approval threshold not met.
+    EmergencyRescueThresholdNotMet = 634,
+    /// Emergency rescue already executed.
+    EmergencyRescueAlreadyExecuted = 635,
+    /// Escrow is not eligible for emergency rescue.
+    EscrowNotEligibleForRescue = 636,
+    /// Sub-order allocations exceed the parent escrow amount.
+    ExceedsTotalEscrowAmount = 637,
+    /// Sub-order already resolved.
+    SubItemAlreadyResolved = 638,
+    /// Oracle invocation failed.
+    OracleInvocationFailed = 639,
 }
 
 pub fn execute_atomic_operation<F, T>(env: &Env, f: F) -> Result<T, EscrowError>
@@ -3003,6 +3019,19 @@ impl_escrow_error_try_from! {
     624 => LstCollateralNotFound,
     625 => LstCollateralAlreadyRecorded,
     626 => UnsafeHealthFactor,
+    627 => UnfundedCancellationNotAllowed,
+    628 => InvalidTtlExtension,
+    629 => CourierPubkeyNotSet,
+    630 => AlreadyShipped,
+    631 => DefiPoolDetached,
+    632 => EmergencyRescueProposalNotFound,
+    633 => EmergencyRescueTimelockNotElapsed,
+    634 => EmergencyRescueThresholdNotMet,
+    635 => EmergencyRescueAlreadyExecuted,
+    636 => EscrowNotEligibleForRescue,
+    637 => ExceedsTotalEscrowAmount,
+    638 => SubItemAlreadyResolved,
+    639 => OracleInvocationFailed,
 }
 
 impl TryFrom<&soroban_sdk::Error> for EscrowError {
@@ -3010,6 +3039,12 @@ impl TryFrom<&soroban_sdk::Error> for EscrowError {
     #[inline(always)]
     fn try_from(error: &soroban_sdk::Error) -> Result<Self, Self::Error> {
         <_ as TryFrom<soroban_sdk::Error>>::try_from(*error)
+    }
+}
+
+impl From<crate::storage::ReentrancyStatus> for EscrowError {
+    fn from(_: crate::storage::ReentrancyStatus) -> Self {
+        EscrowError::ReentrancyDetected
     }
 }
 
@@ -3158,6 +3193,16 @@ pub struct FeeTier {
     pub min_volume: i128,
     /// Platform fee in basis points charged at this tier (e.g., 200 = 2%).
     pub fee_bps: u32,
+}
+
+/// Administrative fee tier table entry used by [`admin_actions`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeTierConfig {
+    /// Minimum settled volume (inclusive) for this tier.
+    pub volume_threshold_stroops: i128,
+    /// Platform fee in basis points charged at this tier.
+    pub fee_basis_points: u32,
 }
 
 /// Emitted when a merchant's settled volume first reaches a higher fee tier
@@ -5483,6 +5528,14 @@ impl EscrowContract {
         }
         admin_actions::consume(&env, AdminAction::AddToken(token_address.clone()))?;
 
+        Self::add_token_internal(&env, admin, token_address)
+    }
+
+    fn add_token_internal(
+        env: &Env,
+        admin: Address,
+        token_address: Address,
+    ) -> Result<bool, EscrowError> {
         if Self::is_token_allowed(env.clone(), token_address.clone()) {
             return Ok(true);
         }
@@ -5529,6 +5582,14 @@ impl EscrowContract {
         }
         admin_actions::consume(&env, AdminAction::RemoveToken(token_address.clone()))?;
 
+        Self::remove_token_internal(&env, admin, token_address)
+    }
+
+    fn remove_token_internal(
+        env: &Env,
+        admin: Address,
+        token_address: Address,
+    ) -> Result<bool, EscrowError> {
         let index_opt: Option<u32> = env
             .storage()
             .instance()
@@ -6420,7 +6481,7 @@ impl EscrowContract {
             flags: EscrowFlags(0),
             order_id: order_id.clone(),
             created_at: env.ledger().timestamp(),
-            created_ledger: env.ledger().sequence(),
+            created_ledger: env.ledger().sequence() as u64,
             updated_at: env.ledger().timestamp(),
             timeout_ledger,
             receipt_token_id: None,
@@ -6849,13 +6910,13 @@ impl EscrowContract {
 
         // Check 300-ledger grace window: env.ledger().sequence() > escrow.created_ledger + 300
         let current_ledger = env.ledger().sequence();
-        let grace_ledger = record.created_ledger + 300;
-        if current_ledger <= grace_ledger {
+        let grace_ledger = record.created_ledger.saturating_add(300);
+        if current_ledger as u64 <= grace_ledger {
             return Err(EscrowError::TimeoutNotReached);
         }
 
         // Check if order is already cancelled or completed
-        if record.status == EscrowStatus::Cancelled || record.status == EscrowStatus::Completed || record.status == EscrowStatus::Refunded {
+        if record.status == EscrowStatus::Cancelled || record.status == EscrowStatus::Released || record.status == EscrowStatus::Refunded {
             return Err(EscrowError::AlreadyCancelled);
         }
 
@@ -6870,7 +6931,7 @@ impl EscrowContract {
         env.events().publish(
             (
                 symbol_short!("escrow"),
-                symbol_short!("intent_cancelled"),
+                symbol_short!("int_cncl"),
                 record.order_id.clone(),
             ),
             IntentCancelledEvent {
@@ -8327,13 +8388,12 @@ impl EscrowContract {
         let payload = TranchePayload {
             escrow_id,
             tranche_index,
-            checkpoint_hash,
+            checkpoint_hash: checkpoint_hash.clone(),
         }
         .to_xdr(&env);
         
         env.crypto()
-            .ed25519_verify(&config.courier_pubkey, &payload, &signature)
-            .map_err(|_| EscrowError::InvalidTrancheProof)?;
+            .ed25519_verify(&config.courier_pubkey, &payload, &signature);
 
         let seller = record.seller.clone();
         let caller = record.buyer.clone();
@@ -10849,7 +10909,6 @@ impl EscrowContract {
         );
 
         Ok(true)
-        Err(EscrowError::InvalidStatus)
     }
 
     /// Register the line items that make up a multi-item escrow (issue #363).
@@ -10916,6 +10975,195 @@ impl EscrowContract {
         Ok(true)
     }
 
+    /// Register merchant sub-orders under a funded parent escrow.
+    ///
+    /// Buyer or admin only. The sum of sub-order amounts may not exceed the
+    /// parent escrow amount, and sub-orders may only be registered once.
+    pub fn register_sub_order(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        orders: Vec<SubOrder>,
+    ) -> Result<(), EscrowError> {
+        caller.require_auth();
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        if record.status != EscrowStatus::Funded {
+            return Err(EscrowError::InvalidStatus);
+        }
+        if caller != record.buyer && !Self::is_admin(env.clone(), caller.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+        if !sub_orders::get(&env, escrow_id).is_empty() {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let total = sub_orders::sum_amounts(&orders)?;
+        if total > record.amount {
+            return Err(EscrowError::ExceedsTotalEscrowAmount);
+        }
+        Self::enter_release(&env)?;
+        sub_orders::register(&env, escrow_id, total, orders)?;
+        Self::exit_release(&env);
+        Ok(())
+    }
+
+    /// Return one registered sub-order by id.
+    pub fn get_sub_order(
+        env: Env,
+        escrow_id: u64,
+        sub_order_id: u64,
+    ) -> Result<SubOrder, EscrowError> {
+        let orders = sub_orders::get(&env, escrow_id);
+        for i in 0..orders.len() {
+            let order = orders.get(i).ok_or(EscrowError::NotFound)?;
+            if order.sub_order_id == sub_order_id {
+                return Ok(order);
+            }
+        }
+        Err(EscrowError::NotFound)
+    }
+
+    /// Release one funded sub-order to its merchant.
+    ///
+    /// Buyer or admin only. Transfers the sub-order amount exactly once and
+    /// advances the parent escrow accounting.
+    pub fn release_sub_order(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        sub_order_id: u64,
+    ) -> Result<SubOrder, EscrowError> {
+        caller.require_auth();
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        if !matches!(record.status, EscrowStatus::Funded | EscrowStatus::Disputed) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        if caller != record.buyer && !Self::is_admin(env.clone(), caller.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        Self::enter_release(&env)?;
+        let (order, parent_status) = sub_orders::release(&env, escrow_id, sub_order_id)?;
+
+        let token = soroban_sdk::token::Client::new(&env, &record.token);
+        token.transfer(
+            &env.current_contract_address(),
+            &order.merchant,
+            &order.amount,
+        );
+        record.released_amount = record
+            .released_amount
+            .checked_add(order.amount)
+            .ok_or(EscrowError::MathOverflow)?;
+        if let Some(status) = parent_status {
+            record.status = status;
+        }
+        record.updated_at = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &record);
+        Self::exit_release(&env);
+        Ok(order)
+    }
+
+    /// Mark one funded sub-order as disputed without locking sibling funds.
+    ///
+    /// The buyer, the sub-order merchant, or an admin may open the dispute.
+    pub fn dispute_sub_order(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        sub_order_id: u64,
+    ) -> Result<SubOrder, EscrowError> {
+        caller.require_auth();
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        if !matches!(record.status, EscrowStatus::Funded | EscrowStatus::Disputed) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let existing = Self::get_sub_order(env.clone(), escrow_id, sub_order_id)?;
+        if caller != record.buyer
+            && caller != existing.merchant
+            && !Self::is_admin(env.clone(), caller.clone())
+        {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        Self::enter_release(&env)?;
+        let order = sub_orders::dispute(&env, escrow_id, sub_order_id)?;
+        record.status = EscrowStatus::Disputed;
+        record.updated_at = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &record);
+        Self::exit_release(&env);
+        Ok(order)
+    }
+
+    /// Resolve a disputed sub-order as `Released` or `Refunded`.
+    ///
+    /// Admin only. Transfers the sub-order amount to the merchant or buyer and
+    /// advances the parent escrow accounting exactly once.
+    pub fn resolve_sub_order(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        sub_order_id: u64,
+        outcome: EscrowStatus,
+    ) -> Result<SubOrder, EscrowError> {
+        Self::require_admin(&env, &caller)?;
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        if !matches!(outcome, EscrowStatus::Released | EscrowStatus::Refunded) {
+            return Err(EscrowError::InvalidStatus);
+        }
+
+        Self::enter_release(&env)?;
+        let (order, parent_status) =
+            sub_orders::resolve(&env, escrow_id, sub_order_id, outcome)?;
+
+        let token = soroban_sdk::token::Client::new(&env, &record.token);
+        let contract = env.current_contract_address();
+        match order.status {
+            EscrowStatus::Released => {
+                token.transfer(&contract, &order.merchant, &order.amount);
+                record.released_amount = record
+                    .released_amount
+                    .checked_add(order.amount)
+                    .ok_or(EscrowError::MathOverflow)?;
+            }
+            EscrowStatus::Refunded => {
+                token.transfer(&contract, &record.buyer, &order.amount);
+                record.refunded_amount = record
+                    .refunded_amount
+                    .checked_add(order.amount)
+                    .ok_or(EscrowError::MathOverflow)?;
+            }
+            _ => return Err(EscrowError::InvalidStatus),
+        }
+
+        record.status = parent_status.unwrap_or(EscrowStatus::Disputed);
+        record.updated_at = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &record);
+        Self::exit_release(&env);
+        Ok(order)
+    }
+
     /// Return the registered line items of a multi-item escrow (issue #363).
     pub fn get_sub_order_items(env: Env, escrow_id: u64) -> soroban_sdk::Vec<SubOrderItem> {
         env.storage()
@@ -10965,34 +11213,6 @@ impl EscrowContract {
             return Err(EscrowError::NotDisputed);
         }
 
-        let items: soroban_sdk::Vec<SubOrderItem> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::InspectionPeriodConfig(escrow_id))
-            .ok_or(EscrowError::InspectionConfigNotSet)?;
-
-        let current_ledger = env.ledger().sequence();
-        if current_ledger < inspection_config.auto_release_ledger {
-            return Err(EscrowError::InspectionAutoReleaseNotReady);
-        }
-
-        let remaining = record.amount - record.released_amount - record.refunded_amount;
-        if remaining <= 0 {
-            return Err(EscrowError::ZeroAmount);
-        }
-
-        blend_yield::redeem(&env, record.escrow_id);
-        let token_client = soroban_sdk::token::Client::new(&env, &record.token);
-        let payout = Self::compute_payout(&env, remaining)?;
-        Self::distribute_fee(&env, &token_client, payout.fee)?;
-        token_client.transfer(
-            &env.current_contract_address(),
-            &record.seller,
-            &payout.seller_net,
-        );
-
-        record.released_amount += remaining;
-        record.status = EscrowStatus::Released;
         if record.status != EscrowStatus::Disputed {
             return Err(EscrowError::NotDisputed);
         }
@@ -11075,11 +11295,6 @@ impl EscrowContract {
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("subres"), escrow_id),
-            (
-                symbol_short!("escrow"),
-                symbol_short!("subres"),
-                escrow_id,
-            ),
             SubItemResolvedEvent {
                 escrow_id,
                 item_id: stored.item_id.clone(),

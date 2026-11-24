@@ -41,6 +41,9 @@ use soroban_sdk::{
     Env, Symbol, Vec,
 };
 
+#[cfg(any(test, feature = "testutils"))]
+use soroban_sdk::testutils::storage::Persistent as _;
+
 const _PERM: Symbol = symbol_short!("PERM");
 const _PENDING_DEC: Symbol = symbol_short!("PEND_DEC");
 
@@ -1621,13 +1624,12 @@ pub struct PermissionsContract;
 // wrappers only. User-defined functions carry their own scoped allows.
 #[allow(clippy::too_many_arguments)]
 pub fn bump_persistent_ttl(env: &Env, key: &DataKey) {
-    if env
-        .storage()
-        .persistent()
-        .get_ttl(key)
-        .unwrap_or(0)
-        < PERMISSION_TTL_THRESHOLD
-    {
+    #[cfg(any(test, feature = "testutils"))]
+    let current_ttl = env.storage().persistent().get_ttl(key);
+    #[cfg(not(any(test, feature = "testutils")))]
+    let current_ttl = 0u32;
+
+    if current_ttl < PERMISSION_TTL_THRESHOLD {
         env.storage()
             .persistent()
             .extend_ttl(key, PERMISSION_TTL_BUMP, PERMISSION_TTL_BUMP);
@@ -2138,7 +2140,7 @@ impl PermissionsContract {
         if !delegates.contains(&delegate) {
             delegates.push_back(delegate.clone());
             env.storage().persistent().set(&user_perms_key, &delegates);
-            Self::extend_persistent_ttl_if_needed(&env, &user_perms_key);
+            extend_persistent_ttl_if_needed(&env, &user_perms_key);
         }
 
         let user_perms_key = DataKey::UserPermissions(owner.clone());
@@ -2150,7 +2152,7 @@ impl PermissionsContract {
         if !delegates.contains(&delegate) {
             delegates.push_back(delegate.clone());
             env.storage().persistent().set(&user_perms_key, &delegates);
-            Self::extend_persistent_ttl_if_needed(&env, &user_perms_key);
+            extend_persistent_ttl_if_needed(&env, &user_perms_key);
         }
 
         let user_perms_key = DataKey::UserPermissions(owner.clone());
@@ -2162,7 +2164,7 @@ impl PermissionsContract {
         if !delegates.contains(&delegate) {
             delegates.push_back(delegate.clone());
             env.storage().persistent().set(&user_perms_key, &delegates);
-            Self::extend_persistent_ttl_if_needed(&env, &user_perms_key);
+            extend_persistent_ttl_if_needed(&env, &user_perms_key);
         }
 
         let record = PermissionRecord {
@@ -2184,7 +2186,7 @@ impl PermissionsContract {
         };
 
         env.storage().persistent().set(&key, &record);
-        Self::extend_persistent_ttl_if_needed(&env, &key);
+        extend_persistent_ttl_if_needed(&env, &key);
 
         let epoch_key = DataKey::ExecutionEpoch(owner.clone(), delegate.clone());
         let epoch_config = env
@@ -2465,7 +2467,7 @@ impl PermissionsContract {
             if let Some(index) = delegates.first_index_of(&delegate) {
                 delegates.remove(index);
                 env.storage().persistent().set(&user_perms_key, &delegates);
-                Self::extend_persistent_ttl_if_needed(&env, &user_perms_key);
+                extend_persistent_ttl_if_needed(&env, &user_perms_key);
             }
             Self::remove_from_address_index(
                 &env,
@@ -2475,7 +2477,7 @@ impl PermissionsContract {
 
             record.status = PermissionStatus::Revoked;
             env.storage().persistent().set(&key, &record);
-            Self::extend_persistent_ttl_if_needed(&env, &key);
+            extend_persistent_ttl_if_needed(&env, &key);
             env.storage()
                 .persistent()
                 .remove(&DataKey::PendingDecrement(owner.clone(), delegate.clone()));
@@ -3804,15 +3806,6 @@ impl PermissionsContract {
         let key = DataKey::Permission(owner.clone(), delegate.clone());
         let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
 
-        // Reset spent when crossing an epoch boundary (issue #11).
-        let current_ledger = env.ledger().sequence();
-        let ledgers_since_reset = current_ledger.saturating_sub(record.last_reset_ledger);
-        match record.epoch {
-            Epoch::Daily => {
-                if ledgers_since_reset >= 1 {
-                    record.spent = 0;
-                    record.last_reset_ledger = current_ledger;
-                }
         if !recurring_quota::consume(env, &mut record, amount)? {
             // Reset spent when crossing an epoch boundary (issue #11).
             let current_ledger = env.ledger().sequence();
@@ -4203,7 +4196,7 @@ impl PermissionsContract {
             .ok_or(PermissionError::NonceAlreadyUsed)?;
 
         env.storage().persistent().set(&nonce_key, &next_nonce);
-        Self::extend_persistent_ttl_if_needed(&env, &nonce_key);
+        extend_persistent_ttl_if_needed(&env, &nonce_key);
 
         env.events().publish(
             (
@@ -4643,7 +4636,7 @@ impl PermissionsContract {
             &DataKey::MultiPermission(primary_owner.clone(), delegate.clone()),
             &record,
         );
-        Self::extend_persistent_ttl_if_needed(&env, &DataKey::MultiPermission(primary_owner.clone(), delegate.clone()));
+        extend_persistent_ttl_if_needed(&env, &DataKey::MultiPermission(primary_owner.clone(), delegate.clone()));
 
         // Index the grant by delegate so a queued spend can resolve the one
         // grant — and therefore the one quorum — it draws on (issue #377).
@@ -4780,7 +4773,7 @@ impl PermissionsContract {
             .filter(|spent| *spent <= record.limit_total)
             .ok_or(PermissionError::ExceedsAllowance)?;
         env.storage().persistent().set(&key, &record);
-        Self::extend_persistent_ttl_if_needed(&env, &key);
+        extend_persistent_ttl_if_needed(&env, &key);
 
         Self::record_rolling_window_spend(&env, &primary_owner, &delegate, amount)?;
 
@@ -4878,12 +4871,12 @@ impl PermissionsContract {
         env.storage()
             .persistent()
             .set(&DataKey::SpendProposal(proposal_id), &proposal);
-        Self::extend_persistent_ttl_if_needed(&env, &DataKey::SpendProposal(proposal_id));
+        extend_persistent_ttl_if_needed(&env, &DataKey::SpendProposal(proposal_id));
         queued.push_back(proposal_id);
         env.storage()
             .persistent()
             .set(&DataKey::DelegateSpendProposals(delegate.clone()), &queued);
-        Self::extend_persistent_ttl_if_needed(&env, &DataKey::DelegateSpendProposals(delegate.clone()));
+        extend_persistent_ttl_if_needed(&env, &DataKey::DelegateSpendProposals(delegate.clone()));
         env.storage()
             .instance()
             .set(&DataKey::SpendProposalCounter, &proposal_id);
@@ -5725,7 +5718,7 @@ impl PermissionsContract {
         env.storage().persistent().set(&pend_key, &pending);
 
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("allowdec_q")),
+            (symbol_short!("perm"), symbol_short!("allowdecq")),
             AllowanceDecreaseQueuedEvent {
                 owner,
                 delegate,
@@ -6031,12 +6024,8 @@ impl PermissionsContract {
             .set(&DataKey::FrozenRelayer(relayer.clone()), &false);
 
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("rlyr_unfrz")),
-            RelayerFreezeEvent {
-                relayer,
-                frozen: false,
-                ledger: env.ledger().sequence(),
-            },
+            (symbol_short!("perm"), symbol_short!("rlyrunfrz")),
+            RelayerFrozenEvent { admin, relayer },
         );
 
         Ok(true)

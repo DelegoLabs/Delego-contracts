@@ -31,6 +31,8 @@ fn escrow_delegates_yield_to_lending_pool() {
         treasury,
         min_amount: 100i128,
         max_amount: 10_000i128,
+        min_fee_floor_stroops: 0,
+        max_fee_ceiling_stroops: 0,
     };
     let escrow_id_addr = env.register(EscrowContract, (escrow_config,));
     let escrow = EscrowContractClient::new(&env, &escrow_id_addr);
@@ -92,6 +94,8 @@ fn escrow_falls_back_when_pool_paused() {
         treasury,
         min_amount: 100i128,
         max_amount: 10_000i128,
+        min_fee_floor_stroops: 0,
+        max_fee_ceiling_stroops: 0,
     };
     let escrow_id_addr = env.register(EscrowContract, (escrow_config,));
     let escrow = EscrowContractClient::new(&env, &escrow_id_addr);
@@ -147,6 +151,8 @@ fn escrow_falls_back_when_pool_reports_zero() {
         treasury,
         min_amount: 100i128,
         max_amount: 10_000i128,
+        min_fee_floor_stroops: 0,
+        max_fee_ceiling_stroops: 0,
     };
     let escrow_id_addr = env.register(EscrowContract, (escrow_config,));
     let escrow = EscrowContractClient::new(&env, &escrow_id_addr);

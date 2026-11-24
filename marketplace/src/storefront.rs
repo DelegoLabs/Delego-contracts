@@ -42,7 +42,7 @@ pub fn set_storefront_metadata(
     // Suspended merchants may not update their storefront while under
     // policy review; the suspension must be lifted before metadata changes.
     if merchant.status == MerchantStatus::Suspended {
-        return Err(MarketplaceError::MerchantSuspended);
+        return Err(MarketplaceError::MerchantFrozen);
     }
 
     MarketplaceContract::check_not_frozen_or_closed(&merchant)?;
@@ -61,11 +61,9 @@ pub fn set_storefront_metadata(
     };
     let key = DataKey::StorefrontMetadata(merchant_id);
     env.storage().persistent().set(&key, &metadata);
-    env.storage().persistent().extend_ttl(
-        &key,
-        PERSISTENT_BUMP_THRESHOLD,
-        PERSISTENT_BUMP_AMOUNT,
-    );
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
     env.events().publish(
         (
@@ -105,12 +103,7 @@ fn is_valid_ipfs_cid(cid: &String) -> bool {
                     .iter()
                     .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(byte))
         }
-        b'z' => {
-            len >= 10
-                && bytes[1..len as usize]
-                    .iter()
-                    .all(|byte| is_base58(*byte))
-        }
+        b'z' => len >= 10 && bytes[1..len as usize].iter().all(|byte| is_base58(*byte)),
         _ => false,
     }
 }
