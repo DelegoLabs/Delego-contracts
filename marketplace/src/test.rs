@@ -1,13 +1,11 @@
 use crate::{
     normalize_symbol, AdminAcceptedEvent, AdminProposedEvent, CategoryChange, CategoryEntry,
-    DataKey, MarketplaceContract, MarketplaceContractClient, MarketplaceError, Merchant,
-    MerchantCategoryChangedEvent, MerchantCursor, MerchantOperationalView,
+    CommissionTier, DataKey, MarketplaceContract, MarketplaceContractClient, MarketplaceError,
+    Merchant, MerchantCategoryChangedEvent, MerchantCursor, MerchantOperationalView,
     MerchantRegisteredEvent, MerchantStats, MerchantStatus, MerchantValidationError,
-    RegisterParams, VerificationPolicy, Verifier, VerifierPage,
-    MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN, MAX_METADATA_LEN, MAX_NAME_LEN, MAX_VERIFIERS,
-    CommissionTier, MerchantVolumeRecord,
-    TreasurySplitConfig, RESERVE_LOCK_LEDGERS,
-    VerifierPage, MAX_VERIFIERS,
+    MerchantVolumeRecord, RegisterParams, TreasurySplitConfig, VerificationPolicy, Verifier,
+    VerifierPage, VerifierPage, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN, MAX_METADATA_LEN,
+    MAX_NAME_LEN, MAX_VERIFIERS, MAX_VERIFIERS, RESERVE_LOCK_LEDGERS,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -1177,15 +1175,20 @@ fn test_commission_tier_defaults_and_configuration() {
         min_settled_volume: 0,
         commission_rate_bps: 400,
     });
-    let err = f
-        .client
-        .try_set_commission_tiers(&stranger, &new_tiers);
+    let err = f.client.try_set_commission_tiers(&stranger, &new_tiers);
     assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::Unauthorized);
 
     // Admin can reconfigure tiers.
     f.client.set_commission_tiers(&f.admin, &new_tiers);
     assert_eq!(f.client.get_commission_tiers().len(), 1);
-    assert_eq!(f.client.get_commission_tiers().get(0).unwrap().commission_rate_bps, 400);
+    assert_eq!(
+        f.client
+            .get_commission_tiers()
+            .get(0)
+            .unwrap()
+            .commission_rate_bps,
+        400
+    );
 }
 
 #[test]
@@ -1392,7 +1395,10 @@ fn test_merchant_operational_view_unregistered_merchant_not_found() {
     let f = TestFixture::setup();
 
     let err = f.client.try_get_merchant_operational_view(&999);
-    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::MerchantNotFound);
+    assert_eq!(
+        err.unwrap_err().unwrap(),
+        MarketplaceError::MerchantNotFound
+    );
 }
 
 #[test]
@@ -2034,12 +2040,8 @@ fn test_liquidation_reserve_locked_for_high_value_order() {
     let order_id: u64 = 1;
     let order_value: i128 = 20_000;
     f.env.ledger().set_sequence_number(1_000);
-    f.client.lock_liquidation_reserve(
-        &merchant_id,
-        &order_id,
-        &order_value,
-        &buyer,
-    );
+    f.client
+        .lock_liquidation_reserve(&merchant_id, &order_id, &order_value, &buyer);
 
     let reserve = f
         .client
@@ -2147,8 +2149,7 @@ fn test_liquidation_reserve_can_be_liquidated_by_arbiter() {
     f.client.set_reserve_token(&f.admin, &token_id);
     token_client.mint(&f._contract_id, &2_000);
 
-    f.client
-        .liquidate_reserve(&arbiter, &order_id, &buyer);
+    f.client.liquidate_reserve(&arbiter, &order_id, &buyer);
 
     assert_eq!(token_client.balance(&buyer), 2_000);
     assert_eq!(token_client.balance(&f._contract_id), 0);
@@ -2909,7 +2910,7 @@ fn test_merchant_cancellation_penalty_deducts_bond_and_compensates_buyer() {
         &f.admin,
         &crate::CancellationPenaltyConfig {
             penalty_amount_stroops: 2_000_000,
-            max_cancellations_before_suspension: 2,
+            max_cancellations: 2,
         },
     );
 
@@ -2919,18 +2920,18 @@ fn test_merchant_cancellation_penalty_deducts_bond_and_compensates_buyer() {
     f.client
         .record_merchant_cancellation(&f.admin, &merchant_id, &buyer);
     assert_eq!(token_client.balance(&buyer), 2_000_000);
-    assert_eq!(f.client.get_merchant_cancellation_strikes(&merchant_id), 1);
+    assert_eq!(f.client.get_cancellation_strikes(&merchant_id), 1);
     assert_eq!(
         f.client.get_merchant(&merchant_id).status,
         MerchantStatus::Registered
     );
 
-    // Second cancellation reaches `max_cancellations_before_suspension`: the
+    // Second cancellation reaches `max_cancellations`: the
     // merchant is automatically suspended and the buyer is compensated again.
     f.client
         .record_merchant_cancellation(&f.admin, &merchant_id, &buyer);
     assert_eq!(token_client.balance(&buyer), 4_000_000);
-    assert_eq!(f.client.get_merchant_cancellation_strikes(&merchant_id), 2);
+    assert_eq!(f.client.get_cancellation_strikes(&merchant_id), 2);
     assert_eq!(
         f.client.get_merchant(&merchant_id).status,
         MerchantStatus::Suspended
@@ -2960,6 +2961,6 @@ fn test_merchant_cancellation_without_config_errors() {
         .try_record_merchant_cancellation(&f.admin, &merchant_id, &buyer);
     assert_eq!(
         result,
-        Err(Ok(MarketplaceError::CancellationPenaltyNotConfigured))
+        Err(Ok(MarketplaceError::CancellationPenaltyMissing))
     );
 }

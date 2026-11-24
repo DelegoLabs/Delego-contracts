@@ -87,7 +87,10 @@ pub trait FlagReportingTrait {
 
     /// Resolve a review flag. Upheld reports remove fraudulent review and reward reporter.
     /// Frivolous reports result in bond forfeiture.
-    fn resolve_flag(
+    ///
+    /// Named distinctly from the entity-flag `resolve_flag` entry point because
+    /// both are exposed on `ReputationContract` and would otherwise collide.
+    fn resolve_review_flag(
         env: Env,
         arbiter: Address,
         flag_id: u64,
@@ -199,17 +202,15 @@ pub fn flag_review(
         PERSISTENT_BUMP_AMOUNT,
     );
 
-    env.events().publish(
-        (symbol_short!("reput"), symbol_short!("flg_file")),
-        flag,
-    );
+    env.events()
+        .publish((symbol_short!("reput"), symbol_short!("flg_file")), flag);
 
     Ok(true)
 }
 
 /// Resolves a review flag. If upheld, removes fraudulent review and rewards reporter.
 /// If frivolous, slashes the reporter's bond.
-pub fn resolve_flag(
+pub fn resolve_review_flag(
     env: Env,
     arbiter: Address,
     flag_id: u64,
@@ -269,9 +270,10 @@ pub fn resolve_flag(
         // Frivolous report: slash bond (forfeiture)
         let slashed_key = DataKey::TotalSlashedReviewBonds;
         let total_slashed: i128 = env.storage().instance().get(&slashed_key).unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&slashed_key, &total_slashed.saturating_add(flag.bond_amount));
+        env.storage().instance().set(
+            &slashed_key,
+            &total_slashed.saturating_add(flag.bond_amount),
+        );
 
         (0i128, flag.bond_amount)
     };
@@ -323,11 +325,7 @@ fn remove_fraudulent_review(env: &Env, review_id: u64) {
         .get::<_, ReviewCommitment>(&commitment_key)
     {
         let merchant_key = DataKey::MerchantReviewCommitments(commitment.merchant.clone());
-        if let Some(review_ids) = env
-            .storage()
-            .persistent()
-            .get::<_, Vec<u64>>(&merchant_key)
-        {
+        if let Some(review_ids) = env.storage().persistent().get::<_, Vec<u64>>(&merchant_key) {
             let mut filtered = Vec::new(env);
             for id in review_ids.iter() {
                 if id != review_id {

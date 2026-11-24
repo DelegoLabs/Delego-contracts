@@ -25,9 +25,7 @@
 //! and a stealth key cannot be reused to link several reviews together.
 
 use crate::{ReputationError, PERSISTENT_BUMP_AMOUNT, PERSISTENT_BUMP_THRESHOLD};
-use soroban_sdk::{
-    contracttype, symbol_short, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol,
-};
+use soroban_sdk::{contracttype, symbol_short, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol};
 
 /// Upper bound on the encrypted review ciphertext, in bytes.
 pub const MAX_ENCRYPTED_PAYLOAD_LEN: u32 = 4_096;

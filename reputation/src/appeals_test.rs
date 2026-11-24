@@ -87,6 +87,7 @@ fn write_review(env: &Env, s: &Setup, review_id: u64, merchant: &Address, rating
         rating,
         content_hash: BytesN::from_array(env, &[review_id as u8; 32]),
         submitted_ledger: env.ledger().sequence(),
+        verified_purchase: false,
     };
     env.as_contract(&s.contract_id, || {
         env.storage()
