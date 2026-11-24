@@ -14,6 +14,6 @@ mod mock_lending_pool;
 mod reputation_reader;
 
 pub use lending_pool::{LendingPoolClient, LendingPoolInterface};
-pub use lifecycle::ContractLifecycleState;
+pub use lifecycle::{ContractLifecycleState, PauseInfo};
 pub use mock_lending_pool::{MockLendingPool, MockLendingPoolClient};
 pub use reputation_reader::ReputationReaderTrait;
