@@ -7,7 +7,7 @@ use crate::{
     MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN, MAX_METADATA_LEN, MAX_NAME_LEN, MAX_VERIFIERS,
     CommissionTier, MerchantVolumeRecord,
     TreasurySplitConfig, RESERVE_LOCK_LEDGERS,
-    VerifierPage, MAX_VERIFIERS,
+    VerifierPage, MAX_VERIFIERS, LiquidationReserve,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
