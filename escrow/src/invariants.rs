@@ -67,7 +67,11 @@ pub fn verify_value_conservation(record: &EscrowRecord) -> bool {
 ///   unauthorized reversal of completed transactions.
 pub fn verify_terminal_state_irrevocability(record: &EscrowRecord) -> bool {
     match record.status {
-        EscrowStatus::Released | EscrowStatus::Refunded | EscrowStatus::Cancelled => {
+        EscrowStatus::Released
+        | EscrowStatus::Refunded
+        | EscrowStatus::Cancelled
+        | EscrowStatus::CancelledByMutualConsent
+        | EscrowStatus::SettledWithPartialRefund => {
             // Terminal states should have complete distribution
             match record.status {
                 EscrowStatus::Released => {
@@ -81,6 +85,14 @@ pub fn verify_terminal_state_irrevocability(record: &EscrowRecord) -> bool {
                 EscrowStatus::Cancelled => {
                     // For Cancelled state, escrow was never funded or was refunded
                     record.released_amount == 0
+                }
+                EscrowStatus::CancelledByMutualConsent => {
+                    record.released_amount == 0 && record.refunded_amount == record.amount
+                }
+                EscrowStatus::SettledWithPartialRefund => {
+                    record.released_amount > 0
+                        && record.refunded_amount > 0
+                        && record.released_amount + record.refunded_amount == record.amount
                 }
                 _ => unreachable!(),
             }
@@ -175,6 +187,14 @@ pub fn verify_status_distribution_consistency(record: &EscrowRecord) -> bool {
             record.refunded_amount == record.amount && record.released_amount == 0
         }
         EscrowStatus::Cancelled => record.released_amount == 0,
+        EscrowStatus::CancelledByMutualConsent => {
+            record.released_amount == 0 && record.refunded_amount == record.amount
+        }
+        EscrowStatus::SettledWithPartialRefund => {
+            record.released_amount > 0
+                && record.refunded_amount > 0
+                && record.released_amount + record.refunded_amount == record.amount
+        }
         _ => true, // Non-terminal states allow partial distributions
     }
 }
@@ -362,6 +382,16 @@ mod tests {
         let cancelled = mock_escrow(&env, 1000, 0, 0, EscrowStatus::Cancelled);
         assert!(verify_terminal_state_irrevocability(&cancelled));
 
+        // Valid mutual cancellation
+        let mutual_cancel =
+            mock_escrow(&env, 1000, 0, 1000, EscrowStatus::CancelledByMutualConsent);
+        assert!(verify_terminal_state_irrevocability(&mutual_cancel));
+
+        // Valid partial refund settlement
+        let partial =
+            mock_escrow(&env, 1000, 600, 400, EscrowStatus::SettledWithPartialRefund);
+        assert!(verify_terminal_state_irrevocability(&partial));
+
         // Invalid Released (partial release)
         let bad_released = mock_escrow(&env, 1000, 500, 0, EscrowStatus::Released);
         assert!(!verify_terminal_state_irrevocability(&bad_released));
@@ -435,8 +465,25 @@ mod tests {
     #[test]
     fn test_all_terminal_state_transitions_blocked() {
         use EscrowStatus::*;
-        let terminal_states = [Released, Refunded, Cancelled];
-        let all_states = [Created, Funded, Released, Refunded, Disputed, Cancelled];
+        let terminal_states = [
+            Released,
+            Refunded,
+            Cancelled,
+            CancelledByMutualConsent,
+            SettledWithPartialRefund,
+        ];
+        let all_states = [
+            Created,
+            Funded,
+            Inspection,
+            Released,
+            Refunded,
+            Disputed,
+            Cancelled,
+            InitialRuling,
+            CancelledByMutualConsent,
+            SettledWithPartialRefund,
+        ];
 
         for terminal in &terminal_states {
             for target in &all_states {
