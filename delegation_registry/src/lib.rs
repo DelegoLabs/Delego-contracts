@@ -91,7 +91,8 @@ pub struct ContractVersion {
 #[allow(missing_docs)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DelegationStatus {
-    /// Delegation is pending activation.
+    /// Reserved for wire/XDR compatibility; current lifecycle transitions do not enter this state.
+    /// Keep this variant to preserve the serialized enum discriminants.
     Pending,
     /// Delegation is active.
     Active,
@@ -3172,50 +3173,6 @@ impl DelegationRegistry {
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
-    }
-
-    /// Lazily migrates a delegation record to the V2 schema (issue #574).
-    ///
-    /// Reads the V2 entry first; when it is missing, falls back to the legacy
-    /// V1 entry keyed by owner, converts it to the current schema, writes it
-    /// back under the V2 key, removes the V1 entry and returns the migrated
-    /// record. Returns `None` when neither layout holds a record, so callers
-    /// can surface `NotFound` without panicking.
-    fn load_delegation(env: &Env, delegation_id: u64, owner: &Address) -> Option<DelegationRecord> {
-        // Fast path: the canonical id-keyed record is already current.
-        if let Some(record) = env
-            .storage()
-            .persistent()
-            .get::<_, DelegationRecord>(&DataKey::Delegation(delegation_id))
-        {
-            return Some(record);
-        }
-
-        // V2 schema keyed by owner + label.
-        let v1_key = DataKey::DelegationV1(owner.clone());
-        let v1: Option<DelegationRecordV1> = env.storage().persistent().get(&v1_key);
-        let v1 = v1?;
-
-        if v1.id != delegation_id {
-            return None;
-        }
-
-        let record = v1.into_v2();
-
-        // Write the migrated record under both the canonical and V2 keys so
-        // subsequent reads take the fast path, then drop the legacy entry.
-        env.storage()
-            .persistent()
-            .set(&DataKey::Delegation(delegation_id), &record);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Delegation(delegation_id),
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-        Self::write_delegation_v2(env, &record);
-        env.storage().persistent().remove(&v1_key);
-
-        Some(record)
     }
 
     /// Returns the current delegation storage schema version.
