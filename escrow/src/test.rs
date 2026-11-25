@@ -4479,6 +4479,35 @@ mod schema_and_milestone_tests {
                     .set(&FeeTokenKey::Balance(to), &(to_bal + net));
             }
 
+            /// Allowance-based transfer with the same 10 % fee (allowances are
+            /// not tracked by this mock; the spender only needs to authorize).
+            pub fn transfer_from(
+                env: Env,
+                spender: Address,
+                from: Address,
+                to: Address,
+                amount: i128,
+            ) {
+                spender.require_auth();
+                let from_bal: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&FeeTokenKey::Balance(from.clone()))
+                    .unwrap_or(0);
+                env.storage()
+                    .persistent()
+                    .set(&FeeTokenKey::Balance(from), &(from_bal - amount));
+                let net = amount * 9 / 10;
+                let to_bal: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&FeeTokenKey::Balance(to.clone()))
+                    .unwrap_or(0);
+                env.storage()
+                    .persistent()
+                    .set(&FeeTokenKey::Balance(to), &(to_bal + net));
+            }
+
             /// Return the token balance of `id`.
             pub fn balance(env: Env, id: Address) -> i128 {
                 env.storage()
@@ -4487,6 +4516,58 @@ mod schema_and_milestone_tests {
                     .unwrap_or(0)
             }
         }
+    }
+
+    /// `batch_create_escrows` must reject fee-on-transfer tokens atomically:
+    /// no escrow is persisted and the call fails with `DepositUnderfunded`.
+    #[test]
+    fn test_batch_create_escrows_fee_on_transfer_aborts_atomically() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+
+        let fee_token_id = env.register(fee_token::FeeToken, ());
+        let fee_token_client = fee_token::FeeTokenClient::new(&env, &fee_token_id);
+        fee_token_client.mint(&buyer, &10_000i128);
+
+        let escrow_contract_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: admin.clone(),
+                fee_bps: 0u32,
+                treasury,
+                min_amount: 100i128,
+                max_amount: 10_000i128,
+            },),
+        );
+        let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
+        escrow_client.add_token(&admin, &fee_token_id);
+
+        let current = env.ledger().sequence();
+        let mut items = Vec::new(&env);
+        for i in 0..2u8 {
+            items.push_back(crate::BatchEscrowItem {
+                seller: seller.clone(),
+                token: fee_token_id.clone(),
+                amount: 1_000i128,
+                order_id: BytesN::from_array(&env, &[20 + i; 32]),
+                timeout_ledger: current + 100,
+            });
+        }
+
+        let result = escrow_client.try_batch_create_escrows(&buyer, &items);
+        assert_eq!(result, Err(Ok(EscrowError::DepositUnderfunded)));
+        // Atomic: no escrow persisted, contract holds nothing.
+        assert_eq!(
+            escrow_client.try_get_escrow(&1u64),
+            Err(Ok(EscrowError::NotFound))
+        );
+        assert_eq!(fee_token_client.balance(&escrow_contract_id), 0);
+        assert_eq!(fee_token_client.balance(&buyer), 10_000i128);
     }
 
     /// `deposit` with a fee-on-transfer token: `escrow.amount` must reflect

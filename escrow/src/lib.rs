@@ -7605,7 +7605,17 @@ impl EscrowContract {
         with_reentrancy_guard(&env, || -> Result<(), EscrowError> {
             for (token, amount) in token_totals.iter() {
                 let token_client = soroban_sdk::token::Client::new(&env, &token);
+                let balance_before = token_client.balance(&contract_address);
                 token_client.transfer_from(&contract_address, &buyer, &contract_address, &amount);
+                // Reject fee-on-transfer / deflationary tokens: the received
+                // delta must cover the aggregate of every item for this token.
+                verify_received_deposit_delta(
+                    &env,
+                    &token_client,
+                    &contract_address,
+                    balance_before,
+                    amount,
+                )?;
             }
             Ok(())
         })?;
