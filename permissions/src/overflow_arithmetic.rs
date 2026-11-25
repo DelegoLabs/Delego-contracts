@@ -115,8 +115,13 @@ fn relayer_fee_validates_correctly_for_normal_inputs() {
 /// back to the Cargo.toml fix required by issue #536.
 #[test]
 fn overflow_checks_are_enabled_in_test_profile() {
+    let overflowed = std::panic::catch_unwind(|| {
+        let max = std::hint::black_box(u8::MAX);
+        let _ = max + 1;
+    })
+    .is_err();
     assert!(
-        cfg!(overflow_checks),
+        overflowed,
         "overflow-checks must be true in [profile.test] (issue #536); \
          add `overflow-checks = true` under [profile.test] in root Cargo.toml",
     );

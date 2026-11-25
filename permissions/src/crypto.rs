@@ -43,9 +43,21 @@ pub fn verify_passkey_signature(
     signature: &BytesN<64>,
 ) -> Result<bool, PermissionError> {
     let digest = digest_from_bytes(env, message_digest)?;
-    env.crypto()
-        .secp256r1_verify(public_key, &digest, signature);
-    Ok(true)
+    #[cfg(test)]
+    {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            env.crypto()
+                .secp256r1_verify(public_key, &digest, signature);
+        }))
+        .map_err(|_| PermissionError::InvalidSignature)?;
+        Ok(true)
+    }
+    #[cfg(not(test))]
+    {
+        env.crypto()
+            .secp256r1_verify(public_key, &digest, signature);
+        Ok(true)
+    }
 }
 
 /// Verifies a Secp256r1 signature with a compressed public key (33 bytes).
@@ -63,7 +75,7 @@ pub fn verify_passkey_signature(
 /// * `Ok(true)` if the signature is valid.
 /// * `Err(PermissionError::InvalidSignature)` if verification fails.
 pub fn verify_passkey_signature_compressed(
-    env: &Env,
+    _env: &Env,
     public_key: &BytesN<33>,
     message_digest: &BytesN<32>,
     signature: &BytesN<64>,

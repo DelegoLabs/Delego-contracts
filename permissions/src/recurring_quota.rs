@@ -1,10 +1,27 @@
 //! Opt-in, immutable recurring quotas for persistent single-owner permissions.
 
 use crate::{
-    DataKey, PermissionError, PermissionRecord, PermissionStatus, PermissionsContract,
+    DataKey, Epoch, PermissionError, PermissionRecord, PermissionStatus, PermissionsContract,
     PermissionsContractArgs, PermissionsContractClient,
 };
 use soroban_sdk::{contractimpl, contracttype, symbol_short, Address, Env};
+
+fn legacy_epoch_spent(env: &Env, record: &PermissionRecord) -> i128 {
+    let ledgers_since_reset = env
+        .ledger()
+        .sequence()
+        .saturating_sub(record.last_reset_ledger);
+    let threshold = match record.epoch {
+        Epoch::Daily => 17_280,
+        Epoch::Weekly => 120_960,
+        Epoch::Monthly => 518_400,
+    };
+    if ledgers_since_reset >= threshold {
+        0
+    } else {
+        record.spent
+    }
+}
 
 /// Ledger-aligned recurring allowance with a non-renewable lifetime ceiling.
 #[contracttype]
@@ -59,7 +76,7 @@ pub(crate) fn remaining(env: &Env, record: &PermissionRecord) -> i128 {
             state.refresh(env.ledger().sequence());
             state.remaining(record.limit_total)
         }
-        None => record.limit_total - record.spent,
+        None => record.limit_total - legacy_epoch_spent(env, record),
     }
 }
 
@@ -69,7 +86,7 @@ pub(crate) fn epoch_spent(env: &Env, record: &PermissionRecord) -> i128 {
             state.refresh(env.ledger().sequence());
             state.epoch_spent
         }
-        None => record.spent,
+        None => legacy_epoch_spent(env, record),
     }
 }
 
@@ -103,7 +120,7 @@ pub(crate) fn consume(
     record.last_reset_ledger = env.ledger().sequence();
     let key = DataKey::RecurringQuota(record.owner.clone(), record.delegate.clone());
     env.storage().persistent().set(&key, &state);
-    crate::bump_persistent_ttl(&env, &key);
+    crate::extend_persistent_ttl_if_needed(env, &key);
     env.events().publish(
         (
             symbol_short!("perm"),
@@ -176,7 +193,7 @@ impl PermissionsContract {
                 epoch_spent: 0,
             },
         );
-        crate::bump_persistent_ttl(
+        crate::extend_persistent_ttl_if_needed(
             &env,
             &DataKey::RecurringQuota(owner.clone(), delegate.clone()),
         );

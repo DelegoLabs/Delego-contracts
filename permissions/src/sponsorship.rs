@@ -37,6 +37,8 @@ pub struct SponsorshipPolicy {
     pub max_fee_per_tx_stroops: i128,
     /// Remaining number of sponsored transactions.
     pub remaining_tx_count: u32,
+    /// Whether this sponsorship policy is currently active.
+    pub active: bool,
 }
 
 fn extend_sponsorship_ttl(env: &Env, key: &SponsorshipDataKey) {
@@ -105,6 +107,7 @@ pub fn configure(
         fee_token: fee_token.clone(),
         max_fee_per_tx_stroops,
         remaining_tx_count,
+        active: true,
     };
     write_policy(env, sponsor, &policy);
     env.events().publish(
@@ -122,6 +125,9 @@ pub fn fund(env: &Env, sponsor: &Address, amount: i128) -> Result<i128, Permissi
         return Err(PermissionError::InvalidParam);
     }
     let policy = read_policy(env, sponsor).ok_or(PermissionError::NotFound)?;
+    if !policy.active {
+        return Err(PermissionError::PermissionPaused);
+    }
     let new_balance = read_balance(env, sponsor)
         .checked_add(amount)
         .ok_or(PermissionError::InvalidParam)?;
@@ -150,6 +156,9 @@ pub fn charge_fee(
     fee_stroops: i128,
 ) -> Result<i128, PermissionError> {
     let mut policy = read_policy(env, sponsor).ok_or(PermissionError::NotFound)?;
+    if !policy.active {
+        return Err(PermissionError::PermissionPaused);
+    }
     let mut quota = GasSponsorshipQuota {
         relayer: policy.relayer.clone(),
         sponsor_balance_stroops: read_balance(env, sponsor),
@@ -169,6 +178,59 @@ pub fn charge_fee(
     write_policy(env, sponsor, &policy);
     write_balance(env, sponsor, quota.sponsor_balance_stroops);
     Ok(quota.sponsor_balance_stroops)
+}
+
+/// Deactivates `sponsor`'s sponsorship policy so no further relayer fees or
+/// deposits can be processed until reconfigured. Requires `sponsor` auth.
+pub fn deactivate(env: &Env, sponsor: &Address) -> Result<(), PermissionError> {
+    sponsor.require_auth();
+    let mut policy = read_policy(env, sponsor).ok_or(PermissionError::NotFound)?;
+    if !policy.active {
+        return Err(PermissionError::AlreadyPaused);
+    }
+    policy.active = false;
+    write_policy(env, sponsor, &policy);
+
+    env.events().publish(
+        (symbol_short!("perm"), symbol_short!("gas_deact")),
+        (sponsor.clone(), policy.relayer),
+    );
+    Ok(())
+}
+
+/// Withdraws `amount` of unspent `token` from `sponsor`'s escrowed sponsorship
+/// balance back to `sponsor`, returning the remaining balance. Requires
+/// `sponsor` auth.
+pub fn withdraw(
+    env: &Env,
+    sponsor: &Address,
+    token: &Address,
+    amount: i128,
+) -> Result<i128, PermissionError> {
+    sponsor.require_auth();
+    if amount <= 0 {
+        return Err(PermissionError::InvalidParam);
+    }
+    let policy = read_policy(env, sponsor).ok_or(PermissionError::NotFound)?;
+    if policy.fee_token != *token {
+        return Err(PermissionError::InvalidParam);
+    }
+    let current_balance = read_balance(env, sponsor);
+    let new_balance = current_balance
+        .checked_sub(amount)
+        .ok_or(PermissionError::ExceedsTotalLimit)?;
+    if new_balance < 0 {
+        return Err(PermissionError::ExceedsTotalLimit);
+    }
+
+    write_balance(env, sponsor, new_balance);
+    token::Client::new(env, token).transfer(&env.current_contract_address(), sponsor, &amount);
+
+    env.events().publish(
+        (symbol_short!("perm"), symbol_short!("gas_wdrw")),
+        (sponsor.clone(), token.clone(), amount, new_balance),
+    );
+    Ok(new_balance)
 }
 
 /// Storage and tracking quota for gas fee sponsorship.
@@ -279,6 +341,7 @@ mod tests {
     #[test]
     fn test_deduct_sponsorship_fee_success() {
         let env = Env::default();
+        let contract_id = env.register(MockContract, ());
         let relayer = Address::generate(&env);
 
         let mut quota = GasSponsorshipQuota {
@@ -288,7 +351,9 @@ mod tests {
             remaining_tx_count: 5,
         };
 
-        let res = deduct_sponsorship_fee(&env, &mut quota, 5_000, &relayer);
+        let res = env.as_contract(&contract_id, || {
+            deduct_sponsorship_fee(&env, &mut quota, 5_000, &relayer)
+        });
         assert_eq!(res, Ok(()));
         assert_eq!(quota.sponsor_balance_stroops, 45_000);
         assert_eq!(quota.remaining_tx_count, 4);
@@ -597,5 +662,114 @@ mod tests {
             assert!(policy_ttl >= SPONSORSHIP_TTL_THRESHOLD);
             assert!(balance_ttl >= SPONSORSHIP_TTL_THRESHOLD);
         });
+    }
+
+    #[test]
+    fn test_withdraw_sponsorship_partial_and_full() {
+        let s = setup_sponsorship(10_000, 5);
+        let client = PermissionsContractClient::new(&s.env, &s.client_id);
+        let token_client = TokenClient::new(&s.env, &s.fee_token);
+
+        client.fund_sponsorship(&s.sponsor, &50_000);
+        assert_eq!(token_client.balance(&s.sponsor), 950_000);
+        assert_eq!(token_client.balance(&s.client_id), 50_000);
+
+        // Partial withdrawal
+        let remaining = client.withdraw_sponsorship(&s.sponsor, &s.fee_token, &20_000);
+        assert_eq!(remaining, 30_000);
+        assert_eq!(client.get_sponsorship_balance(&s.sponsor), 30_000);
+        assert_eq!(token_client.balance(&s.sponsor), 970_000);
+        assert_eq!(token_client.balance(&s.client_id), 30_000);
+
+        // Full withdrawal of remaining balance
+        let remaining_after_full = client.withdraw_sponsorship(&s.sponsor, &s.fee_token, &30_000);
+        assert_eq!(remaining_after_full, 0);
+        assert_eq!(client.get_sponsorship_balance(&s.sponsor), 0);
+        assert_eq!(token_client.balance(&s.sponsor), 1_000_000);
+        assert_eq!(token_client.balance(&s.client_id), 0);
+    }
+
+    #[test]
+    fn test_withdraw_sponsorship_over_withdrawal_and_invalid_rejected() {
+        let s = setup_sponsorship(10_000, 5);
+        let client = PermissionsContractClient::new(&s.env, &s.client_id);
+        let token_client = TokenClient::new(&s.env, &s.fee_token);
+
+        client.fund_sponsorship(&s.sponsor, &15_000);
+
+        // Over-withdrawal rejected
+        assert_eq!(
+            client.try_withdraw_sponsorship(&s.sponsor, &s.fee_token, &15_001),
+            Err(Ok(PermissionError::ExceedsTotalLimit))
+        );
+        // Zero and negative amounts rejected
+        assert_eq!(
+            client.try_withdraw_sponsorship(&s.sponsor, &s.fee_token, &0),
+            Err(Ok(PermissionError::InvalidParam))
+        );
+        assert_eq!(
+            client.try_withdraw_sponsorship(&s.sponsor, &s.fee_token, &-500),
+            Err(Ok(PermissionError::InvalidParam))
+        );
+        // Mismatched token rejected
+        let wrong_token = Address::generate(&s.env);
+        assert_eq!(
+            client.try_withdraw_sponsorship(&s.sponsor, &wrong_token, &5_000),
+            Err(Ok(PermissionError::InvalidParam))
+        );
+        // Unconfigured sponsor rejected
+        let stranger = Address::generate(&s.env);
+        assert_eq!(
+            client.try_withdraw_sponsorship(&stranger, &s.fee_token, &1_000),
+            Err(Ok(PermissionError::NotFound))
+        );
+
+        // State and balances unchanged
+        assert_eq!(client.get_sponsorship_balance(&s.sponsor), 15_000);
+        assert_eq!(token_client.balance(&s.client_id), 15_000);
+    }
+
+    #[test]
+    fn test_deactivate_sponsorship_blocks_charges_and_allows_withdrawal() {
+        let s = setup_sponsorship(10_000, 5);
+        let client = PermissionsContractClient::new(&s.env, &s.client_id);
+        let token_client = TokenClient::new(&s.env, &s.fee_token);
+
+        client.fund_sponsorship(&s.sponsor, &25_000);
+        assert!(client.get_sponsorship_policy(&s.sponsor).unwrap().active);
+
+        client.deactivate_sponsorship(&s.sponsor);
+        assert!(!client.get_sponsorship_policy(&s.sponsor).unwrap().active);
+
+        // Duplicate deactivation rejected
+        assert_eq!(
+            client.try_deactivate_sponsorship(&s.sponsor),
+            Err(Ok(PermissionError::AlreadyPaused))
+        );
+
+        // Unconfigured sponsor deactivation rejected
+        let stranger = Address::generate(&s.env);
+        assert_eq!(
+            client.try_deactivate_sponsorship(&stranger),
+            Err(Ok(PermissionError::NotFound))
+        );
+
+        // Relayer fee charges and new deposits are blocked while deactivated
+        assert_eq!(
+            client.try_charge_sponsored_fee(&s.sponsor, &s.relayer, &5_000),
+            Err(Ok(PermissionError::PermissionPaused))
+        );
+        assert_eq!(
+            client.try_fund_sponsorship(&s.sponsor, &5_000),
+            Err(Ok(PermissionError::PermissionPaused))
+        );
+
+        // Sponsor can still withdraw unspent balance after deactivation
+        assert_eq!(
+            client.withdraw_sponsorship(&s.sponsor, &s.fee_token, &25_000),
+            0
+        );
+        assert_eq!(client.get_sponsorship_balance(&s.sponsor), 0);
+        assert_eq!(token_client.balance(&s.sponsor), 1_000_000);
     }
 }

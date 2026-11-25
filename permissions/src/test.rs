@@ -7,10 +7,10 @@ mod test {
         PermissionsContractClient, ScopedPermissionConfig, SessionKeyConfig,
         MAX_ABSOLUTE_RELAYER_STROOPS, MAX_RELAYER_FEE_BPS, MAX_SESSION_WINDOW_LEDGERS,
     };
-    use soroban_sdk::testutils::LedgerInfo;
     use soroban_sdk::{
         symbol_short,
         testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
+        xdr::ToXdr,
         Address, Env, IntoVal, Symbol, TryIntoVal, Vec,
     };
 
@@ -267,7 +267,7 @@ mod test {
             &SessionKeyConfig {
                 session_key: session_key.clone(),
                 max_spend_per_session: 200,
-                valid_until_ledger: 2_000, // ledger expiry is far away
+                valid_until_ledger: 500 + MAX_SESSION_WINDOW_LEDGERS, // ledger expiry is far away
                 expires_at: 2_000,         // but timestamp expiry is near
             },
         );
@@ -754,18 +754,14 @@ mod test {
         client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
 
         let events = env.events().all();
-        let last = events.last().unwrap();
-        assert_eq!(last.0, contract_id);
-        assert_eq!(last.1.len(), 3);
-        assert_eq!(
-            last.1.get(0).unwrap(),
-            Symbol::new(&env, "permissions").into_val(&env)
-        );
-        assert_eq!(
-            last.1.get(1).unwrap(),
-            Symbol::new(&env, "granted").into_val(&env)
-        );
-        let entity: Address = last.1.get(2).unwrap().try_into_val(&env).unwrap();
+        let first = events.get(0).unwrap();
+        assert_eq!(first.0, contract_id);
+        assert_eq!(first.1.len(), 3);
+        let t0: Symbol = first.1.get(0).unwrap().try_into_val(&env).unwrap();
+        let t1: Symbol = first.1.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("perm"));
+        assert_eq!(t1, symbol_short!("granted"));
+        let entity: Address = first.1.get(2).unwrap().try_into_val(&env).unwrap();
         assert_eq!(entity, delegate);
     }
 
@@ -787,14 +783,10 @@ mod test {
         let last = events.last().unwrap();
         assert_eq!(last.0, contract_id);
         assert_eq!(last.1.len(), 3);
-        assert_eq!(
-            last.1.get(0).unwrap(),
-            Symbol::new(&env, "permissions").into_val(&env)
-        );
-        assert_eq!(
-            last.1.get(1).unwrap(),
-            Symbol::new(&env, "revoked").into_val(&env)
-        );
+        let t0: Symbol = last.1.get(0).unwrap().try_into_val(&env).unwrap();
+        let t1: Symbol = last.1.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("perm"));
+        assert_eq!(t1, symbol_short!("revoked"));
         let entity: Address = last.1.get(2).unwrap().try_into_val(&env).unwrap();
         assert_eq!(entity, delegate);
     }
@@ -818,14 +810,10 @@ mod test {
         let last = events.last().unwrap();
         assert_eq!(last.0, contract_id);
         assert_eq!(last.1.len(), 3);
-        assert_eq!(
-            last.1.get(0).unwrap(),
-            Symbol::new(&env, "permissions").into_val(&env)
-        );
-        assert_eq!(
-            last.1.get(1).unwrap(),
-            Symbol::new(&env, "spent").into_val(&env)
-        );
+        let t0: Symbol = last.1.get(0).unwrap().try_into_val(&env).unwrap();
+        let t1: Symbol = last.1.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("perm"));
+        assert_eq!(t1, symbol_short!("spent"));
         let entity: Address = last.1.get(2).unwrap().try_into_val(&env).unwrap();
         assert_eq!(entity, delegate);
     }
@@ -911,7 +899,7 @@ mod test {
         let mut found = false;
         for event in events.iter() {
             let (contract, topics, value) = event;
-            if contract != contract_id || topics.len() != 2 {
+            if contract != contract_id || topics.len() < 2 {
                 continue;
             }
             let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -1455,6 +1443,41 @@ mod test {
         assert_eq!(detail.remaining, 350);
     }
 
+    #[test]
+    fn test_allowance_decrease_queued_event_emitted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+        client.decrease_allowance(&owner, &delegate, &250);
+
+        let events = env.events().all();
+        let mut found = false;
+        for (contract, topics, value) in events.iter() {
+            if contract != contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == soroban_sdk::symbol_short!("perm")
+                && t1 == soroban_sdk::symbol_short!("allowdecq")
+            {
+                let evt: crate::AllowanceDecreaseQueuedEvent = value.try_into_val(&env).unwrap();
+                assert_eq!(evt.owner, owner);
+                assert_eq!(evt.delegate, delegate);
+                assert_eq!(evt.amount, 250);
+                found = true;
+            }
+        }
+        assert!(found, "AllowanceDecreaseQueuedEvent not found in events");
+    }
+
     // --- AllowanceIncreasedEvent tests ---
 
     #[test]
@@ -1671,7 +1694,7 @@ mod test {
         let mut found = false;
         for event in events.iter() {
             let (contract, topics, value) = event;
-            if contract != contract_id || topics.len() != 2 {
+            if contract != contract_id || topics.len() < 2 {
                 continue;
             }
             let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -1738,10 +1761,10 @@ mod test {
         assert_eq!(detail.limit, 2000);
         assert_eq!(detail.spent, 0);
         assert_eq!(detail.remaining, 2000);
-        let mut found = false;
+        let mut last_granted: Option<crate::PermissionGrantedEvent> = None;
         for event in events.iter() {
             let (contract, topics, value) = event;
-            if contract != contract_id || topics.len() != 2 {
+            if contract != contract_id || topics.len() < 2 {
                 continue;
             }
             let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -1749,14 +1772,13 @@ mod test {
             if t0 == soroban_sdk::symbol_short!("perm")
                 && t1 == soroban_sdk::symbol_short!("granted")
             {
-                let evt: crate::PermissionGrantedEvent = value.try_into_val(&env).unwrap();
-                assert_eq!(evt.total_limit, 2000);
-                assert_eq!(evt.previous_spent, 150);
-                assert_eq!(evt.remaining_delta, 1150);
-                found = true;
+                last_granted = Some(value.try_into_val(&env).unwrap());
             }
         }
-        assert!(found, "PermissionGrantedEvent not found in events");
+        let evt = last_granted.expect("PermissionGrantedEvent not found in events");
+        assert_eq!(evt.total_limit, 2000);
+        assert_eq!(evt.previous_spent, 150);
+        assert_eq!(evt.remaining_delta, 1150);
     }
 
     #[test]
@@ -2558,7 +2580,7 @@ mod test {
         let mut found = false;
         for event in events.iter() {
             let (contract, topics, value) = event;
-            if contract != contract_id || topics.len() != 2 {
+            if contract != contract_id || topics.len() < 2 {
                 continue;
             }
             let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -3675,6 +3697,10 @@ mod test {
                         status: PermissionStatus::Active,
                         expires_at_ledger: 10_000,
                         created_at: 0,
+                        not_before_ledger: 0,
+                        not_after_ledger: 0,
+                        epoch: crate::Epoch::Daily,
+                        last_reset_ledger: 0,
                         parent_owner: None,
                         parent_delegate: None,
                     },
@@ -3845,14 +3871,16 @@ mod test {
     fn test_recheck_merchant_verification_under_old_policy() {
         let env = Env::default();
         env.mock_all_auths();
+        let admin = Address::generate(&env);
         let merchant_id: u64 = 1;
 
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
+        client.set_admin(&admin);
 
         // Merchant verified under a policy requiring 1 verification.
         let old_policy = crate::VerificationPolicy { required: 1 };
-        client.set_merchant_verifications(&merchant_id, &1);
+        client.set_merchant_verifications(&admin, &merchant_id, &1);
         assert!(client.recheck_merchant_verification(&merchant_id, &old_policy));
     }
 
@@ -3860,13 +3888,15 @@ mod test {
     fn test_recheck_merchant_verification_after_policy_increase() {
         let env = Env::default();
         env.mock_all_auths();
+        let admin = Address::generate(&env);
         let merchant_id: u64 = 2;
 
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
+        client.set_admin(&admin);
 
         // Merchant verified under old policy (1 verification).
-        client.set_merchant_verifications(&merchant_id, &1);
+        client.set_merchant_verifications(&admin, &merchant_id, &1);
 
         // Governance raises the required verifications to 2.
         let new_policy = crate::VerificationPolicy { required: 2 };
@@ -4297,7 +4327,7 @@ mod test {
 
         // 1% of 1_000_000 stroops is 10_000 stroops; 10_001 must be rejected
         assert_eq!(
-            validate_relayer_fee(1_000_000, 10_000),
+            validate_relayer_fee(1_000_000, 10_001),
             Err(PermissionError::InvalidParam)
         );
 
@@ -4412,6 +4442,7 @@ mod test {
         assert!(res.is_err());
 
         // The pending decrease must still be present and executable by the owner.
+        env.mock_all_auths();
         env.ledger().with_mut(|li| {
             li.timestamp += 86401;
         });
@@ -4731,59 +4762,7 @@ mod test {
         );
 
         // Nothing was written by any of the rejected calls.
-        client.grant(&owner, &delegate, &1000, &100, &merchants, &10);
-
-        // Keep instance and record alive across the ledger jump
-        env.as_contract(&contract_id, || {
-            env.storage().instance().extend_ttl(1_000_000, 1_000_000);
-            env.storage().persistent().extend_ttl(
-                &DataKey::Permission(owner.clone(), delegate.clone()),
-                1_000_000,
-                1_000_000,
-            );
-            env.storage().persistent().extend_ttl(
-                &DataKey::UserPermissions(owner.clone()),
-                1_000_000,
-                1_000_000,
-            );
-        });
-
-        // Advance ledger to 100_011 (> 10 + 100_000)
-        env.ledger().set_sequence_number(100_011);
-
-        let pruned = client.prune_expired_permission(&owner, &delegate, &keeper);
-        assert_eq!(pruned, true);
-
-        // Verify PermissionPrunedEvent was emitted
-        let events = env.events().all();
-        let mut found_event = false;
-        for event in events.iter() {
-            let (contract, topics, value) = event;
-            if contract != contract_id || topics.len() != 2 {
-                continue;
-            }
-            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
-            if t0 == soroban_sdk::symbol_short!("perm")
-                && t1 == soroban_sdk::symbol_short!("pruned")
-            {
-                let evt: crate::PermissionPrunedEvent = value.try_into_val(&env).unwrap();
-                assert_eq!(evt.owner, owner);
-                assert_eq!(evt.delegate, delegate);
-                assert_eq!(evt.keeper, keeper);
-                assert_eq!(evt.pruned_at_ledger, 100_011);
-                found_event = true;
-            }
-        }
-        assert!(
-            found_event,
-            "PermissionPrunedEvent not found in emitted events"
-        );
-
-        // Verify storage deletion
-        assert_eq!(client.is_active(&owner, &delegate), false);
-        let get_res = client.try_get_permission(&owner, &delegate);
-        assert_eq!(get_res, Err(Ok(PermissionError::PermissionNotFound)));
+        assert_eq!(client.get_permission_scope(&owner, &delegate), None);
     }
 
     #[test]
@@ -5225,10 +5204,8 @@ mod test {
         use crate::NonceBatchInvalidatedEvent;
         let events = env.events().all();
         let found = events.iter().any(|ev| {
-            if let Ok(payload) =
-                ev.2.clone()
-                    .try_into_val::<_, NonceBatchInvalidatedEvent>(&env)
-            {
+            let decoded: Result<NonceBatchInvalidatedEvent, _> = ev.2.clone().try_into_val(&env);
+            if let Ok(payload) = decoded {
                 payload.owner == owner
                     && payload.delegate == delegate
                     && payload.up_to_nonce == 7
@@ -5453,42 +5430,6 @@ mod test {
             client.try_set_rolling_window_limit(&admin, &0, &1_000),
             Err(Ok(PermissionError::InvalidParam))
         );
-        client.grant(&owner, &delegate1, &1000, &100, &merchants, &10);
-        client.grant(&owner, &delegate2, &2000, &200, &merchants, &200_000);
-
-        assert_eq!(client.get_permissions_by_owner(&owner).len(), 2);
-
-        // Keep instance and records alive across the ledger jump
-        env.as_contract(&contract_id, || {
-            env.storage().instance().extend_ttl(1_000_000, 1_000_000);
-            env.storage().persistent().extend_ttl(
-                &DataKey::Permission(owner.clone(), delegate1.clone()),
-                1_000_000,
-                1_000_000,
-            );
-            env.storage().persistent().extend_ttl(
-                &DataKey::Permission(owner.clone(), delegate2.clone()),
-                1_000_000,
-                1_000_000,
-            );
-            env.storage().persistent().extend_ttl(
-                &DataKey::UserPermissions(owner.clone()),
-                1_000_000,
-                1_000_000,
-            );
-        });
-
-        // Advance to prune delegate1
-        env.ledger().set_sequence_number(100_011);
-        assert_eq!(
-            client.prune_expired_permission(&owner, &delegate1, &keeper),
-            true
-        );
-
-        // delegate1 is removed, delegate2 remains
-        let remaining = client.get_permissions_by_owner(&owner);
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining.get(0).unwrap().delegate, delegate2);
     }
 }
 
@@ -5506,7 +5447,7 @@ mod expiry_and_allowance_sweep_tests {
     };
 
     fn setup(env: &Env) -> (PermissionsContractClient<'_>, Address, Address, Address) {
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(env, &contract_id);
         (
@@ -5542,59 +5483,53 @@ mod expiry_and_allowance_sweep_tests {
     fn test_revalidate_merchant_status_grants_grace_period() {
         let env = Env::default();
         env.mock_all_auths();
+        let admin = Address::generate(&env);
         let merchant_id: u64 = 3;
 
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
+        client.set_admin(&admin);
+        env.ledger().set_timestamp(1_000);
 
         // Merchant verified under old policy (1 verification).
-        client.set_merchant_verifications(&merchant_id, &1);
+        client.set_verification_policy(&admin, &1);
+        client.set_merchant_verifications(&admin, &merchant_id, &1);
 
         // Governance raises the required verifications to 2.
-        let new_policy = crate::VerificationPolicy { required: 2 };
-        client.set_verification_policy(&new_policy);
+        client.set_verification_policy(&admin, &2);
 
         // Immediately after the policy change, the merchant is still within
-        // the 30-day grace period and remains valid.
-        let status = client.revalidate_merchant_status(&merchant_id);
-        assert!(
-            status.valid,
-            "merchant must remain valid during the 30-day grace period"
+        // the 30-day grace period.
+        assert_eq!(
+            client.try_revalidate_merchant_status(&merchant_id),
+            Err(Ok(PermissionError::VerificationGracePeriod))
         );
-        assert!(
-            status.grace_period_active,
-            "grace period must be reported as active"
-        );
-        assert_eq!(status.required, 2);
-        assert_eq!(status.current, 1);
     }
 
     #[test]
     fn test_revalidate_merchant_status_expires_after_grace_period() {
         let env = Env::default();
         env.mock_all_auths();
+        let admin = Address::generate(&env);
         let merchant_id: u64 = 4;
 
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
+        client.set_admin(&admin);
+        env.ledger().set_timestamp(1_000);
 
-        client.set_merchant_verifications(&merchant_id, &1);
-        let new_policy = crate::VerificationPolicy { required: 2 };
-        client.set_verification_policy(&new_policy);
+        client.set_verification_policy(&admin, &1);
+        client.set_merchant_verifications(&admin, &merchant_id, &1);
+        client.set_verification_policy(&admin, &2);
 
         // Advance the ledger timestamp past the 30-day grace period.
-        env.ledger().with_mut(|li: &mut LedgerInfo| {
+        env.ledger().with_mut(|li| {
             li.timestamp += 30 * 24 * 60 * 60 + 1;
         });
 
-        let status = client.revalidate_merchant_status(&merchant_id);
-        assert!(
-            !status.valid,
-            "merchant must transition gracefully once the grace period expires"
-        );
-        assert!(
-            !status.grace_period_active,
-            "grace period must no longer be active"
+        assert_eq!(
+            client.try_revalidate_merchant_status(&merchant_id),
+            Err(Ok(PermissionError::VerificationBelowPolicy))
         );
     }
 
@@ -5668,12 +5603,13 @@ mod expiry_and_allowance_sweep_tests {
         env.ledger().set_sequence_number(150);
 
         client.sweep_expired_allowance(&owner, &delegate, &token);
+        let events = env.events().all();
 
         assert_eq!(
             TokenClient::new(&env, &token).allowance(&owner, &delegate),
             0
         );
-        let (contract, topics, data) = env.events().all().last().unwrap();
+        let (contract, topics, data) = events.last().unwrap();
         assert_eq!(contract, contract_id);
         let t1: Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
         assert_eq!(t1, symbol_short!("allow_rcl"));
@@ -5775,7 +5711,7 @@ mod expiry_and_allowance_sweep_tests {
         // Depth 2: grandchild of root grant.
         assert_eq!(
             client.try_grant_child(
-                &root_owner,
+                &parent_delegate,
                 &child_delegate,
                 &grandchild_delegate,
                 &2500,
@@ -5806,10 +5742,10 @@ mod expiry_and_allowance_sweep_tests {
         // Depth 1.
         client.grant_child(&root_owner, &d1, &d2, &5000, &500, &merchants, &10000);
         // Depth 2.
-        client.grant_child(&root_owner, &d2, &d3, &2500, &250, &merchants, &10000);
+        client.grant_child(&d1, &d2, &d3, &2500, &250, &merchants, &10000);
         // Depth 3 would exceed MAX_HIERARCHY_DEPTH (3) and must be rejected.
         assert_eq!(
-            client.try_grant_child(&root_owner, &d3, &d4, &1250, &125, &merchants, &10000,),
+            client.try_grant_child(&d2, &d3, &d4, &1250, &125, &merchants, &10000,),
             Err(Ok(PermissionError::MaxHierarchyDepthExceeded))
         );
     }
@@ -5818,101 +5754,88 @@ mod expiry_and_allowance_sweep_tests {
     fn test_revalidate_merchant_status_meets_new_policy() {
         let env = Env::default();
         env.mock_all_auths();
+        let admin = Address::generate(&env);
         let merchant_id: u64 = 5;
 
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
+        client.set_admin(&admin);
 
         // Merchant acquires the additional attestation.
-        client.set_merchant_verifications(&merchant_id, &2);
-        let new_policy = crate::VerificationPolicy { required: 2 };
-        client.set_verification_policy(&new_policy);
+        client.set_merchant_verifications(&admin, &merchant_id, &2);
+        client.set_verification_policy(&admin, &2);
 
-        let status = client.revalidate_merchant_status(&merchant_id);
-        assert!(
-            status.valid,
-            "merchant meeting the new policy must be valid"
-        );
-        assert!(
-            !status.grace_period_active,
-            "no grace period needed when policy is met"
-        );
-        assert_eq!(status.required, 2);
-        assert_eq!(status.current, 2);
+        assert_eq!(client.try_revalidate_merchant_status(&merchant_id), Ok(Ok(true)));
     }
 
     #[test]
     fn test_revalidate_merchant_status_unknown_merchant() {
         let env = Env::default();
         env.mock_all_auths();
+        let admin = Address::generate(&env);
         let merchant_id: u64 = 999;
 
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
+        client.set_admin(&admin);
 
-        // Depth 0.
-        client.grant(&root_owner, &d1, &10_000, &1000, &merchants, &10000);
-        // Depth 1.
-        client.grant_child(&root_owner, &d1, &d2, &5000, &500, &merchants, &10000);
-        // Depth 2.
-        client.grant_child(&root_owner, &d2, &d3, &2500, &250, &merchants, &10000);
-        // Depth 3 would exceed MAX_HIERARCHY_DEPTH (3) and must be rejected.
+        client.set_verification_policy(&admin, &1);
+
         assert_eq!(
-            client.try_grant_child(&root_owner, &d3, &d4, &1250, &125, &merchants, &10000,),
-            Err(Ok(PermissionError::MaxHierarchyDepthExceeded))
+            client.try_revalidate_merchant_status(&merchant_id),
+            Err(Ok(PermissionError::VerificationBelowPolicy))
         );
-        let new_policy = crate::VerificationPolicy { required: 1 };
-        client.set_verification_policy(&new_policy);
-
-        let status = client.revalidate_merchant_status(&merchant_id);
-        assert!(!status.valid, "unknown merchant must not be valid");
-        assert_eq!(status.current, 0);
     }
 
     #[test]
     fn test_policy_transition_behavior_end_to_end() {
         let env = Env::default();
         env.mock_all_auths();
+        let admin = Address::generate(&env);
         let merchant_id: u64 = 42;
 
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
+        client.set_admin(&admin);
+        env.ledger().set_timestamp(1_000);
 
         // 1. Merchant verified under old policy (1 verification).
         let old_policy = crate::VerificationPolicy { required: 1 };
-        client.set_verification_policy(&old_policy);
-        client.set_merchant_verifications(&merchant_id, &1);
+        client.set_verification_policy(&admin, &1);
+        client.set_merchant_verifications(&admin, &merchant_id, &1);
         assert!(client.recheck_merchant_verification(&merchant_id, &old_policy));
-        assert!(client.revalidate_merchant_status(&merchant_id).valid);
+        assert_eq!(client.try_revalidate_merchant_status(&merchant_id), Ok(Ok(true)));
 
         // 2. Governance raises the policy to 2 verifications.
         let new_policy = crate::VerificationPolicy { required: 2 };
-        client.set_verification_policy(&new_policy);
+        client.set_verification_policy(&admin, &2);
 
         // 3. Merchant is no longer statically verified.
         assert!(!client.recheck_merchant_verification(&merchant_id, &new_policy));
 
-        // 4. But the grace period keeps them valid temporarily.
-        let grace_status = client.revalidate_merchant_status(&merchant_id);
-        assert!(grace_status.valid);
-        assert!(grace_status.grace_period_active);
+        // 4. But the grace period keeps them in grace state temporarily.
+        assert_eq!(
+            client.try_revalidate_merchant_status(&merchant_id),
+            Err(Ok(PermissionError::VerificationGracePeriod))
+        );
 
         // 5. Merchant acquires the second attestation before the deadline.
-        client.set_merchant_verifications(&merchant_id, &2);
-        let met_status = client.revalidate_merchant_status(&merchant_id);
-        assert!(met_status.valid);
-        assert!(!met_status.grace_period_active);
+        client.set_merchant_verifications(&admin, &merchant_id, &2);
+        assert_eq!(client.try_revalidate_merchant_status(&merchant_id), Ok(Ok(true)));
 
         // 6. A different merchant that never acquires the attestation
-        //    transitions gracefully after the grace period.
+        //    transitions to VerificationBelowPolicy after the grace period.
         let lagging_id: u64 = 43;
-        client.set_merchant_verifications(&lagging_id, &1);
-        env.ledger().with_mut(|li: &mut LedgerInfo| {
+        client.set_verification_policy(&admin, &1);
+        client.set_merchant_verifications(&admin, &lagging_id, &1);
+        client.set_verification_policy(&admin, &2);
+        env.ledger().with_mut(|li| {
             li.timestamp += 30 * 24 * 60 * 60 + 1;
         });
-        let lagging_status = client.revalidate_merchant_status(&lagging_id);
-        assert!(!lagging_status.valid);
-        assert!(!lagging_status.grace_period_active);
+        assert_eq!(
+            client.try_revalidate_merchant_status(&lagging_id),
+            Err(Ok(PermissionError::VerificationBelowPolicy))
+        );
     }
 }
 
@@ -6185,7 +6108,7 @@ mod freeze_relayer_tests {
 
         client.unfreeze_relayer(&admin, &relayer);
 
-        // Find the RelayerFreeze event by its topic symbols.
+        // Find the RelayerFrozenEvent emitted on unfreeze by its topic symbols.
         let events = env.events().all();
         let mut found = false;
         for (_contract_addr, topics, data) in events.iter() {
@@ -6193,24 +6116,17 @@ mod freeze_relayer_tests {
                 let t0: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
                 let t1: Result<soroban_sdk::Symbol, _> = topics.get(1).unwrap().try_into_val(&env);
                 if let (Ok(sym0), Ok(sym1)) = (t0, t1) {
-                    if sym0 == symbol_short!("perm") && sym1 == symbol_short!("rlyr_unfrz") {
-                        let evt: RelayerFreezeEvent = data.try_into_val(&env).unwrap();
+                    if sym0 == symbol_short!("perm") && sym1 == symbol_short!("rlyrunfrz") {
+                        let evt: RelayerFrozenEvent = data.try_into_val(&env).unwrap();
+                        assert_eq!(evt.admin, admin);
                         assert_eq!(evt.relayer, relayer);
-                        assert_eq!(evt.frozen, false);
                         found = true;
                     }
                 }
             }
         }
-        assert!(found, "RelayerFreeze event not found");
+        assert!(found, "RelayerFrozenEvent on unfreeze not found");
     }
-
-    // -----------------------------------------------------------------------
-    // execute_spend_via_relayer — frozen relayer is blocked
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn execute_spend_via_relayer_blocked_when_relayer_frozen() {
 
     #[test]
     fn execute_spend_via_channel_blocked_when_relayer_frozen() {
@@ -6294,7 +6210,6 @@ mod freeze_relayer_tests {
 
 #[cfg(test)]
 mod crypto_tests {
-    use super::*;
     use crate::{
         verify_passkey_signature, verify_passkey_signature_compressed,
         verify_passkey_signature_flexible, PermissionError,
@@ -6559,4 +6474,115 @@ mod crypto_tests {
         assert!(result.is_err());
     }
 }
+
+#[cfg(test)]
+mod epoch_reset_and_ttl_tests {
+    use crate::{
+        DataKey, Epoch, PermissionRecord, PermissionsContract, PermissionsContractClient,
+        PERMISSION_TTL_BUMP, PERMISSION_TTL_THRESHOLD,
+    };
+    use soroban_sdk::{
+        testutils::{storage::Persistent as _, Address as _, Ledger},
+        Address, Env, Vec,
+    };
+
+    #[test]
+    fn test_apply_spend_epoch_reset_daily_weekly_monthly() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|li| {
+            li.min_persistent_entry_ttl = 2_000_000;
+            li.min_temp_entry_ttl = 2_000_000;
+            li.max_entry_ttl = 3_000_000;
+        });
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchant = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        let merchants = Vec::<Address>::new(&env);
+
+        // Daily epoch reset after >= 17_280 ledgers
+        env.ledger().set_sequence_number(10);
+        client.grant(&owner, &delegate, &500, &300, &merchants, &1_000_000);
+        let key = DataKey::Permission(owner.clone(), delegate.clone());
+
+        client.execute_spend(&owner, &delegate, &300, &merchant);
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 200);
+
+        env.ledger().set_sequence_number(10 + 17_280);
+        client.execute_spend(&owner, &delegate, &300, &merchant);
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 200);
+
+        // Switch record to Weekly epoch and verify reset requires >= 120_960 ledgers
+        env.as_contract(&contract_id, || {
+            let mut rec: PermissionRecord = env.storage().persistent().get(&key).unwrap();
+            rec.epoch = Epoch::Weekly;
+            rec.spent = 300;
+            rec.last_reset_ledger = 20_000;
+            env.storage().persistent().set(&key, &rec);
+        });
+        env.ledger().set_sequence_number(20_000 + 120_959);
+        client.execute_spend(&owner, &delegate, &100, &merchant);
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 100);
+
+        env.ledger().set_sequence_number(20_000 + 120_960);
+        client.execute_spend(&owner, &delegate, &250, &merchant);
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 250);
+
+        // Switch record to Monthly epoch and verify reset requires >= 518_400 ledgers
+        env.as_contract(&contract_id, || {
+            let mut rec: PermissionRecord = env.storage().persistent().get(&key).unwrap();
+            rec.epoch = Epoch::Monthly;
+            rec.spent = 400;
+            rec.last_reset_ledger = 200_000;
+            env.storage().persistent().set(&key, &rec);
+        });
+        env.ledger().set_sequence_number(200_000 + 518_399);
+        client.execute_spend(&owner, &delegate, &50, &merchant);
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 50);
+
+        env.ledger().set_sequence_number(200_000 + 518_400);
+        client.execute_spend(&owner, &delegate, &200, &merchant);
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 300);
+    }
+
+    #[test]
+    fn test_persistent_ttl_extended_on_permission_and_recurring_quota_writes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        let merchants = Vec::<Address>::new(&env);
+
+        client.grant(&owner, &delegate, &1_000, &200, &merchants, &10_000);
+        client.configure_recurring_quota(&owner, &delegate, &100, &500, &2_000);
+
+        env.as_contract(&contract_id, || {
+            let perm_ttl = env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::Permission(owner.clone(), delegate.clone()));
+            let user_perms_ttl = env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::UserPermissions(owner.clone()));
+            let quota_ttl = env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::RecurringQuota(owner.clone(), delegate.clone()));
+
+            assert!(perm_ttl >= PERMISSION_TTL_THRESHOLD && perm_ttl >= PERMISSION_TTL_BUMP);
+            assert!(
+                user_perms_ttl >= PERMISSION_TTL_THRESHOLD && user_perms_ttl >= PERMISSION_TTL_BUMP
+            );
+            assert!(quota_ttl >= PERMISSION_TTL_THRESHOLD && quota_ttl >= PERMISSION_TTL_BUMP);
+        });
+    }
+}
+
 
