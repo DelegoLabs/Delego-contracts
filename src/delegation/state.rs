@@ -1,10 +1,10 @@
 use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
-use soroban_sdk::token::{Token, TokenType};
-use soroban_sdk::types::ContractData;
+
+use super::errors::PermissionError;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-put enum AccountCircuitBreakerStatus {
+pub enum AccountCircuitBreakerStatus {
     Normal,
     Frozen,
 }
@@ -40,6 +40,9 @@ pub struct DelegationState {
     pub is_paused: bool,
     pub epoch_config: EpochConfig,
     pub allowances: Vec<AssetAllowance>,
+    /// Next nonce expected on a spend authorization. Incremented on every
+    /// successful spend so the same authorization cannot be replayed.
+    pub nonce: u64,
 }
 
 impl DelegationState {
@@ -53,6 +56,7 @@ impl DelegationState {
                 epoch_started_ledger: env.ledger().sequence(),
             },
             allowances: Vec::new(env),
+            nonce: 0,
         }
     }
 
@@ -61,7 +65,12 @@ impl DelegationState {
         self.epoch_config.epoch_started_ledger = env.ledger().sequence();
     }
 
-    pub fn add_allowance(&mut self, env: &Env, token_contract: Address, spending_limit_stroops: i128) {
+    pub fn add_allowance(
+        &mut self,
+        env: &Env,
+        token_contract: Address,
+        spending_limit_stroops: i128,
+    ) {
         let mut idx = self.allowances.len();
         let mut i = 0;
         while i < self.allowances.len() {
@@ -97,19 +106,36 @@ impl DelegationState {
         None
     }
 
-    pub fn record_spend(&mut self, token_contract: &Address, amount: i128) -> Result<(), PermissionError> {
+    /// Records a spend against the matching asset allowance.
+    ///
+    /// Rejects non-positive amounts with [`PermissionError::InvalidAmount`] and
+    /// uses checked arithmetic so a full `i128` allowance can never overflow
+    /// into a negative (and therefore apparently unlimited) balance: an
+    /// overflowing `spent_stroops + amount` is reported as
+    /// [`PermissionError::ExceedsAllowance`].
+    pub fn record_spend(
+        &mut self,
+        token_contract: &Address,
+        amount: i128,
+    ) -> Result<(), PermissionError> {
+        if amount <= 0 {
+            return Err(PermissionError::InvalidAmount);
+        }
         let idx = match self.find_allowance_idx(token_contract) {
             Some(i) => i,
             None => return Err(PermissionError::AssetNotAuthorized),
         };
         let mut record = self.allowances.get(idx).unwrap();
-        let new_spent = record.spent_stroops + amount;
+        let new_spent = record
+            .spent_stroops
+            .checked_add(amount)
+            .ok_or(PermissionError::ExceedsAllowance)?;
         if new_spent > record.spending_limit_stroops {
             return Err(PermissionError::ExceedsAllowance);
         }
         record.spent_stroops = new_spent;
         self.allowances.set(idx, record);
-        Ok(()
+        Ok(())
     }
 }
 

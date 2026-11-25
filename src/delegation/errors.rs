@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, Env};
+use soroban_sdk::contracterror;
 
 #[contracterror]
 #[derive(Debug, Eq, PartialEq)]
@@ -23,6 +23,7 @@ pub enum PermissionError {
 
     #[msg("Delegation has expired")]
     DelegationExpired,
+
     #[msg("Account is frozen by circuit breaker")]
     AccountFrozen,
 
@@ -34,4 +35,10 @@ pub enum PermissionError {
 
     #[msg("Master key confirmation required")]
     MasterKeyConfirmationRequired,
+
+    #[msg("Nonce is replayed or out of order")]
+    InvalidNonce,
+
+    #[msg("Spend amount must be positive")]
+    InvalidAmount,
 }
