@@ -296,6 +296,9 @@ pub enum PermissionError {
     /// Distinct from `Expired` (ledger-sequence expiry) so callers can distinguish
     /// between the two expiration dimensions (issue #566).
     SessionExpired = 2432,
+    /// A grant was requested with `ttl_ledgers == 0`, which would create an
+    /// immediately expired permission (issue #10).
+    InvalidTtl = 2433,
 }
 
 /// Epoch period for allowance reset logic.
@@ -373,6 +376,7 @@ mod error_code_tests {
         PermissionError::RelayerFrozen as u32,
         PermissionError::InvalidSignature as u32,
         PermissionError::SessionExpired as u32,
+        PermissionError::InvalidTtl as u32,
     ];
 
     /// Compile-time completeness guard: this `match` has no wildcard arm, so
@@ -430,16 +434,17 @@ mod error_code_tests {
             | EphemeralRelayerUnsupported
             | RelayerFrozen
             | InvalidSignature
-            | SessionExpired => err as u32,
+            | SessionExpired
+            | InvalidTtl => err as u32,
         }
     }
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        // 49 = every `PermissionError` variant, each listed exactly once.
+        // 50 = every `PermissionError` variant, each listed exactly once.
         // `exhaustive_permission_error_guard` above fails to compile if a new
         // variant is added without being accounted for here (issue #691).
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 49);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 50);
         for code in PERMISSION_ERROR_CODES {
             assert!(
                 (2001..=2500).contains(code),
@@ -1654,6 +1659,9 @@ impl PermissionsContract {
     /// `(owner, delegate)` pair, it returns [`PermissionError::AlreadyGranted`]
     /// instead of resetting its spend accounting. Callers that deliberately
     /// want to replace an existing delegation must use [`Self::re_grant`].
+    ///
+    /// A `ttl_ledgers` of `0` is rejected with [`PermissionError::InvalidTtl`]:
+    /// it would record a permission that is already expired (issue #10).
     pub fn grant(
         env: Env,
         owner: Address,
@@ -1663,6 +1671,10 @@ impl PermissionsContract {
         allowed_merchants: Vec<Address>,
         ttl_ledgers: u32,
     ) -> Result<(), PermissionError> {
+        if ttl_ledgers == 0 {
+            return Err(PermissionError::InvalidTtl);
+        }
+
         Self::grant_impl(
             env,
             owner,
@@ -2295,6 +2307,7 @@ impl PermissionsContract {
     /// unscoped sub-delegation to a downstream agent.
     ///
     /// # Errors
+    /// - [`PermissionError::InvalidTtl`] if `ttl_ledgers` is `0`.
     /// - [`PermissionError::ParentNotFound`] if the parent permission
     ///   doesn't exist.
     /// - [`PermissionError::PermissionPaused`] / [`PermissionError::Expired`]
@@ -2311,6 +2324,10 @@ impl PermissionsContract {
         allowed_merchants: Vec<Address>,
         ttl_ledgers: u32,
     ) -> Result<(), PermissionError> {
+        if ttl_ledgers == 0 {
+            return Err(PermissionError::InvalidTtl);
+        }
+
         parent_delegate.require_auth();
 
         if let Some(state) = env
@@ -7485,3 +7502,90 @@ mod audit_log_page_tests {
 
 #[cfg(test)]
 mod recurring_quota_tests;
+
+/// Tests for the non-zero `ttl_ledgers` guard (issue #10).
+#[cfg(test)]
+mod ttl_guard_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+
+    const SEQUENCE: u32 = 100;
+
+    fn setup(env: &Env) -> PermissionsContractClient<'_> {
+        env.mock_all_auths();
+        env.ledger().set_sequence_number(SEQUENCE);
+        let contract_id = env.register(PermissionsContract, ());
+        PermissionsContractClient::new(env, &contract_id)
+    }
+
+    #[test]
+    fn grant_rejects_zero_ttl() {
+        let env = Env::default();
+        let client = setup(&env);
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchants = Vec::<Address>::new(&env);
+
+        assert_eq!(
+            client.try_grant(&owner, &delegate, &1_000, &100, &merchants, &0),
+            Err(Ok(PermissionError::InvalidTtl))
+        );
+        // Nothing may be recorded by a rejected grant.
+        assert!(client.try_get_permission(&owner, &delegate).is_err());
+    }
+
+    #[test]
+    fn grant_accepts_ttl_of_one() {
+        let env = Env::default();
+        let client = setup(&env);
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchants = Vec::<Address>::new(&env);
+
+        assert_eq!(
+            client.try_grant(&owner, &delegate, &1_000, &100, &merchants, &1),
+            Ok(Ok(()))
+        );
+        let record = client.get_permission(&owner, &delegate);
+        assert_eq!(record.status, PermissionStatus::Active);
+        assert_eq!(record.expires_at_ledger, SEQUENCE + 1);
+    }
+
+    #[test]
+    fn grant_child_rejects_zero_ttl() {
+        let env = Env::default();
+        let client = setup(&env);
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let child = Address::generate(&env);
+        let merchants = Vec::<Address>::new(&env);
+
+        client.grant(&owner, &delegate, &1_000, &100, &merchants, &1_000);
+
+        assert_eq!(
+            client.try_grant_child(&owner, &delegate, &child, &500, &50, &merchants, &0),
+            Err(Ok(PermissionError::InvalidTtl))
+        );
+        assert!(client.try_get_permission(&delegate, &child).is_err());
+    }
+
+    #[test]
+    fn grant_child_accepts_ttl_of_one() {
+        let env = Env::default();
+        let client = setup(&env);
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let child = Address::generate(&env);
+        let merchants = Vec::<Address>::new(&env);
+
+        client.grant(&owner, &delegate, &1_000, &100, &merchants, &1_000);
+
+        assert_eq!(
+            client.try_grant_child(&owner, &delegate, &child, &500, &50, &merchants, &1),
+            Ok(Ok(()))
+        );
+        let record = client.get_permission(&delegate, &child);
+        assert_eq!(record.status, PermissionStatus::Active);
+        assert_eq!(record.expires_at_ledger, SEQUENCE + 1);
+    }
+}
