@@ -198,7 +198,9 @@ impl PermissionsContract {
         owner: Address,
         delegate: Address,
     ) -> Option<RecurringQuotaConfig> {
+        let key = DataKey::RecurringQuota(owner.clone(), delegate.clone());
         load(&env, &owner, &delegate).map(|mut state| {
+            crate::extend_persistent_ttl_if_needed(&env, &key);
             state.refresh(env.ledger().sequence());
             state.config
         })

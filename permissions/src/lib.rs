@@ -1657,7 +1657,7 @@ pub fn bump_instance_ttl(env: &Env) {
 
 /// Extends the TTL on a persistent storage key if it falls below the threshold.
 /// This prevents active permissions from being evicted during archival.
-fn extend_persistent_ttl_if_needed(env: &Env, key: &DataKey) {
+pub(crate) fn extend_persistent_ttl_if_needed(env: &Env, key: &DataKey) {
     bump_persistent_ttl(env, key);
 }
 
