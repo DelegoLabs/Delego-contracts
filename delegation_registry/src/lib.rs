@@ -1805,10 +1805,19 @@ impl DelegationRegistry {
         label: Symbol,
     ) -> Result<DelegationRecord, DelegationError> {
         let key = DataKey::DelegationV2(owner.clone(), label);
-        env.storage()
+        let record = env
+            .storage()
             .persistent()
             .get::<_, DelegationRecord>(&key)
-            .ok_or(DelegationError::NotFound)
+            .ok_or(DelegationError::NotFound)?;
+
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(record)
     }
 
     /// Returns all delegations associated with the given agent identifier.
