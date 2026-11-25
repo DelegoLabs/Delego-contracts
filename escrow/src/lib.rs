@@ -195,6 +195,10 @@ pub enum EscrowTerminalState {
     Refunded,
     /// Escrow was cancelled.
     Cancelled,
+    /// Escrow was cancelled by mutual consent.
+    CancelledByMutualConsent,
+    /// Escrow was settled with both release and refund distributions.
+    SettledWithPartialRefund,
 }
 
 impl EscrowTerminalState {
@@ -204,6 +208,12 @@ impl EscrowTerminalState {
             EscrowStatus::Released => Some(EscrowTerminalState::Released),
             EscrowStatus::Refunded => Some(EscrowTerminalState::Refunded),
             EscrowStatus::Cancelled => Some(EscrowTerminalState::Cancelled),
+            EscrowStatus::CancelledByMutualConsent => {
+                Some(EscrowTerminalState::CancelledByMutualConsent)
+            }
+            EscrowStatus::SettledWithPartialRefund => {
+                Some(EscrowTerminalState::SettledWithPartialRefund)
+            }
             _ => None,
         }
     }
@@ -484,6 +494,7 @@ pub struct EscrowArchiveHeader {
     pub escrow_id: u64,
     pub settled_ledger: u32,
     pub final_settlement_hash: BytesN<32>,
+    pub final_status: EscrowStatus,
 }
 
 /// Emitted when a settled escrow is archived.
@@ -2309,7 +2320,7 @@ pub enum DataKey {
     ReferrerPublicKey(Address),
     /// Ledger sequence at which an escrow entered a terminal state.
     SettledLedger(u64),
-    /// Lightweight archive header for a settled escrow stored in instance storage.
+    /// Lightweight archive header for a settled escrow stored in persistent storage.
     EscrowArchive(u64),
 }
 
@@ -3642,6 +3653,55 @@ fn check_not_terminal(record: &EscrowRecord) -> Result<(), EscrowError> {
         EscrowStatus::SettledWithPartialRefund => Err(EscrowError::AlreadyReleased),
         _ => Ok(()),
     }
+}
+
+/// Remove per-escrow auxiliary entries when their terminal record is archived.
+fn cleanup_escrow_auxiliary_keys(env: &Env, escrow_id: u64) -> u32 {
+    let persistent_keys = [
+        DataKey::DisputeVotes(escrow_id),
+        DataKey::TimeoutExtensionVotes(escrow_id),
+        DataKey::EscrowMetadataHash(escrow_id),
+        DataKey::EscrowMetadataSchema(escrow_id),
+        DataKey::ShipmentProof(escrow_id),
+        DataKey::ReleaseCondition(escrow_id),
+        DataKey::DualControlConfig(escrow_id),
+        DataKey::EscrowYieldConfig(escrow_id),
+        DataKey::RequireReleaseCondition(escrow_id),
+        DataKey::OrderAcceptance(escrow_id),
+        DataKey::CancelLockoutLedger(escrow_id),
+        DataKey::CancelBuyerAgreement(escrow_id),
+        DataKey::InspectionPeriodConfig(escrow_id),
+        DataKey::TimelockExtensionAgreement(escrow_id),
+        DataKey::MultiOracleConfig(escrow_id),
+        DataKey::EscrowOracleVotes(escrow_id),
+        DataKey::DualControlTimeout(escrow_id),
+        DataKey::ReferralAttribution(escrow_id),
+        DataKey::MutualCancellation(escrow_id),
+        DataKey::MilestoneConfig(escrow_id),
+        DataKey::TrancheConfig(escrow_id),
+        DataKey::DisputeAppeal(escrow_id),
+        DataKey::DisputeDeadline(escrow_id),
+        DataKey::PathSlippageBounds(escrow_id),
+        DataKey::CrossCurrencySwapConfig(escrow_id),
+        DataKey::EscrowYieldSplitConfig(escrow_id),
+        DataKey::TimeoutExtensionNonce(escrow_id),
+    ];
+
+    let storage = env.storage().persistent();
+    let mut cleared: u32 = 0;
+    for key in persistent_keys.iter() {
+        if storage.has(key) {
+            storage.remove(key);
+            cleared = cleared.saturating_add(1);
+        }
+    }
+
+    let last_bump = DataKey::LastBumpLedger(escrow_id);
+    if env.storage().instance().has(&last_bump) {
+        env.storage().instance().remove(&last_bump);
+        cleared = cleared.saturating_add(1);
+    }
+    cleared
 }
 
 /// Returns `true` once a seller/admin timeout-based claim is allowed to
@@ -6828,8 +6888,25 @@ impl EscrowContract {
 
         record.amount = net_received;
         record.status = EscrowStatus::Funded;
+        record.flags.set_flag(ESCROW_FLAG_FUNDED);
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("funded"), escrow_id),
+            StandardEscrowEventPayload {
+                escrow_id,
+                buyer: buyer.clone(),
+                merchant: record.seller.clone(),
+                amount_stroops: net_received,
+                token: record.token.clone(),
+                event_timestamp: record.updated_at,
+            },
+        );
 
         Ok(true)
     }
@@ -7232,6 +7309,9 @@ impl EscrowContract {
         record.status = EscrowStatus::CancelledByMutualConsent;
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SettledLedger(escrow_id), &env.ledger().sequence());
 
         env.events().publish(
             (
@@ -7558,6 +7638,7 @@ impl EscrowContract {
         // State mutations (Effects) after external call (Interactions)
         record.amount = net_received;
         record.status = EscrowStatus::Funded;
+        record.flags.set_flag(ESCROW_FLAG_FUNDED);
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
         env.storage().persistent().extend_ttl(
@@ -7593,6 +7674,9 @@ impl EscrowContract {
         buyer: Address,
         orders: Vec<BatchDepositParams>,
     ) -> Result<Vec<u64>, EscrowError> {
+        if orders.len() > MAX_PAGE_LIMIT {
+            return Err(EscrowError::BatchLimitExceeded);
+        }
         if is_zero_address(&env, &buyer) {
             return Err(EscrowError::InvalidAddress);
         }
@@ -7638,7 +7722,7 @@ impl EscrowContract {
             return Err(EscrowError::InvalidAddress);
         }
         if items.len() > MAX_PAGE_LIMIT {
-            return Err(EscrowError::InvalidLimits);
+            return Err(EscrowError::BatchLimitExceeded);
         }
         buyer.require_auth();
 
@@ -7720,6 +7804,7 @@ impl EscrowContract {
                 .get(&key)
                 .ok_or(EscrowError::NotFound)?;
             record.status = EscrowStatus::Funded;
+            record.flags.set_flag(ESCROW_FLAG_FUNDED);
             record.updated_at = env.ledger().timestamp();
             env.storage().persistent().set(&key, &record);
             env.storage().persistent().extend_ttl(
@@ -7742,6 +7827,9 @@ impl EscrowContract {
         caller: Address,
         releases: Vec<BatchReleaseParams>,
     ) -> Result<Vec<PartialReleaseResult>, EscrowError> {
+        if releases.len() > MAX_PAGE_LIMIT {
+            return Err(EscrowError::BatchLimitExceeded);
+        }
         caller.require_auth();
         Self::enter_release(&env)?;
 
@@ -7770,6 +7858,9 @@ impl EscrowContract {
         caller: Address,
         refunds: Vec<BatchRefundParams>,
     ) -> Result<Vec<PartialRefundResult>, EscrowError> {
+        if refunds.len() > MAX_PAGE_LIMIT {
+            return Err(EscrowError::BatchLimitExceeded);
+        }
         caller.require_auth();
 
         let mut results = Vec::new(&env);
@@ -10963,7 +11054,6 @@ impl EscrowContract {
         );
 
         Ok(true)
-        Err(EscrowError::InvalidStatus)
     }
 
     /// Register the line items that make up a multi-item escrow (issue #363).
@@ -11806,7 +11896,10 @@ impl EscrowContract {
         // array is used rather than a host `Vec` — the key set is fixed, and
         // building it on the stack avoids the storage round-trip and the clone
         // that materializing `DataKey` values into a `Vec` would cost.
-        let aux_keys = [
+        let mut cleared_entries = 1u32; // the escrow record itself
+        let storage = env.storage().persistent();
+        // Count present persistent auxiliary entries without mutating state.
+        let persistent_aux_keys = [
             DataKey::DisputeVotes(escrow_id),
             DataKey::TimeoutExtensionVotes(escrow_id),
             DataKey::EscrowMetadataHash(escrow_id),
@@ -11816,16 +11909,33 @@ impl EscrowContract {
             DataKey::DualControlConfig(escrow_id),
             DataKey::EscrowYieldConfig(escrow_id),
             DataKey::RequireReleaseCondition(escrow_id),
-            DataKey::LastBumpLedger(escrow_id),
+            DataKey::OrderAcceptance(escrow_id),
+            DataKey::CancelLockoutLedger(escrow_id),
+            DataKey::CancelBuyerAgreement(escrow_id),
+            DataKey::InspectionPeriodConfig(escrow_id),
+            DataKey::TimelockExtensionAgreement(escrow_id),
+            DataKey::MultiOracleConfig(escrow_id),
+            DataKey::EscrowOracleVotes(escrow_id),
+            DataKey::DualControlTimeout(escrow_id),
+            DataKey::ReferralAttribution(escrow_id),
+            DataKey::MutualCancellation(escrow_id),
+            DataKey::MilestoneConfig(escrow_id),
+            DataKey::TrancheConfig(escrow_id),
+            DataKey::DisputeAppeal(escrow_id),
+            DataKey::DisputeDeadline(escrow_id),
+            DataKey::PathSlippageBounds(escrow_id),
+            DataKey::CrossCurrencySwapConfig(escrow_id),
+            DataKey::EscrowYieldSplitConfig(escrow_id),
+            DataKey::TimeoutExtensionNonce(escrow_id),
         ];
-        let storage = env.storage().persistent();
-        let mut cleared_entries: u32 = 0;
-        for aux_key in aux_keys.iter() {
+        for aux_key in persistent_aux_keys.iter() {
             if storage.has(aux_key) {
-                cleared_entries += 1;
+                cleared_entries = cleared_entries.saturating_add(1);
             }
         }
-        cleared_entries += 1; // the escrow record itself
+        if env.storage().instance().has(&DataKey::LastBumpLedger(escrow_id)) {
+            cleared_entries = cleared_entries.saturating_add(1);
+        }
 
         // Emitted *before* the removals: once the sweep returns, the state this
         // event describes no longer exists, so the record of what was purged
@@ -11845,9 +11955,7 @@ impl EscrowContract {
             },
         );
 
-        for aux_key in aux_keys.iter() {
-            storage.remove(aux_key);
-        }
+        cleanup_escrow_auxiliary_keys(&env, escrow_id);
         storage.remove(&key);
 
         Ok(())
@@ -11855,7 +11963,7 @@ impl EscrowContract {
 
     /// Archive a settled or cancelled escrow after 100,000 ledgers post-settlement.
     ///
-    /// Moves the settled escrow to TTL-decaying instance storage as an [`EscrowArchiveHeader`],
+    /// Moves the settled escrow to persistent storage as an [`EscrowArchiveHeader`],
     /// deletes verbose order line-items and other persistent entries from persistent storage
     /// to reclaim ongoing rent fees, and emits an [`EscrowArchived`] event with the full
     /// state digest for off-chain indexers.
@@ -11874,16 +11982,21 @@ impl EscrowContract {
             .get(&key)
             .ok_or(EscrowError::NotFound)?;
 
-        let is_terminal = match record.status {
-            EscrowStatus::Released | EscrowStatus::Refunded | EscrowStatus::Cancelled => true,
-            _ => false,
-        };
-        if !is_terminal {
+        let terminal_state =
+            EscrowTerminalState::from_status(&record.status).ok_or(EscrowError::InvalidStatus)?;
+        let is_cancel_only = matches!(
+            terminal_state,
+            EscrowTerminalState::Cancelled
+                | EscrowTerminalState::CancelledByMutualConsent
+        );
+        if !is_cancel_only
+            && record.amount - record.released_amount - record.refunded_amount != 0
+        {
             return Err(EscrowError::InvalidStatus);
         }
 
-        if record.status != EscrowStatus::Cancelled
-            && record.amount - record.released_amount - record.refunded_amount != 0
+        if matches!(terminal_state, EscrowTerminalState::Cancelled)
+            && record.released_amount != 0
         {
             return Err(EscrowError::InvalidStatus);
         }
@@ -11918,31 +12031,22 @@ impl EscrowContract {
         env.storage().persistent().remove(&DataKey::SettledLedger(escrow_id));
         env.storage().persistent().remove(&key);
 
-        let aux_keys = [
-            DataKey::DisputeVotes(escrow_id),
-            DataKey::TimeoutExtensionVotes(escrow_id),
-            DataKey::EscrowMetadataHash(escrow_id),
-            DataKey::EscrowMetadataSchema(escrow_id),
-            DataKey::ShipmentProof(escrow_id),
-            DataKey::ReleaseCondition(escrow_id),
-            DataKey::DualControlConfig(escrow_id),
-            DataKey::EscrowYieldConfig(escrow_id),
-            DataKey::RequireReleaseCondition(escrow_id),
-            DataKey::LastBumpLedger(escrow_id),
-        ];
-        for aux_key in aux_keys.iter() {
-            env.storage().persistent().remove(aux_key);
-        }
+        cleanup_escrow_auxiliary_keys(&env, escrow_id);
 
-        // Move to TTL-decaying instance storage
+        // Move the lightweight header to persistent storage.
         let header = EscrowArchiveHeader {
             escrow_id,
             settled_ledger,
             final_settlement_hash: final_settlement_hash.clone(),
+            final_status: record.status.clone(),
         };
-        env.storage()
-            .instance()
-            .set(&DataKey::EscrowArchive(escrow_id), &header);
+        let archive_key = DataKey::EscrowArchive(escrow_id);
+        env.storage().persistent().set(&archive_key, &header);
+        env.storage().persistent().extend_ttl(
+            &archive_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         // Emit EscrowArchived event containing full state digest for off-chain indexers
         env.events().publish(
@@ -11963,12 +12067,12 @@ impl EscrowContract {
 
     /// Read-only getter for the lightweight archive header of a settled escrow.
     pub fn get_archived_escrow(env: Env, escrow_id: u64) -> Option<EscrowArchiveHeader> {
-        env.storage().instance().get(&DataKey::EscrowArchive(escrow_id))
+        env.storage().persistent().get(&DataKey::EscrowArchive(escrow_id))
     }
 
     /// Read-only getter for the lightweight archive header of a settled escrow (alias).
     pub fn get_escrow_archive(env: Env, escrow_id: u64) -> Option<EscrowArchiveHeader> {
-        env.storage().instance().get(&DataKey::EscrowArchive(escrow_id))
+        env.storage().persistent().get(&DataKey::EscrowArchive(escrow_id))
     }
 
     /// Remove a co-admin. Must be called by the primary admin.
