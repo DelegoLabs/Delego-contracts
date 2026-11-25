@@ -1,5 +1,6 @@
 //! Opt-in, per-escrow accounting over Blend's non-collateral supply positions.
 //! Failed pool calls or principal shortfalls abort the enclosing transaction.
+use crate::checkpoint::{self, CheckpointError};
 use delego_interfaces::blend::{underlying, BlendPoolClient, Request, SUPPLY, WITHDRAW};
 use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
@@ -60,6 +61,10 @@ struct Position {
 }
 
 fn fail(env: &Env, error: BlendYieldError) -> ! {
+    panic_with_error!(env, error)
+}
+
+fn checkpoint_fail(env: &Env, error: CheckpointError) -> ! {
     panic_with_error!(env, error)
 }
 
@@ -220,6 +225,8 @@ pub fn fund(env: &Env, id: u64, asset: &Address, amount: i128) {
         },
     );
     bump(env, &key);
+    checkpoint::stake(env, &cfg.lending_pool_contract, id, shares)
+        .unwrap_or_else(|error| checkpoint_fail(env, error));
     env.events().publish(
         (symbol_short!("escrow"), symbol_short!("bl_supply"), id),
         (amount, shares),
@@ -254,6 +261,8 @@ pub fn redeem(env: &Env, id: u64) {
         );
         env.storage().persistent().set(&stranded_key, &stranded);
         bump(env, &stranded_key);
+        checkpoint::unstake(env, &cfg.lending_pool_contract, id, position.shares)
+            .unwrap_or_else(|error| checkpoint_fail(env, error));
         position.shares = 0;
         env.storage().persistent().set(&key, &position);
         env.events().publish(
@@ -307,6 +316,8 @@ pub fn redeem(env: &Env, id: u64) {
         fail(env, BlendYieldError::PrincipalShortfall);
     }
     let interest = checked(env, received.checked_sub(position.principal));
+    checkpoint::unstake(env, &cfg.lending_pool_contract, id, position.shares)
+        .unwrap_or_else(|error| checkpoint_fail(env, error));
     position.shares = 0;
     env.storage().persistent().set(&key, &position);
     cfg.accrued_yield_stroops = interest;
