@@ -981,11 +981,20 @@ pub enum DataKey {
     ProductAttestation(u64, u64),
 }
 
+/// Mirror of `EntityRole` from `delego-reputation` for cross-contract deserialization.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntityRole {
+    Merchant,
+    BuyerAgent,
+}
+
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExternalReputationScore {
     pub entity: Address,
+    pub role: EntityRole,
     pub score: u32,
     pub total_transactions: u64,
     pub successful_transactions: u64,
@@ -7157,6 +7166,84 @@ mod product_attestation_tests {
                 .client
                 .get_product_attestation(&merchant_id, &9u64)
                 .is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod reputation_cross_contract_tests {
+    use super::*;
+    use delego_reputation::{
+        ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
+    };
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{Address, Env, String, Symbol};
+
+    #[test]
+    fn get_merchant_view_detailed_resolves_reputation() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        // Deploy reputation contract with a threshold of 1 so the score is unmasked.
+        let rep_admin = Address::generate(&env);
+        let rep_id = env.register(
+            ReputationContract,
+            (
+                rep_admin.clone(),
+                ReputationConfig {
+                    decay_window_seconds: 90 * 24 * 60 * 60,
+                    min_transactions_threshold: 1,
+                    dispute_penalty_bps: 500,
+                    freeze_threshold_flags: 3,
+                },
+            ),
+        );
+        let rep_client = ReputationContractClient::new(&env, &rep_id);
+
+        // Register a merchant and record one successful transaction so there
+        // is a reputation score to read back.
+        let owner = Address::generate(&env);
+        let (token_id, deposit) = crate::testutil::funded_registration_deposit(&env, &owner);
+        let merchant_id = client.register_merchant(
+            &owner,
+            &RegisterParams {
+                name: String::from_str(&env, "Cross-contract Merchant"),
+                description: String::from_str(&env, ""),
+                category: Symbol::new(&env, "general"),
+                image_url: String::from_str(&env, ""),
+                metadata: None,
+                metadata_uri: None,
+                required_verifications: 0,
+            },
+            &token_id,
+            &deposit,
+        );
+
+        rep_client.record_transaction(
+            &rep_admin,
+            &1u64,
+            &owner,
+            &Address::generate(&env),
+            &1_000i128,
+            &TransactionOutcome::Released,
+        );
+
+        // Wire the reputation contract to the merchant.
+        client.set_merchant_reputation(&admin, &merchant_id, &Some(rep_id.clone()));
+
+        // The detailed view must decode the cross-contract response without
+        // falling back to CallFailed.
+        let detailed = client.get_merchant_view_detailed(&merchant_id);
+        match detailed.reputation {
+            ReputationResolution::Available(score, _) => {
+                let expected = rep_client.get_reputation(&owner).score;
+                assert_eq!(score, expected);
+            }
+            other => panic!("expected ReputationResolution::Available, got {:?}", other),
         }
     }
 }
