@@ -28,15 +28,15 @@ pub struct YieldBearingEscrowConfig {
 #[repr(u32)]
 pub enum BlendYieldError {
     /// Invalid, duplicate, or already-used configuration.
-    InvalidConfig = 4900,
+    InvalidConfig = 700,
     /// Pool response cannot be decoded or violates accounting expectations.
-    InvalidPool = 4901,
+    InvalidPool = 701,
     /// Conversion or balance arithmetic overflowed.
-    MathOverflow = 4902,
+    MathOverflow = 702,
     /// Redeemed balance does not cover this escrow's principal.
-    PrincipalShortfall = 4903,
+    PrincipalShortfall = 703,
     /// Position has already been funded.
-    AlreadyFunded = 4904,
+    AlreadyFunded = 704,
 }
 
 #[contracttype]

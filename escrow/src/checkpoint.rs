@@ -39,13 +39,13 @@ pub const YIELD_PRECISION: i128 = 1_000_000_000_000;
 #[repr(u32)]
 pub enum CheckpointError {
     /// Negative accrual, non-positive share change, or a mismatched split.
-    InvalidAmount = 4910,
+    InvalidAmount = 710,
     /// A checkpoint moved backwards in ledger sequence or accumulator value.
-    LedgerRegression = 4911,
+    LedgerRegression = 711,
     /// A withdrawal exceeds the position's shares.
-    InsufficientShares = 4912,
+    InsufficientShares = 712,
     /// Intermediate arithmetic exceeded `i128`.
-    MathOverflow = 4913,
+    MathOverflow = 713,
 }
 
 /// Snapshot of the pool accumulator at a ledger.
