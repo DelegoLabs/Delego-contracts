@@ -68,7 +68,7 @@ pub struct DefiPoolDetachedEvent {
 
 #[contracttype]
 #[derive(Clone)]
-enum UnwindKey {
+pub(crate) enum UnwindKey {
     DetachApprovals(Address),
 }
 
@@ -81,10 +81,16 @@ pub fn assert_pool_accepting_deposits(env: &Env, pool: &Address) -> Result<(), E
 }
 
 fn detach_approvals(env: &Env, pool: &Address) -> Vec<Address> {
-    env.storage()
-        .persistent()
-        .get(&UnwindKey::DetachApprovals(pool.clone()))
-        .unwrap_or_else(|| Vec::new(env))
+    let key = UnwindKey::DetachApprovals(pool.clone());
+    let approvals: Option<Vec<Address>> = env.storage().persistent().get(&key);
+    if approvals.is_some() {
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+    approvals.unwrap_or_else(|| Vec::new(env))
 }
 
 fn detach(env: &Env, admin: Address, pool: Address) -> Result<bool, EscrowError> {
