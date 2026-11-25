@@ -2438,37 +2438,74 @@ pub enum DataKey {
 // | 445 | InspectionExpired | next major |
 // | 446 | InspectionConfigNotSet | next major |
 // | 447 | InspectionAutoReleaseNotReady | next major |
-// | 448+ | Reserved for new variants | next major |
-// | 407 | UpgradeProposalExists | next major |
-// | 408 | UpgradeProposalNotFound | next major |
-// | 409 | UpgradeTimelockActive | next major |
-// | 410 | UpgradeHashMismatch | next major |
-// | 411 | EmergencyRescueProposalNotFound | next major |
-// | 412 | EmergencyRescueTimelockNotElapsed | next major |
-// | 413 | EmergencyRescueThresholdNotMet | next major |
-// | 414 | EmergencyRescueAlreadyExecuted | next major |
-// | 415 | EscrowNotEligibleForRescue | next major |
-// | 416+ | Reserved for new variants | next major |
-// | 411 | InvalidMilestoneSchedule | next major |
-// | 412 | MilestoneNotFound | next major |
-// | 413 | MilestoneAlreadyReleased | next major |
-// | 414 | MilestoneReleaseRequired | next major |
-// | 415+ | Reserved for new variants | next major |
-// | 411 | GuardianNotSet | next major |
-// | 412 | GuardianAlreadySet | next major |
-// | 413 | AdminActionNotFound | next major |
-// | 414 | AdminActionLocked | next major |
-// | 415 | AdminActionVetoed | next major |
-// | 416 | AdminActionAlreadyQueued | next major |
-// | 417 | AdminActionOverflow | next major |
-// | 418+ | Reserved for new variants | next major |
-// | 411 | MathOverflow | next major |
-// | 412 | ReentrancyDetected | next major |
-// | 411 | CancelLockoutActive | next major |
-// | 412 | InvalidCancelLockout | next major |
-// | 411 | MathOverflow | next major |
-// | 412 | InvalidMinFee | next major |
-// | 413+ | Reserved for new variants | next major |
+// | 448 | TimeoutExtensionNonceUsed | next major |
+// | 449 | InvalidTimeoutExtensionVoucher | next major |
+// | 450 | TimelockExtensionNotFound | next major |
+// | 451 | TimelockExtensionAlreadyProposed | next major |
+// | 452 | InvalidTimelockExtension | next major |
+// | 453 | NotTimelockExtensionParty | next major |
+// | 454 | TimelockExtensionAlreadyApproved | next major |
+// | 455 | TimelockExtensionPendingApproval | next major |
+// | 456 | InvalidTrancheSchedule | next major |
+// | 457 | TrancheNotFound | next major |
+// | 458 | TrancheAlreadyReleased | next major |
+// | 459 | TrancheOutOfSequence | next major |
+// | 460 | InvalidTrancheProof | next major |
+// | 461 | ValueConservationViolation | next major |
+// | 462 | TrancheReleaseRequired | next major |
+// | 470 | InvalidMilestoneSchedule | next major |
+// | 471 | MilestoneNotFound | next major |
+// | 472 | MilestoneAlreadyReleased | next major |
+// | 473 | MilestoneReleaseRequired | next major |
+// | 474 | GuardianNotSet | next major |
+// | 475 | GuardianAlreadySet | next major |
+// | 476 | AdminActionNotFound | next major |
+// | 477 | AdminActionLocked | next major |
+// | 478 | AdminActionVetoed | next major |
+// | 479 | AdminActionAlreadyQueued | next major |
+// | 480 | NonceAlreadyUsed | next major |
+// | 481 | AuthorizationExpired | next major |
+// | 482 | BuyerReleaseKeyNotSet | next major |
+// | 483 | AdminActionOverflow | next major |
+// | 484 | MathOverflow | next major |
+// | 485 | DepositUnderfunded | next major |
+// | 486 | CancelLockoutActive | next major |
+// | 487 | InvalidCancelLockout | next major |
+// | 490 | InvalidMinFee | next major |
+// | 491 | InvalidTtlExtension | next major |
+// | 492 | AlreadyShipped | next major |
+// | 493 | CourierPubkeyNotSet | next major |
+// | 494 | ExceedsTotalEscrowAmount | next major |
+// | 495 | UnfundedCancellationNotAllowed | next major |
+// | 496 | DefiPoolDetached | next major |
+// | 497 | EmergencyRescueProposalNotFound | next major |
+// | 498 | EmergencyRescueTimelockNotElapsed | next major |
+// | 499 | EmergencyRescueThresholdNotMet | next major |
+// | 500 | EmergencyRescueAlreadyExecuted | next major |
+// | 501 | EscrowNotEligibleForRescue | next major |
+// | 502 | SubItemAlreadyResolved | next major |
+// | 503 | OracleInvocationFailed | next major |
+// | 600 | TokenTransferFailed | next major |
+// | 601 | TokenTransferRejected | next major |
+// | 602 | TokenUnexpectedReturn | next major |
+// | 603 | TokenInsufficientBalance | next major |
+// | 604 | TokenAllowanceExceeded | next major |
+// | 605 | TokenFrozen | next major |
+// | 606 | TokenInvalidTokenContract | next major |
+// | 607 | ReferralAlreadySet | next major |
+// | 608 | SelfReferralNotAllowed | next major |
+// | 609 | InvalidReferralCommission | next major |
+// | 610 | ReferrerKeyNotSet | next major |
+// | 611 | InvalidSplitSettlement | next major |
+// | 612 | SameLedgerManipulationDetected | next major |
+// | 613 | DefiPoolAlreadyDetached | next major |
+// | 620 | BlendSupplyFailed | next major |
+// | 621 | BlendWithdrawFailed | next major |
+// | 622 | LstTokenNotWhitelisted | next major |
+// | 623 | InvalidLstExchangeRate | next major |
+// | 624 | LstCollateralNotFound | next major |
+// | 625 | LstCollateralAlreadyRecorded | next major |
+// | 626 | UnsafeHealthFactor | next major |
 //
 // # Allocating new variants
 //
@@ -2575,7 +2612,7 @@ pub enum EscrowError {
     /// Escrow has already been cancelled
     AlreadyCancelled = 27,
     /// Cannot cancel an unfunded escrow (only merchant/relayer can, after 300 ledger grace period)
-    UnfundedCancellationNotAllowed = 28,
+    UnfundedCancellationNotAllowed = 495,
     /// Escrow has already been funded
     AlreadyFunded = 28,
     /// Extension length must be > 0
@@ -2731,7 +2768,7 @@ pub enum EscrowError {
     /// Timelock extension not yet approved by both parties.
     TimelockExtensionPendingApproval = 455,
     /// Requested storage TTL extension is outside the supported bounds.
-    InvalidTtlExtension = 450,
+    InvalidTtlExtension = 491,
     /// Buyer refund + merchant payout + platform fee does not equal the
     /// deposited escrow principal (issue #547).
     ValueConservationViolation = 461,
@@ -2747,7 +2784,7 @@ pub enum EscrowError {
     /// Invalid checkpoint proof signature for tranche unlock (Issue #484).
     InvalidTrancheProof = 460,
     /// Courier public key not configured for this tranche escrow (Issue #484).
-    CourierPubkeyNotSet = 461,
+    CourierPubkeyNotSet = 493,
     /// Tranche escrows must be paid out through `unlock_tranche`.
     TrancheReleaseRequired = 462,
     /// Relayed release authorization nonce was already consumed.
@@ -2758,7 +2795,7 @@ pub enum EscrowError {
     BuyerReleaseKeyNotSet = 482,
     /// Escrow has already been shipped; mutual cancellation is no longer
     /// permitted (issue #487).
-    AlreadyShipped = 456,
+    AlreadyShipped = 492,
     /// Cross-contract token `transfer`/`transfer_from` call failed and no
     /// more specific reason could be determined (issue #481).
     TokenTransferFailed = 600,
@@ -2861,9 +2898,25 @@ pub enum EscrowError {
     InvalidMinFee = 490,
     /// The external DeFi pool has been emergency-detached and accepts no new
     /// deposits (issue #597).
-    DefiPoolDetached = 612,
+    DefiPoolDetached = 496,
     /// The external DeFi pool is already detached (issue #597).
     DefiPoolAlreadyDetached = 613,
+    /// The requested amount exceeds the total escrow principal.
+    ExceedsTotalEscrowAmount = 494,
+    /// No emergency rescue proposal exists.
+    EmergencyRescueProposalNotFound = 497,
+    /// The emergency rescue timelock has not elapsed.
+    EmergencyRescueTimelockNotElapsed = 498,
+    /// The emergency rescue approval threshold has not been met.
+    EmergencyRescueThresholdNotMet = 499,
+    /// The emergency rescue proposal has already been executed.
+    EmergencyRescueAlreadyExecuted = 500,
+    /// The escrow is not eligible for emergency rescue.
+    EscrowNotEligibleForRescue = 501,
+    /// The escrow sub-item has already been resolved.
+    SubItemAlreadyResolved = 502,
+    /// The oracle contract invocation failed.
+    OracleInvocationFailed = 503,
 }
 
 pub fn execute_atomic_operation<F, T>(env: &Env, f: F) -> Result<T, EscrowError>
@@ -2892,6 +2945,28 @@ where
 /// cases, so the conversions are written out here and the spec entry is omitted.
 macro_rules! impl_escrow_error_try_from {
     ($($code:literal => $variant:ident),* $(,)?) => {
+        impl From<EscrowError> for u32 {
+            fn from(error: EscrowError) -> Self {
+                // Exhaustive matching makes a missing conversion a compile error.
+                match error {
+                    $( EscrowError::$variant => $code, )*
+                }
+            }
+        }
+
+        impl TryFrom<u32> for EscrowError {
+            type Error = u32;
+            fn try_from(code: u32) -> Result<Self, Self::Error> {
+                match code {
+                    $( $code => Ok(Self::$variant), )*
+                    _ => Err(code),
+                }
+            }
+        }
+
+        #[cfg(test)]
+        const ALL_ESCROW_ERRORS: &[EscrowError] = &[$(EscrowError::$variant,)*];
+
         impl TryFrom<soroban_sdk::Error> for EscrowError {
             type Error = soroban_sdk::Error;
             #[inline(always)]
@@ -2952,6 +3027,7 @@ impl_escrow_error_try_from! {
     25 => ConflictingQuorum,
     26 => CreationPaused,
     27 => AlreadyCancelled,
+    495 => UnfundedCancellationNotAllowed,
     28 => AlreadyFunded,
     29 => InvalidExtension,
     30 => PoolNotFound,
@@ -2984,26 +3060,6 @@ impl_escrow_error_try_from! {
     408 => MerkleRootAlreadyPublished,
     409 => BatchLimitExceeded,
     410 => InvalidDisputeAward,
-    411 => UpgradeProposalExists,
-    412 => UpgradeProposalNotFound,
-    413 => UpgradeTimelockActive,
-    414 => UpgradeHashMismatch,
-    415 => MathOverflow,
-    416 => ExceedsTotalEscrowAmount,
-    417 => MerchantCategoryNotAllowed,
-    418 => SubItemAlreadyResolved,
-    461 => ValueConservationViolation,
-    456 => InvalidTrancheSchedule,
-    457 => TrancheNotFound,
-    458 => TrancheAlreadyReleased,
-    459 => TrancheOutOfSequence,
-    460 => InvalidTrancheProof,
-    461 => CourierPubkeyNotSet,
-    462 => TrancheReleaseRequired,
-    456 => InvalidTtlExtension,
-    480 => NonceAlreadyUsed,
-    481 => AuthorizationExpired,
-    482 => BuyerReleaseKeyNotSet,
     411 => InvalidSwapConfig,
     412 => SwapConfigNotSet,
     413 => SlippageExceeded,
@@ -3043,31 +3099,25 @@ impl_escrow_error_try_from! {
     447 => InspectionAutoReleaseNotReady,
     448 => TimeoutExtensionNonceUsed,
     449 => InvalidTimeoutExtensionVoucher,
-    450 => EmergencyRescueProposalNotFound,
-    451 => EmergencyRescueTimelockNotElapsed,
-    452 => EmergencyRescueThresholdNotMet,
-    453 => EmergencyRescueAlreadyExecuted,
-    454 => EscrowNotEligibleForRescue,
-    455 => GuardianNotSet,
-    456 => GuardianAlreadySet,
-    457 => AdminActionNotFound,
-    458 => AdminActionLocked,
-    459 => AdminActionVetoed,
-    460 => AdminActionAlreadyQueued,
-    461 => AdminActionOverflow,
-    462 => CancelLockoutActive,
-    463 => InvalidCancelLockout,
-    464 => MathOverflow,
-    465 => InvalidMinFee,
-    466 => InvalidMilestoneSchedule,
-    467 => MilestoneNotFound,
-    468 => MilestoneAlreadyReleased,
-    469 => MilestoneReleaseRequired,
-    470 => DepositUnderfunded,
-    471 => ExceedsTotalEscrowAmount,
-    472 => SubItemAlreadyResolved,
-    473 => OracleInvocationFailed,
-    456 => AlreadyShipped,
+    450 => TimelockExtensionNotFound,
+    451 => TimelockExtensionAlreadyProposed,
+    452 => InvalidTimelockExtension,
+    453 => NotTimelockExtensionParty,
+    454 => TimelockExtensionAlreadyApproved,
+    455 => TimelockExtensionPendingApproval,
+    491 => InvalidTtlExtension,
+    461 => ValueConservationViolation,
+    456 => InvalidTrancheSchedule,
+    457 => TrancheNotFound,
+    458 => TrancheAlreadyReleased,
+    459 => TrancheOutOfSequence,
+    460 => InvalidTrancheProof,
+    493 => CourierPubkeyNotSet,
+    462 => TrancheReleaseRequired,
+    480 => NonceAlreadyUsed,
+    481 => AuthorizationExpired,
+    482 => BuyerReleaseKeyNotSet,
+    492 => AlreadyShipped,
     600 => TokenTransferFailed,
     601 => TokenTransferRejected,
     602 => TokenUnexpectedReturn,
@@ -3088,6 +3138,32 @@ impl_escrow_error_try_from! {
     624 => LstCollateralNotFound,
     625 => LstCollateralAlreadyRecorded,
     626 => UnsafeHealthFactor,
+    470 => InvalidMilestoneSchedule,
+    471 => MilestoneNotFound,
+    472 => MilestoneAlreadyReleased,
+    473 => MilestoneReleaseRequired,
+    474 => GuardianNotSet,
+    475 => GuardianAlreadySet,
+    476 => AdminActionNotFound,
+    477 => AdminActionLocked,
+    478 => AdminActionVetoed,
+    479 => AdminActionAlreadyQueued,
+    483 => AdminActionOverflow,
+    484 => MathOverflow,
+    485 => DepositUnderfunded,
+    486 => CancelLockoutActive,
+    487 => InvalidCancelLockout,
+    490 => InvalidMinFee,
+    496 => DefiPoolDetached,
+    613 => DefiPoolAlreadyDetached,
+    494 => ExceedsTotalEscrowAmount,
+    497 => EmergencyRescueProposalNotFound,
+    498 => EmergencyRescueTimelockNotElapsed,
+    499 => EmergencyRescueThresholdNotMet,
+    500 => EmergencyRescueAlreadyExecuted,
+    501 => EscrowNotEligibleForRescue,
+    502 => SubItemAlreadyResolved,
+    503 => OracleInvocationFailed,
 }
 
 impl TryFrom<&soroban_sdk::Error> for EscrowError {
@@ -18094,133 +18170,8 @@ mod error_code_allocation_tests {
         (3_000, 3_999),
         (4_000, 4_999),
     ];
-    fn escrow_error_codes() -> [u32; 124] {
-        [
-            EscrowError::AlreadyInitialized as u32,
-            EscrowError::NotFound as u32,
-            EscrowError::Unauthorized as u32,
-            EscrowError::AlreadyReleased as u32,
-            EscrowError::AlreadyRefunded as u32,
-            EscrowError::InvalidStatus as u32,
-            EscrowError::TimeoutNotReached as u32,
-            EscrowError::NotDisputed as u32,
-            EscrowError::InvalidAmount as u32,
-            EscrowError::TokenNotWhitelisted as u32,
-            EscrowError::InsufficientEscrowBalance as u32,
-            EscrowError::ZeroAmount as u32,
-            EscrowError::NoPendingTransfer as u32,
-            EscrowError::InvalidPendingAdmin as u32,
-            EscrowError::AdminAlreadyExists as u32,
-            EscrowError::InvalidFeeBps as u32,
-            EscrowError::AmountBelowMin as u32,
-            EscrowError::AmountAboveMax as u32,
-            EscrowError::InvalidLimits as u32,
-            EscrowError::NotAnArbiter as u32,
-            EscrowError::AlreadyVoted as u32,
-            EscrowError::InvalidQuorum as u32,
-            EscrowError::QuorumNotReached as u32,
-            EscrowError::QuorumConfigNotSet as u32,
-            EscrowError::ConflictingQuorum as u32,
-            EscrowError::CreationPaused as u32,
-            EscrowError::AlreadyCancelled as u32,
-            EscrowError::AlreadyFunded as u32,
-            EscrowError::InvalidExtension as u32,
-            EscrowError::PoolNotFound as u32,
-            EscrowError::InsufficientPoolBalance as u32,
-            EscrowError::InvalidAddress as u32,
-            EscrowError::InvalidEscrowParticipants as u32,
-            EscrowError::ReleaseConditionNotSet as u32,
-            EscrowError::OracleCallFailed as u32,
-            EscrowError::ConditionNotMet as u32,
-            EscrowError::InvalidYieldConfig as u32,
-            EscrowError::AmountLimitsNotSet as u32,
-            EscrowError::FeeConfigNotSet as u32,
-            EscrowError::MaxTreasuriesExceeded as u32,
-            EscrowError::MerchantNotTrading as u32,
-            EscrowError::MerchantStatusCheckFailed as u32,
-            EscrowError::SignedProofRequired as u32,
-            EscrowError::InvalidSignedDeliveryProof as u32,
-            EscrowError::OraclePublicKeyNotSet as u32,
-            EscrowError::DualControlNotConfigured as u32,
-            EscrowError::SecondaryApprovalRequired as u32,
-            EscrowError::InvalidReleaseRecipient as u32,
-            EscrowError::MetadataNotSet as u32,
-            EscrowError::InvalidMetadata as u32,
-            EscrowError::BumpRateLimitExceeded as u32,
-            EscrowError::BumpThresholdNotMet as u32,
-            EscrowError::ShipmentProofNotFound as u32,
-            EscrowError::FeeUpdateNotEffective as u32,
-            EscrowError::FeeNoticeWindowNotMet as u32,
-            EscrowError::InvalidMerkleProof as u32,
-            EscrowError::MerkleRootAlreadyPublished as u32,
-            EscrowError::BatchLimitExceeded as u32,
-            EscrowError::InvalidDisputeAward as u32,
-            EscrowError::InvalidSwapConfig as u32,
-            EscrowError::SwapConfigNotSet as u32,
-            EscrowError::SlippageExceeded as u32,
-            EscrowError::SwapRouterCallFailed as u32,
-            EscrowError::ReentrancyDetected as u32,
-            EscrowError::AppealWindowExpired as u32,
-            EscrowError::AppealAlreadyFiled as u32,
-            EscrowError::NoAppealFound as u32,
-            EscrowError::NotAppealsCouncil as u32,
-            EscrowError::DisputeNotInitialRuling as u32,
-            EscrowError::AppealBondInsufficient as u32,
-            EscrowError::ArbiterStakedAmountZero as u32,
-            EscrowError::DisputeNotExpired as u32,
-            EscrowError::ArbiterNotAssigned as u32,
-            EscrowError::SlippageBoundsNotSet as u32,
-            EscrowError::InvalidSlippageBounds as u32,
-            EscrowError::SlippageBoundsTooLoose as u32,
-            EscrowError::InvalidPathRoute as u32,
-            EscrowError::PathExecutionFailed as u32,
-            EscrowError::InvalidTier as u32,
-            EscrowError::TierLimitExceeded as u32,
-            EscrowError::TierNotFound as u32,
-            EscrowError::UpgradeProposalExists as u32,
-            EscrowError::UpgradeProposalNotFound as u32,
-            EscrowError::UpgradeHashMismatch as u32,
-            EscrowError::UpgradeTimelockActive as u32,
-            EscrowError::MerchantCategoryNotAllowed as u32,
-            EscrowError::ApproverDeadlineExpired as u32,
-            EscrowError::ApproverDeadlineNotReached as u32,
-            EscrowError::InvalidFallbackAction as u32,
-            EscrowError::DualControlTimeoutNotConfigured as u32,
-            EscrowError::DualControlAlreadyApproved as u32,
-            EscrowError::ArchivalRetentionNotElapsed as u32,
-            EscrowError::NotInInspection as u32,
-            EscrowError::InspectionExpired as u32,
-            EscrowError::InspectionConfigNotSet as u32,
-            EscrowError::InspectionAutoReleaseNotReady as u32,
-            EscrowError::TimeoutExtensionNonceUsed as u32,
-            EscrowError::InvalidTimeoutExtensionVoucher as u32,
-            EscrowError::EmergencyRescueProposalNotFound as u32,
-            EscrowError::EmergencyRescueTimelockNotElapsed as u32,
-            EscrowError::EmergencyRescueThresholdNotMet as u32,
-            EscrowError::EmergencyRescueAlreadyExecuted as u32,
-            EscrowError::EscrowNotEligibleForRescue as u32,
-            EscrowError::GuardianNotSet as u32,
-            EscrowError::GuardianAlreadySet as u32,
-            EscrowError::AdminActionNotFound as u32,
-            EscrowError::AdminActionLocked as u32,
-            EscrowError::AdminActionVetoed as u32,
-            EscrowError::AdminActionAlreadyQueued as u32,
-            EscrowError::AdminActionOverflow as u32,
-            EscrowError::CancelLockoutActive as u32,
-            EscrowError::InvalidCancelLockout as u32,
-            EscrowError::MathOverflow as u32,
-            EscrowError::InvalidMinFee as u32,
-            EscrowError::InvalidMilestoneSchedule as u32,
-            EscrowError::MilestoneNotFound as u32,
-            EscrowError::MilestoneAlreadyReleased as u32,
-            EscrowError::MilestoneReleaseRequired as u32,
-            EscrowError::DepositUnderfunded as u32,
-            EscrowError::ExceedsTotalEscrowAmount as u32,
-            EscrowError::SubItemAlreadyResolved as u32,
-            EscrowError::OracleInvocationFailed as u32,
-            EscrowError::DefiPoolDetached as u32,
-            EscrowError::DefiPoolAlreadyDetached as u32,
-        ]
+    fn escrow_error_codes() -> std::vec::Vec<u32> {
+        ALL_ESCROW_ERRORS.iter().map(|error| *error as u32).collect()
     }
 
     /// ===== Emergency Rescue Tests =====
@@ -18743,7 +18694,7 @@ mod error_code_allocation_tests {
 
     #[test]
     fn math_overflow_uses_next_escrow_error_code() {
-        assert_eq!(EscrowError::MathOverflow as u32, 411);
+        assert_eq!(EscrowError::MathOverflow as u32, 484);
     }
 
     #[test]
@@ -20652,3 +20603,6 @@ mod partial_refund_resolution_tests {
         assert_eq!(pro_rata_share(1, 9_999), Ok(0));
     }
 }
+
+#[cfg(test)]
+mod error_code_tests;

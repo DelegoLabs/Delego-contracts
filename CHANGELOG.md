@@ -22,6 +22,10 @@ will reject the change.
 
 - Add pro-rata partial refund settlement (issue #539): `resolve_partial_refund` (buyer and merchant authorization)
   and `arbitrate_partial_refund` (arbiter authorization on disputed escrows), emitting `PartialRefundSettled`.
+- Fix escrow error-code collisions and stale decoding mappings (#706). Preserve
+  unambiguous codes, allocate 491-503 for conflicting/missing variants, and add
+  complete uniqueness and round-trip coverage. `ExceedsTotalEscrowAmount` uses
+  494 because 471 already belongs to `MilestoneNotFound`.
 - `create_delegation` and `create_scoped_delegation` now reject a zero `owner` or `permissions_contract`
   address with the new `DelegationError::InvalidParam` (4020), mirroring the escrow `is_zero_address`
   guard (issue #92).
