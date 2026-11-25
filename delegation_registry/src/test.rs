@@ -2766,12 +2766,10 @@ fn test_get_keeper_bounty_status_eligible_when_ttl_below_threshold() {
     let label = Symbol::new(&env, "KprLow");
     let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &200_000);
 
-    // Advance ledger far enough that the storage TTL drops below the threshold.
-    // After creation the TTL is PERSISTENT_BUMP_AMOUNT (518_400).
-    // We need TTL < KEEPER_BOUNTY_THRESHOLD_LEDGERS (50_000), so move forward
-    // by 518_400 - 40_000 = 478_400 ledgers.
+    // The ledger-based TTL estimate drops below the threshold once the bump
+    // window (518_400) is nearly spent.
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400);
+        .set_sequence_number(env.ledger().sequence() + 160_000);
 
     let status = client.get_keeper_bounty_status(&id).unwrap();
     assert!(
@@ -2793,7 +2791,7 @@ fn test_bump_delegation_ttl_with_reward_pays_keeper_and_bumps_ttl() {
 
     // Drop the TTL below the threshold.
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400);
+        .set_sequence_number(env.ledger().sequence() + 160_000);
 
     let keeper = Address::generate(&env);
 
@@ -2857,7 +2855,7 @@ fn test_bump_delegation_ttl_with_reward_fails_when_delegation_not_active() {
 
     // Drop TTL below threshold.
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400);
+        .set_sequence_number(env.ledger().sequence() + 160_000);
 
     let keeper = Address::generate(&env);
     let err = client
@@ -2882,7 +2880,7 @@ fn test_bump_delegation_ttl_with_reward_fails_when_reserve_empty() {
 
     // Drop TTL below threshold.
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400);
+        .set_sequence_number(env.ledger().sequence() + 160_000);
 
     let keeper = Address::generate(&env);
     let err = client
@@ -2904,27 +2902,26 @@ fn test_bump_delegation_ttl_with_reward_enforces_cooldown() {
         setup_with_token(200_000_000); // enough for two payouts
 
     let label = Symbol::new(&env, "KprCool");
-    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &200_000);
-
-    // First bump: drop TTL below threshold and claim.
+    // Short expiry keeps the estimated TTL below the threshold even right
+    // after a bump, so only the cooldown can reject the second claim.
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100_000);
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400);
+        .set_sequence_number(env.ledger().sequence() + 60_000);
+
     let keeper = Address::generate(&env);
     client
         .bump_delegation_ttl_with_reward(&id, &keeper, &xlm_token)
         .unwrap();
+    assert!(client.get_keeper_bounty_status(&id).unwrap().remaining_ledgers
+        < KEEPER_BOUNTY_THRESHOLD_LEDGERS);
+    assert!(!client.get_keeper_bounty_status(&id).unwrap().is_eligible_for_bounty);
 
-    // Immediately after the bump the TTL is high again — let it drop once more
-    // but advance by less than KEEPER_BOUNTY_COOLDOWN_LEDGERS (17_280).
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400);
-
-    // Should be rejected due to cooldown — not enough ledgers since last claim.
+        .set_sequence_number(env.ledger().sequence() + KEEPER_BOUNTY_COOLDOWN_LEDGERS - 1);
     let err = client
         .try_bump_delegation_ttl_with_reward(&id, &keeper, &xlm_token)
         .unwrap_err()
         .unwrap();
-
     assert_eq!(
         err,
         soroban_sdk::Error::from_contract_error(DelegationError::NotEligibleForBounty as u32),
@@ -2938,19 +2935,19 @@ fn test_bump_delegation_ttl_with_reward_allowed_after_cooldown_expires() {
         setup_with_token(200_000_000);
 
     let label = Symbol::new(&env, "KprAfCool");
-    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &3_000_000);
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &200_000);
 
     // First claim.
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400);
+        .set_sequence_number(env.ledger().sequence() + 160_000);
     let keeper = Address::generate(&env);
     client
         .bump_delegation_ttl_with_reward(&id, &keeper, &xlm_token)
         .unwrap();
 
-    // Advance past the cooldown (17_280) AND let the TTL drop again.
+    // Advance past the cooldown (17_280); expiry keeps the TTL estimate low.
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400 + KEEPER_BOUNTY_COOLDOWN_LEDGERS);
+        .set_sequence_number(env.ledger().sequence() + KEEPER_BOUNTY_COOLDOWN_LEDGERS);
 
     // Second claim should succeed.
     let status = client
@@ -3000,7 +2997,7 @@ fn test_keeper_bounty_paid_event_is_emitted() {
     let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &200_000);
 
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400);
+        .set_sequence_number(env.ledger().sequence() + 160_000);
 
     let keeper = Address::generate(&env);
     client
@@ -3026,6 +3023,8 @@ fn test_keeper_bounty_paid_event_is_emitted() {
     assert_eq!(event.delegation_id, id);
     assert_eq!(event.keeper, keeper);
     assert_eq!(event.bounty_amount_stroops, KEEPER_BOUNTY_AMOUNT_STROOPS);
+}
+
 // ── Emergency delegation circuit breaker ────────────────────────────────────
 
 #[test]
