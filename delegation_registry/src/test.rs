@@ -955,26 +955,23 @@ fn test_revoke_paused_delegation_returns_true() {
     assert_eq!(client.get_delegation_version(&id), 3);
 }
 
-assert_eq!(client.get_delegation_version(&id), 3);
-}
-
 const LARGE_TTL: u32 = 10_000_000;
 
 #[test]
-fn test_get_delegation_by_owner_and_label_active() {
+fn test_get_delegation_by_owner_label_active() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
     let label = Symbol::new(&env, "Byol_Active");
     let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
 
-    let record = client.get_delegation_by_owner_and_label(&owner, &label);
+    let record = client.get_delegation_by_owner_label(&owner, &label);
     assert!(record.is_ok());
     assert_eq!(record.unwrap().status, DelegationStatus::Active);
 }
 
 #[test]
-fn test_get_delegation_by_owner_and_label_after_sweep() {
+fn test_get_delegation_by_owner_label_after_sweep() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
@@ -987,13 +984,13 @@ fn test_get_delegation_by_owner_and_label_after_sweep() {
     ids.push_back(id);
     client.sweep_expired(&ids);
 
-    let record = client.get_delegation_by_owner_and_label(&owner, &label);
+    let record = client.get_delegation_by_owner_label(&owner, &label);
     assert!(record.is_ok());
     assert_eq!(record.unwrap().status, DelegationStatus::Expired);
 }
 
 #[test]
-fn test_get_delegation_by_owner_and_label_after_revocation() {
+fn test_get_delegation_by_owner_label_after_revocation() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
@@ -1002,24 +999,24 @@ fn test_get_delegation_by_owner_and_label_after_revocation() {
 
     client.revoke_delegation(&id);
 
-    let record = client.get_delegation_by_owner_and_label(&owner, &label);
+    let record = client.get_delegation_by_owner_label(&owner, &label);
     assert!(record.is_ok());
     assert_eq!(record.unwrap().status, DelegationStatus::Revoked);
 }
 
 #[test]
-fn test_get_delegation_by_owner_and_label_not_found() {
+fn test_get_delegation_by_owner_label_not_found() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
     let label = Symbol::new(&env, "Byol_NotFound");
 
-    let record = client.get_delegation_by_owner_and_label(&owner, &label);
+    let record = client.get_delegation_by_owner_label(&owner, &label);
     assert_eq!(record, Err(DelegationError::NotFound));
 }
 
 #[test]
-fn test_get_delegation_by_owner_and_label_idempotent_after_multiple_ops() {
+fn test_get_delegation_by_owner_label_idempotent_after_multiple_ops() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
@@ -1027,7 +1024,7 @@ fn test_get_delegation_by_owner_and_label_idempotent_after_multiple_ops() {
     let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
 
     // Initially active
-    let record = client.get_delegation_by_owner_and_label(&owner, &label);
+    let record = client.get_delegation_by_owner_label(&owner, &label);
     assert!(record.is_ok());
     assert_eq!(record.unwrap().status, DelegationStatus::Active);
 
@@ -1035,20 +1032,20 @@ fn test_get_delegation_by_owner_and_label_idempotent_after_multiple_ops() {
     env.ledger().set_sequence_number(300);
     client.sweep_expired(&Vec::from_iter(std::iter::once(id)));
 
-    let record = client.get_delegation_by_owner_and_label(&owner, &label);
+    let record = client.get_delegation_by_owner_label(&owner, &label);
     assert!(record.is_ok());
     assert_eq!(record.unwrap().status, DelegationStatus::Expired);
 
     // Revoke it
     client.revoke_delegation(&id);
 
-    let record = client.get_delegation_by_owner_and_label(&owner, &label);
+    let record = client.get_delegation_by_owner_label(&owner, &label);
     assert!(record.is_ok());
     assert_eq!(record.unwrap().status, DelegationStatus::Revoked);
 }
 
 #[test]
-fn test_get_delegation_by_owner_and_label_with_different_labels() {
+fn test_get_delegation_by_owner_label_with_different_labels() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
@@ -1058,15 +1055,15 @@ fn test_get_delegation_by_owner_and_label_with_different_labels() {
     let id2 = client.create_delegation(&owner, &agent_id, &permissions_contract, &label2, &1000);
 
     // Both should be findable by their respective labels
-    let rec1 = client.get_delegation_by_owner_and_label(&owner, &label1);
-    let rec2 = client.get_delegation_by_owner_and_label(&owner, &label2);
+    let rec1 = client.get_delegation_by_owner_label(&owner, &label1);
+    let rec2 = client.get_delegation_by_owner_label(&owner, &label2);
     assert!(rec1.is_ok() && rec2.is_ok());
     assert_eq!(rec1.unwrap().delegation_id, id1);
     assert_eq!(rec2.unwrap().delegation_id, id2);
 }
 
 #[test]
-fn test_get_delegation_by_owner_and_label_not_matching_owner() {
+fn test_get_delegation_by_owner_label_not_matching_owner() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
@@ -1075,12 +1072,12 @@ fn test_get_delegation_by_owner_and_label_not_matching_owner() {
     let id = client.create_delegation(&other_owner, &agent_id, &permissions_contract, &label, &1000);
 
     // Looking up with the original owner should not find it
-    let record = client.get_delegation_by_owner_and_label(&owner, &label);
+    let record = client.get_delegation_by_owner_label(&owner, &label);
     assert_eq!(record, Err(DelegationError::NotFound));
 }
 
 #[test]
-fn test_get_delegation_by_owner_and_label_sweep_batch() {
+fn test_get_delegation_by_owner_label_sweep_batch() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
@@ -1099,8 +1096,8 @@ fn test_get_delegation_by_owner_and_label_sweep_batch() {
     ids.push_back(id2);
     client.sweep_expired(&ids);
 
-    let rec1 = client.get_delegation_by_owner_and_label(&owner, &label1);
-    let rec2 = client.get_delegation_by_owner_and_label(&owner, &label2);
+    let rec1 = client.get_delegation_by_owner_label(&owner, &label1);
+    let rec2 = client.get_delegation_by_owner_label(&owner, &label2);
     assert!(rec1.is_ok() && rec2.is_ok());
     assert_eq!(rec1.unwrap().status, DelegationStatus::Expired);
     assert_eq!(rec2.unwrap().status, DelegationStatus::Expired);

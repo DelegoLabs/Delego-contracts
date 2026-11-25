@@ -42,7 +42,7 @@ pub fn set_storefront_metadata(
     // Suspended merchants may not update their storefront while under
     // policy review; the suspension must be lifted before metadata changes.
     if merchant.status == MerchantStatus::Suspended {
-        return Err(MarketplaceError::MerchantSuspended);
+        return Err(MarketplaceError::MerchantFrozen);
     }
 
     MarketplaceContract::check_not_frozen_or_closed(&merchant)?;

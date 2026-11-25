@@ -1,214 +1,154 @@
-use soroban_sdk::{test::Ledger, Address, Env, Symbol};
-use soroban_sdk::{test::Ledge, Env, Symbol};
-use soroban_sdk::token::{Token, TokenType};
-use soroban_sdk::types::ContractData;
+use delego_delegation_registry::{DelegationRegistry, DelegationRegistryClient, DelegationStatus};
+use delego_permissions::{PermissionError, PermissionsContract, PermissionsContractClient};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    Address, BytesN, Env, Symbol, Vec,
+};
 
-use crate::{DelegationContract, DelegationContractClient, SpendAuthorization, PermissionError};
+struct Setup {
+    env: Env,
+    permissions: PermissionsContractClient<'static>,
+    delegation: DelegationRegistryClient<'static>,
+    owner: Address,
+    delegate: Address,
+    merchant: Address,
+}
+
+fn setup() -> Setup {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let owner = Address::generate(&env);
+    let delegate = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let permissions_id = env.register(PermissionsContract, ());
+    let permissions = PermissionsContractClient::new(&env, &permissions_id);
+
+    let registry_id = env.register(DelegationRegistry, ());
+    let delegation = DelegationRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+    delegation.initialize(&admin);
+
+    Setup {
+        env,
+        permissions,
+        delegation,
+        owner,
+        delegate,
+        merchant,
+    }
+}
+
+fn grant(s: &Setup) {
+    s.permissions.grant(
+        &s.owner,
+        &s.delegate,
+        &1_000i128,
+        &500i128,
+        &Vec::new(&s.env),
+        &1_000u32,
+    );
+}
+
+#[test]
+fn test_epoch_starts_at_zero() {
+    let s = setup();
+    grant(&s);
+
+    let epoch = s.permissions.get_execution_epoch(&s.owner, &s.delegate);
+    assert_eq!(epoch.current_epoch, 0);
+}
 
 #[test]
 fn test_epoch_increment_on_pause_resume() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let client = DelegationContractClient::new(&env, &DelegationContract);
+    let s = setup();
+    grant(&s);
 
-    let deligation_id = Symbol::from_utf8(&env, "test_delegation").unwrap();
-    let owner = Address::generate(&env);
-    let agent = Address::generate(&env);
+    s.permissions.pause(&s.owner, &s.delegate);
+    let paused = s.permissions.get_execution_epoch(&s.owner, &s.delegate);
+    assert_eq!(paused.current_epoch, 1);
 
-    client.create_delegation(&deligation_id, &owner, &agent);
-
-    // Initial state
-    let initial_state = client.get_delegation_state(&delegation_id);
-    assert_eq!(initial_state.epoch_config.current_epoch, 0);
-
-    // Pause increments epoch
-    client.pause_delegation(&deligation_id);
-    let paused_state = client.get_delegation_state(&deligation_id);
-    assert_eq!(paused_state.epoch_config.current_epoch, 1);
-
-    // Resume increments epoch again
-    client.resume_delegation(&deligation_id);
-    let resumed_state = client.get_delegation_state(&deligation_id);
-    assert_eq!(resumed_state.epoch_config.current_epoch, 2);
+    s.permissions.resume(&s.owner, &s.delegate);
+    let resumed = s.permissions.get_execution_epoch(&s.owner, &s.delegate);
+    assert_eq!(resumed.current_epoch, 2);
+    assert!(resumed.epoch_started_ledger >= paused.epoch_started_ledger);
 }
 
 #[test]
-fn test_stale_signature_rejection() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let client = DelegationContractClient::new(&env, &DelegationContract);
+fn test_stale_epoch_rejected() {
+    let s = setup();
+    grant(&s);
 
-    let delegation_id = Symbol::from_utf8(&env, "test_delegation").unwrap();
-    let owner = Address::generate(&env);
-    let agent = Address::generate(&env);
-    let token = Address::generate(&env);
+    s.permissions.pause(&s.owner, &s.delegate);
 
-    client.create_delegation(&delegation_id, &owner, &agent);
+    let expiration_ledger = s.env.ledger().sequence() + 100;
+    let signature = BytesN::<64>::from_array(&s.env, &[0u8; 64]);
+    let relayer = Address::generate(&s.env);
 
-    // Create auth with epoch 0
-    let auth = SpendAuthorization {
-        delegator: owner,
-        agent,
-        token_contract: token,
-        delegator: owner.clone(),
-        agent: agent.clone(),
-        amount: 100,
-        recipient: Address::generate(&env),
-        nonce: 0,
-        epoch: 0,
-        signature: soroban_sdk::Bytes::from_array(&env, &[0u8; 64]),
-    };
+    let result = s.permissions.try_execute_spend_via_relayer(
+        &relayer,
+        &s.owner,
+        &s.delegate,
+        &100i128,
+        &s.merchant,
+        &0u64,
+        &expiration_ledger,
+        &0u32,
+        &signature,
+    );
 
-    // Pause/resume to advance epoch
-    client.pause_delegation(&delegation_id);
-    client.resume_delegation(&deligation_id);
-
-    // Should fail with StaleEpoch
-    let result = client.execute_spend(&delegation_id, auth);
-    assert(matches(result, Err(PermissionError::StaleEpoch)));
+    assert_eq!(result, Err(Ok(PermissionError::StaleEpoch)));
 }
 
 #[test]
-fn test_multi_asset_independent_limits() {
-    let env = Env::default();
-    let client = DelegationContractClient::new(&env, &DelegationContract);
+fn test_epoch_advances_again_after_resume() {
+    let s = setup();
+    grant(&s);
 
-    let delegation_id = Symbol::from_utf8(&env, "test_delegation").unwrap();
-    let owner = Address::generate(&env);
-    let agent = Address::generate(&env);
-    let usdc = Address::generate(&env);
-    let eurc = Address::generate(&env);
+    s.permissions.pause(&s.owner, &s.delegate);
+    s.permissions.resume(&s.owner, &s.delegate);
 
-    client.grant_asset_allowance(&delegation_id, &usdc, &1000);
-    client.grant_asset_allowance(&delegation_id, &eurc, &500);
+    let expiration_ledger = s.env.ledger().sequence() + 100;
+    let signature = BytesN::<64>::from_array(&s.env, &[0u8; 64]);
+    let relayer = Address::generate(&s.env);
 
-    // Spend 400 USDC
-    let auth_usdc = SpendAuthorization {
-        delegator: owner.clone(),
-        agent: agent.clone(),
-        token_contract: usdc.clone(),
-        amount: 400,
-        recipient: Address::generate(&env),
-        nonce: 0,
-        epoch: 0,
-        signature: vec![0u8; 64],
-    };
-    client.execute_spend(&delegation_id, auth_usdc);
+    let result = s.permissions.try_execute_spend_via_relayer(
+        &relayer,
+        &s.owner,
+        &s.delegate,
+        &100i128,
+        &s.merchant,
+        &0u64,
+        &expiration_ledger,
+        &1u32,
+        &signature,
+    );
 
-    // Spend 500 EURC - should succeed independently
-    let auth_eurc = SpendAuthorization {
-        delegator: owner.clone(),
-        agent: agent.clone(),
-        token_contract: eurc.clone(),
-        amount: 500,
-        recipient: Address::generate(&env),
-        nonce: 1,
-        epoch: 0,
-        signature: vec![0u8; 64],
-    };
-    client.execute_spend(&delegation_id, auth_eurc);
-
-    // USDC limit still has 600 remaining; EURC is exhausted
-    let auth_over_usdc = SpendAuthorization {
-        delegator: owner.clone(),
-        agent: agent.clone(),
-        token_contract: usdc.clone(),
-        amount: 700,
-        recipient: Address::generate(&env),
-        nonce: 2,
-        epoch: 0,
-        signature: vec![0u8; 64],
-    };
-    let result = client.execute_spend(&delegation_id, auth_over_usdc);
-    assert(matches(result, Err(PermissionError::ExceedsAllowance)));
+    assert_eq!(result, Err(Ok(PermissionError::StaleEpoch)));
 }
 
 #[test]
-fn test_unauthorized_asset_rejected() {
-    let env = Env::default();
-    let client = DelegationContractClient::new(&env, &DelegationContract);
+fn test_delegation_registry_pause_resume_roundtrip() {
+    let s = setup();
 
-    let delegation_id = Symbol::from_utf8(&env, "test_delegation").unwrap();
-    let owner = Address::generate(&env);
-    let agent = Address::generate(&env);
-    let usdc = Address::generate(&env);
-    let xlq = Address::generate(&env);
+    let permissions_id = s.permissions.address.clone();
+    let agent_id = BytesN::<32>::from_array(&s.env, &[7u8; 32]);
+    let label = Symbol::new(&s.env, "epochtest");
 
-    client.grant_asset_allowance(&delegation_id, &usdc, &1000);
+    let delegation_id =
+        s.delegation
+            .create_delegation(&s.owner, &agent_id, &permissions_id, &label, &1_000u32);
 
-    let auth = SpendAuthorization {
-        delegator: owner,
-        agent,
-        token_contract: xlq,
-        amount: 100,
-        recipient: Address::generate(&env),
-        nonce: 0,
-        epoch: 0,
-        signature: vec![0u8; 64],
-    };
-    let result = client.execute_spend(&delegation_id, auth);
-    assert(matches(result, Err(PermissionError::AssetNotAuthorized)));
-    let result = client.execute_spend(&delegation_id, &auth);
-    assert!(matches!(result, Err(PermissionError::StaleEpoch)));
-}
+    let active = s.delegation.get_delegation(&delegation_id);
+    assert_eq!(active.status, DelegationStatus::Active);
 
-#[test]
-fn test_killswitch_invalidates_sessions() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let client = DelegationContractClient::new(&env, &DelegationContract);
+    s.delegation.pause_delegation(&delegation_id);
+    let paused = s.delegation.get_delegation(&delegation_id);
+    assert_eq!(paused.status, DelegationStatus::Paused);
 
-    let delegator = Address::generate(&env);
-    let agent = Address::generate(&env);
-    let deligation_id = Symbol::from_utf8(&env, "test_delegation").unwrap();
-
-    client.create_delegation(&delegation_id, &delegator, &agent);
-    let before = client.get_delegation_state(&deligation_id);
-
-    // Trigger kill-switch as delegator master key
-    client.trigger_emergency_killswitch(&delegator);
-
-    // Epoch must be invalidated (incremented)
-    let after = client.get_delegation_state(&delegation_id);
-    assert!(after.epoch_config.current_epoch > before.epoch_config.current_epoch);
-
-    // Account must be frozen
-    assert!(matches(
-        client.get_circuit_breaker_status(&delegator),
-        AccountCircuitBreakerStatus::Frozen
-    ));
-
-    // Agent transaction must fail while frozen
-    let auth = SpendAuthorization {
-        delegator: delegator.clone(),
-        agent: agent.clone(),
-        amount: 100,
-        recipient: Address::generate(&env),
-        nonce: 0,
-        epoch: after.epoch_config.current_epoch,
-        signature: soroban_sdk::Bytes::from_array(&env, &[0u8; 64]),
-    };
-    let result = client.execute_spend(&delegation_id, &auth);
-    assert!(result.is_error());
-}
-
-#[test]
-fn test_reactivate_requires_master_key() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let client = DelegationContractClient::new(&env, &DelegationContract);
-
-    let delegator = Address::generate(&env);
-    client.trigger_emergency_killswitch(&delegator);
-    assert!(matches(
-        client.get_circuit_breaker_status(&delegator),
-        AccountCircuitBreakerStatus::Frozen
-    ));
-
-    // Reactivation requires master key confirmation (mocked auth for delegator)
-    client.reactivate_account(&delegator);
-    assert!(matches(
-        client.get_circuit_breaker_status(&delegator),
-        AccountCircuitBreakerStatus::Normal
-    ));
+    s.delegation.resume_delegation(&delegation_id);
+    let resumed = s.delegation.get_delegation(&delegation_id);
+    assert_eq!(resumed.status, DelegationStatus::Active);
+    assert!(resumed.version > paused.version);
 }

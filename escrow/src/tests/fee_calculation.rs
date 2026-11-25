@@ -58,7 +58,7 @@ fn test_min_fee_enforcement() {
 
 #[test]
 fn test_overflow_safety() {
-    let env = Env:default();
+    let env = Env::default();
     let min_fee = 100;
 
     // Test i128 overflow (amount * fee_bps exceeds i128 max)
@@ -69,7 +69,7 @@ fn test_overflow_safety() {
 }
 
 #[test]
-fn test_fee_tier_at zero_volume() {
+fn test_fee_tier_at_zero_volume() {
     let env = Env::default();
     let tiers = standard_tiers(&env);
 
@@ -100,7 +100,7 @@ fn test_fee_tier_at_silver_threshold() {
 
 #[test]
 fn test_fee_tier_at_gold_threshold() {
-    let env = Env:default();
+    let env = Env::default();
     let tiers = standard_tiers(&env);
 
     // At 100 kUSDC lifetime volume the gold tier (0.5%) applies.
@@ -168,7 +168,7 @@ fn test_fee_tx_min_fee_applies_at_gold_tier() {
 
 #[test]
 fn test_fee_tier_selection_overflow_safe() {
-    let env = Env:default();
+    let env = Env::default();
     let tiers = standard_tiers(&env);
 
     // A volume at i128::MAX must still resolve to the highest tier without
@@ -375,4 +375,6 @@ fn test_min_fee_enforcement() {
         calculate_fee_with_minimum(0, BPS_100, min_fee).unwrap(),
         0,
     );
+}
+
 }

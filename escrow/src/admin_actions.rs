@@ -228,10 +228,14 @@ impl EscrowContract {
     ) -> Result<u64, EscrowError> {
         admin.require_auth();
         let authorized = match &action {
-            AdminAction::Fee(_) | AdminAction::FeeConfig(_, _) | AdminAction::FeeDistribution(_) =>
-                Self::has_role(env.clone(), admin.clone(), ContractRole::FeeManager),
-            AdminAction::FeeTiers(_) =>
-                Self::has_role(env.clone(), admin.clone(), ContractRole::FeeManager),
+            AdminAction::Fee(_)
+            | AdminAction::FeeConfig(_, _)
+            | AdminAction::FeeDistribution(_) => {
+                Self::has_role(env.clone(), admin.clone(), ContractRole::FeeManager)
+            }
+            AdminAction::FeeTiers(_) => {
+                Self::has_role(env.clone(), admin.clone(), ContractRole::FeeManager)
+            }
             _ => Self::is_admin(env.clone(), admin.clone()),
         };
         if !authorized {
@@ -324,10 +328,14 @@ impl EscrowContract {
         let proposal =
             Self::get_admin_action(env.clone(), id).ok_or(EscrowError::AdminActionNotFound)?;
         let authorized = match &proposal.action {
-            AdminAction::Fee(_) | AdminAction::FeeConfig(_, _) | AdminAction::FeeDistribution(_) =>
-                Self::has_role(env.clone(), admin.clone(), ContractRole::FeeManager),
-            AdminAction::FeeTiers(_) =>
-                Self::has_role(env.clone(), admin.clone(), ContractRole::FeeManager),
+            AdminAction::Fee(_)
+            | AdminAction::FeeConfig(_, _)
+            | AdminAction::FeeDistribution(_) => {
+                Self::has_role(env.clone(), admin.clone(), ContractRole::FeeManager)
+            }
+            AdminAction::FeeTiers(_) => {
+                Self::has_role(env.clone(), admin.clone(), ContractRole::FeeManager)
+            }
             _ => Self::is_admin(env.clone(), admin.clone()),
         };
         if !authorized {
@@ -339,8 +347,14 @@ impl EscrowContract {
         match proposal.action.clone() {
             AdminAction::Fee(bps) => Self::update_fee(env, admin, bps),
             AdminAction::FeeDistribution(shares) => Self::set_fee_distribution(env, admin, shares),
-            AdminAction::AddToken(token) => Self::add_token(env, admin, token),
-            AdminAction::RemoveToken(token) => Self::remove_token(env, admin, token),
+            AdminAction::AddToken(token) => {
+                consume(&env, proposal.action)?;
+                EscrowContract::add_token_internal(&env, admin, token)
+            }
+            AdminAction::RemoveToken(token) => {
+                consume(&env, proposal.action)?;
+                EscrowContract::remove_token_internal(&env, admin, token)
+            }
             AdminAction::FeeConfig(fee_bps, treasury) => {
                 admin.require_auth();
                 consume(&env, proposal.action)?;
@@ -349,14 +363,15 @@ impl EscrowContract {
                 let (min_floor, max_ceil) = existing
                     .map(|c| (c.min_fee_floor_stroops, c.max_fee_ceiling_stroops))
                     .unwrap_or((DEFAULT_MIN_FEE_STROOPS, 0));
-                env.storage()
-                    .instance()
-                    .set(&DataKey::FeeConfig, &FeeConfig {
-                        basis_points: fee_bps,
+                env.storage().instance().set(
+                    &DataKey::FeeConfig,
+                    &FeeConfig {
+                        fee_bps: fee_bps,
                         treasury,
                         min_fee_floor_stroops: min_floor,
                         max_fee_ceiling_stroops: max_ceil,
-                    });
+                    },
+                );
                 // Remove obsolete pre-upgrade scheduling state, never auto-apply it.
                 env.storage()
                     .instance()
@@ -391,7 +406,7 @@ impl EscrowContract {
             AdminAction::FeeTiers(tiers) => {
                 admin.require_auth();
                 consume(&env, proposal.action)?;
-                Self::set_fee_tiers(env, tiers);
+                Self::apply_fee_tiers(env, tiers);
                 Ok(true)
             }
         }
@@ -417,10 +432,8 @@ impl EscrowContract {
                 .instance()
                 .set(&AdminActionKey::CourierCount, &(count + 1));
         }
-        env.events().publish(
-            (symbol_short!("courier"), symbol_short!("added")),
-            key,
-        );
+        env.events()
+            .publish((symbol_short!("courier"), symbol_short!("added")), key);
     }
 
     /// Revoke a courier public key so future vouchers from it are rejected.
@@ -437,10 +450,8 @@ impl EscrowContract {
                 .instance()
                 .set(&AdminActionKey::CourierCount, &count.saturating_sub(1));
         }
-        env.events().publish(
-            (symbol_short!("courier"), symbol_short!("removed")),
-            key,
-        );
+        env.events()
+            .publish((symbol_short!("courier"), symbol_short!("removed")), key);
     }
 
     /// Whether a courier public key is currently authorized.
@@ -454,7 +465,7 @@ impl EscrowContract {
     /// Persist the tiered fee table used for volume-based commission discounts.
     /// Tiers must be strictly ascending by threshold; the first tier is the
     /// baseline applied to merchants below any higher threshold.
-    pub(super) fn set_fee_tiers(env: Env, tiers: Vec<FeeTierConfig>) {
+    pub(super) fn apply_fee_tiers(env: Env, tiers: Vec<FeeTierConfig>) {
         env.storage()
             .instance()
             .set(&AdminActionKey::FeeTiers, &tiers);
@@ -463,7 +474,7 @@ impl EscrowContract {
     }
 
     /// Current tiered fee table, if configured.
-    pub fn get_fee_tiers(env: Env) -> Vec<FeeTierConfig> {
+    pub fn current_fee_tiers(env: Env) -> Vec<FeeTierConfig> {
         env.storage()
             .instance()
             .get(&AdminActionKey::FeeTiers)
@@ -481,7 +492,10 @@ impl EscrowContract {
             .get(&AdminActionKey::FeeTiers)
             .unwrap_or(Vec::new(&env));
         if tiers.len() == 0 {
-            return Self::get_fee_config(env).fee_bps;
+            return match Self::get_fee_config(env) {
+                Ok(config) => config.fee_bps,
+                Err(_) => 0,
+            };
         }
         let mut selected: u32 = tiers.get(0).unwrap().fee_basis_points;
         for tier in tiers.iter() {
