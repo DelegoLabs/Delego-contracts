@@ -1953,7 +1953,7 @@ fn test_treasury_split_routes_fees_with_zero_residual() {
     let fee_amount: i128 = 10_000;
     token_client.mint(&f._contract_id, &fee_amount);
 
-    f.client.route_fee_disbursements(&fee_amount);
+    f.client.route_fee_disbursements(&f.admin, &token_id, &fee_amount);
 
     assert_eq!(token_client.balance(&dao), 7_000);
     assert_eq!(token_client.balance(&arbiter), 2_000);
@@ -1986,7 +1986,7 @@ fn test_treasury_split_remainder_routed_to_insurance_pool() {
     let fee_amount: i128 = 1_001;
     token_client.mint(&f._contract_id, &fee_amount);
 
-    f.client.route_fee_disbursements(&fee_amount);
+    f.client.route_fee_disbursements(&f.admin, &token_id, &fee_amount);
 
     let dao_share = fee_amount * 7_000 / 10_000;
     let arbiter_share = fee_amount * 2_000 / 10_000;
@@ -2016,6 +2016,77 @@ fn test_treasury_split_rejects_invalid_bps_sum() {
         err.unwrap_err().unwrap(),
         MarketplaceError::InvalidTreasurySplit
     );
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Auth, InvalidAction)")]
+fn test_route_fee_disbursements_requires_admin_auth() {
+    let f = TestFixture::setup();
+    let dao = Address::generate(&f.env);
+    let arbiter = Address::generate(&f.env);
+    let insurance = Address::generate(&f.env);
+    let unauthorized_user = Address::generate(&f.env);
+
+    let config = TreasurySplitConfig {
+        dao_treasury: dao.clone(),
+        dao_bps: 7_000,
+        arbiter_pool: arbiter.clone(),
+        arbiter_bps: 2_000,
+        insurance_pool: insurance.clone(),
+        insurance_bps: 1_000,
+    };
+    f.client.set_treasury_split_config(&f.admin, &config);
+
+    let (token_id, token_client) = deploy_token(&f.env, &f.admin);
+    f.client.set_fee_token(&f.admin, &token_id);
+
+    let fee_amount: i128 = 10_000;
+    token_client.mint(&f._contract_id, &fee_amount);
+
+    // This should panic because unauthorized_user is not the admin
+    f.client.route_fee_disbursements(&unauthorized_user, &token_id, &fee_amount);
+}
+
+#[test]
+fn test_route_fee_disbursements_rejects_non_admin() {
+    let f = TestFixture::setup();
+    let dao = Address::generate(&f.env);
+    let arbiter = Address::generate(&f.env);
+    let insurance = Address::generate(&f.env);
+    let unauthorized_user = Address::generate(&f.env);
+
+    let config = TreasurySplitConfig {
+        dao_treasury: dao.clone(),
+        dao_bps: 7_000,
+        arbiter_pool: arbiter.clone(),
+        arbiter_bps: 2_000,
+        insurance_pool: insurance.clone(),
+        insurance_bps: 1_000,
+    };
+    f.client.set_treasury_split_config(&f.admin, &config);
+
+    let (token_id, token_client) = deploy_token(&f.env, &f.admin);
+    f.client.set_fee_token(&f.admin, &token_id);
+
+    let fee_amount: i128 = 10_000;
+    token_client.mint(&f._contract_id, &fee_amount);
+
+    // Mock authorization for the unauthorized user
+    f.env.mock_all_auths();
+    
+    // This should return Unauthorized error
+    let err = f.client.try_route_fee_disbursements(&unauthorized_user, &token_id, &fee_amount);
+    
+    assert_eq!(
+        err.unwrap_err().unwrap(),
+        MarketplaceError::Unauthorized
+    );
+    
+    // Verify no funds were transferred
+    assert_eq!(token_client.balance(&dao), 0);
+    assert_eq!(token_client.balance(&arbiter), 0);
+    assert_eq!(token_client.balance(&insurance), 0);
+    assert_eq!(token_client.balance(&f._contract_id), fee_amount);
 }
 
 #[test]
