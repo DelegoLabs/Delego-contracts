@@ -1,75 +1,134 @@
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env;};
+//! Guardian-quorum account recovery (issues #575, #686).
+//!
+//! An account registers an owner, a guardian set, and a quorum. A guardian can
+//! then request that ownership moves to a new address. Once enough guardians
+//! approve and the cool-down has elapsed, anyone may execute the request. The
+//! current owner can cancel it at any time before that.
 
-/// Cool-down period between a recovery proposal reaching quorum
-/// and its execution. During this window the legitimate owner may cancel.
-pub const RECOVERY_COOLDOWN_SECONDS: u64 = 48 * 60 * 60;
+use soroban_sdk::{contracterror, contracttype, Address, Env, Symbol, Vec};
 
-/// Default number of guardian approvals required to execute a recovery.
-pub const DEFAULT_REQUIRED_APPROVALS: u32 = 2;
+use crate::{PERMISSION_TTL_BUMP, PERMISSION_TTL_THRESHOLD};
+
+/// Cool-down, in ledgers, between a recovery request being submitted and its
+/// execution (48 hours at 5s per ledger). During this window the legitimate
+/// owner may cancel.
+pub const RECOVERY_COOLDOWN_LEDGERS: u32 = 34_560;
 
 /// Maximum number of guardians allowed in a quorum.
 pub const MAX_GUARDIANS: u32 = 32;
 
-/// A recovery proposal submitted by a guardian quorum.
+/// A pending request to move an account to a new owner.
 #[contracttype]
-#[derive(Clone, Debug, Eq]
-#[partial_eq(1)]
-pub struct RecoveryProposal {
-    pub account: Address,
-    pub proposed_new_owner: Address,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryRequest {
+    /// Owner at the time the request was submitted.
+    pub owner: Address,
+    /// Owner the account moves to when the request is executed.
+    pub new_owner: Address,
+    /// Guardians that have approved, starting with the submitter.
     pub approvals: Vec<Address>,
-    pub required_approvals: u32,
-    pub created_at: u64,
+    /// Ledger sequence at which the request was submitted.
+    pub initiated_ledger: u32,
 }
 
 /// Event emitted when a recovery is successfully executed.
 #[contracttype]
-#[derive(Clone, Debug, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccountRecoveryExecuted {
+    /// Account that was recovered.
     pub account: Address,
+    /// Owner before the recovery.
     pub old_owner: Address,
-    pub proposed_new_owner: Address,
-    pub executed_at: u64,
+    /// Owner after the recovery.
+    pub new_owner: Address,
+    /// Ledger sequence of the execution.
+    pub executed_ledger: u32,
 }
 
-/// Event emitted when a recovery proposal is cancelled by the owner.
+/// Event emitted when a recovery request is cancelled by the owner.
 #[contracttype]
-#[derive(Clone, Debug, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccountRecoveryCancelled {
+    /// Account whose recovery was cancelled.
     pub account: Address,
-    pub cancelled_at: u64,
+    /// Ledger sequence of the cancellation.
+    pub cancelled_ledger: u32,
 }
 
 /// Storage keys used by the recovery module.
 #[contracttype]
-#[derive(Clone, Debug, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecoveryKey {
     /// Owner of an account.
     Owner(Address),
     /// Guardian set configured for an account.
-    Guardians(Address),
-    /// Currently pending recovery proposal for an account.
-    Proposal(Address),
+    GuardianList(Address),
+    /// Currently pending recovery request for an account.
+    RecoveryRequest(Address),
+    /// Number of guardian approvals required for an account.
+    Quorum(Address),
 }
 
-/// Errors returned by the recovery module.
-#[contracttype]
-#[derive(Clone, Debug, Eq)]
+/// Errors returned by the recovery module. Codes stay within the crate's
+/// 2000-2999 block.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
 pub enum RecoveryError {
-    NotInitialized = 1,
-    AlreadyInitialized = 2,
-    Unauthorized = 3,
-    InvalidQuorum = 4,
-    ProposalAlreadyExists = 5,
-    NoProposal = 6,
-    AlreadyApproved = 7,
-    QuorumNotReached = 8,
-    CooldownNotElapsed = 9,
-    InvalidNewOwner = 10,
-    NotAn = 11,
+    /// The account has no recovery configuration.
+    NotInitialized = 2701,
+    /// The account already has a recovery configuration.
+    AlreadyInitialized = 2702,
+    /// The caller is not a guardian, or not the current owner.
+    Unauthorized = 2703,
+    /// The guardian set or quorum is empty, too large, duplicated, or
+    /// unsatisfiable.
+    InvalidQuorum = 2704,
+    /// A recovery request is already pending for the account.
+    RequestAlreadyExists = 2705,
+    /// No recovery request is pending for the account.
+    NoRequest = 2706,
+    /// The guardian has already approved the request.
+    AlreadyApproved = 2707,
+    /// Not enough guardians have approved the request.
+    QuorumNotReached = 2708,
+    /// The cool-down has not elapsed yet.
+    CooldownNotElapsed = 2709,
+    /// The proposed owner is already the owner.
+    InvalidNewOwner = 2710,
+    /// The end of the cool-down cannot be represented as a ledger sequence.
+    LedgerOverflow = 2711,
 }
 
-/// Initialize an account with an owner and a guardian quorum.
+fn bump(env: &Env, key: &RecoveryKey) {
+    env.storage()
+        .persistent()
+        .extend_ttl(key, PERMISSION_TTL_THRESHOLD, PERMISSION_TTL_BUMP);
+}
+
+fn write_request(env: &Env, account: &Address, request: &RecoveryRequest) {
+    let key = RecoveryKey::RecoveryRequest(account.clone());
+    env.storage().persistent().set(&key, request);
+    bump(env, &key);
+}
+
+/// Keeps an account's configuration alive while a recovery is in progress.
+fn bump_config(env: &Env, account: &Address) {
+    bump(env, &RecoveryKey::Owner(account.clone()));
+    bump(env, &RecoveryKey::GuardianList(account.clone()));
+    bump(env, &RecoveryKey::Quorum(account.clone()));
+}
+
+fn require_guardian(env: &Env, account: &Address, guardian: &Address) -> Result<(), RecoveryError> {
+    if get_guardians(env, account)?.contains(guardian) {
+        Ok(())
+    } else {
+        Err(RecoveryError::Unauthorized)
+    }
+}
+
+/// Configures the owner, guardians and quorum of `account`. Requires
+/// `account`'s authorization and can only be done once.
 pub fn initialize_account(
     env: &Env,
     account: Address,
@@ -77,297 +136,481 @@ pub fn initialize_account(
     guardians: Vec<Address>,
     required_approvals: u32,
 ) -> Result<(), RecoveryError> {
+    account.require_auth();
+
     let owner_key = RecoveryKey::Owner(account.clone());
-    if env.storage().has(&owner_key) {
+    let storage = env.storage().persistent();
+    if storage.has(&owner_key) {
         return Err(RecoveryError::AlreadyInitialized);
     }
-    if required_approvals == 0 || required_approvals as usize > guardians.len() {
+    // A non-zero quorum no larger than the set also rules out an empty set.
+    if guardians.len() > MAX_GUARDIANS
+        || required_approvals == 0
+        || required_approvals > guardians.len()
+    {
         return Err(RecoveryError::InvalidQuorum);
     }
-    if guardians.len() == 0 || guardians.len() > MAX_GUARDIANS as usize {
-        return Err(RecoveryError::InvalidQuorum);
+    // Duplicates could make the quorum unreachable.
+    for (i, guardian) in guardians.iter().enumerate() {
+        if guardians.first_index_of(&guardian) != Some(i as u32) {
+            return Err(RecoveryError::InvalidQuorum);
+        }
     }
 
-    env.storage().set(&owner_key, &owner);
-    env.storage()
-        .set(&RecoveryKey::Guardians(account), &guardians);
-    env.storage().set(
-        &RecoveryKey::Quorum(account),
-        &required_approvals,
-    );
+    storage.set(&owner_key, &owner);
+    storage.set(&RecoveryKey::GuardianList(account.clone()), &guardians);
+    storage.set(&RecoveryKey::Quorum(account.clone()), &required_approvals);
+    bump_config(env, &account);
     Ok(())
 }
 
-/// Return the current owner of an account.
-pub fn get_owner(env: &Env, account: Address) -> Result<Address, RecoveryError> {
+/// Returns the current owner of an account.
+pub fn get_owner(env: &Env, account: &Address) -> Result<Address, RecoveryError> {
     env.storage()
-        .get(&RecoveryKey::Owner(account))
-        .ok_or(Err(RecoveryError::NotInitialized))
+        .persistent()
+        .get(&RecoveryKey::Owner(account.clone()))
+        .ok_or(RecoveryError::NotInitialized)
 }
 
-/// Return the guardian set for an account.
-pub fn get_guardians(env: &Env, account: Address) -> Result<Vec<Address>, RecoveryError> {
+/// Returns the guardian set of an account.
+pub fn get_guardians(env: &Env, account: &Address) -> Result<Vec<Address>, RecoveryError> {
     env.storage()
-        .get(&RecoveryKey::Guardians(account))
-        .ok_or(Err(RecoveryError::NotInitialized))
+        .persistent()
+        .get(&RecoveryKey::GuardianList(account.clone()))
+        .ok_or(RecoveryError::NotInitialized)
 }
 
-/// Return the pending recovery proposal, if any.
-pub fn get_proposal(env: &Env, account: Address) -> Option<RecoveryProposal> {
-    env.storage().get(&RecoveryKey::Proposal(account))
+/// Returns the number of guardian approvals an account requires.
+pub fn get_quorum(env: &Env, account: &Address) -> Result<u32, RecoveryError> {
+    env.storage()
+        .persistent()
+        .get(&RecoveryKey::Quorum(account.clone()))
+        .ok_or(RecoveryError::NotInitialized)
 }
 
-/// Submit a recovery proposal. The caller must be a configured guardian.
-/// The submitting guardian is counted as the first approval.
+/// Returns the pending recovery request, if any.
+pub fn get_request(env: &Env, account: &Address) -> Option<RecoveryRequest> {
+    env.storage()
+        .persistent()
+        .get(&RecoveryKey::RecoveryRequest(account.clone()))
+}
+
+/// Submits a recovery request. The caller must be a configured guardian and is
+/// counted as the first approval.
 pub fn submit_recovery(
     env: &Env,
     guardian: Address,
     account: Address,
-    proposed_new_owner: Address,
-) -> Result<RecoveryProposal, RecoveryError> {
+    new_owner: Address,
+) -> Result<RecoveryRequest, RecoveryError> {
     guardian.require_auth();
 
-    let owner = get_owner(env, account.clone())?;
-    if proposed_new_owner == owner {
+    let owner = get_owner(env, &account)?;
+    require_guardian(env, &account, &guardian)?;
+    if new_owner == owner {
         return Err(RecoveryError::InvalidNewOwner);
     }
-
-    let guardians = get_guardians(env, account.clone())?;
-    if !guardians.iteral().any(|g| g == guardian) {
-        return Err(RecoveryError::Unauthorized);
+    if get_request(env, &account).is_some() {
+        return Err(RecoveryError::RequestAlreadyExists);
     }
 
-    let proposal_key = RecoveryKey::Proposal(account.clone());
-    if env.storage()(has(&proposal_key) {
-        return Err(RecoveryError::ProposalAlreadyExists);
-    }
-
-    let required_approvals = env.storage()
-        .get(&RecoveryKey::Quorum(account.clone()))
-        .ok_or(Err(RecoveryError::NotInitialized))?;
-
-    let mut approvals: Vec<Address> = Vec::new(env);
-    approvals.push_back(guardian.clone());
-
-    let proposal = RecoveryProposal {
-        account: account.clone(),
-        proposed_new_owner: proposed_new_owner,
-        approvals: approvals.clone(),
-        required_approvals,
-        created_at: env.ledger().timestamp(),
+    let request = RecoveryRequest {
+        owner,
+        new_owner,
+        approvals: Vec::from_array(env, [guardian]),
+        initiated_ledger: env.ledger().sequence(),
     };
-    env.storage().set(&proposal_key, &proposal);
-    Ok(proposal)
+    write_request(env, &account, &request);
+    bump_config(env, &account);
+    Ok(request)
 }
 
-/// Approve an existing recovery proposal. The caller must be a configured
-/// guardian and must not have already approved.
+/// Approves a pending recovery request. The caller must be a configured
+/// guardian that has not approved yet.
 pub fn approve_recovery(
     env: &Env,
     guardian: Address,
     account: Address,
-) -> Result<RecoveryProposal, RecoveryError> {
+) -> Result<RecoveryRequest, RecoveryError> {
     guardian.require_auth();
 
-    let guardians = get_guardians(env, account.clone())?;
-    if !guardians.iteral().any(|g| g == guardian) {
-        return Err(RecoveryError::Unauthorized);
-    }
-
-    let proposal_key = RecoveryKey::Proposal(account.clone());
-    let mut proposal: RecoveryProposal = env
-        .storage()
-        .get(&proposal_key)
-        .ok_or(Err(RecoveryError::NoProposal))?;
-
-    if proposal.approvals.iteral().any(|a| a == guardian) {
+    require_guardian(env, &account, &guardian)?;
+    let mut request = get_request(env, &account).ok_or(RecoveryError::NoRequest)?;
+    if request.approvals.contains(&guardian) {
         return Err(RecoveryError::AlreadyApproved);
     }
 
-    proposal.approvals.push_back(guardian);
-    env.storage().set(&proposal_key, &proposal);
-    Ok(proposal)
+    request.approvals.push_back(guardian);
+    write_request(env, &account, &request);
+    bump_config(env, &account);
+    Ok(request)
 }
 
-/// Execute a recovery proposal once quorum is reached and the 48-hour
-/// cool-down has elapsed. Transfers ownership to the proposed new owner.
-pub fn execute_recovery(
-    env: &Env,
-    account: Address,
-) -> Result<Address, RecoveryError> {
-    let proposal_key = RecoveryKey::Proposal(account.clone());
-    let proposal: RecoveryProposal = env
-        .storage()
-        .get(&proposal_key)
-        .ok_or(Err(RecoveryError::NoProposal))?;
-
-    if (proposal.approvals.len() as u32) < proposal.required_approvals {
+/// Executes a recovery request once the quorum is reached and the cool-down has
+/// elapsed, and returns the new owner.
+pub fn execute_recovery(env: &Env, account: Address) -> Result<Address, RecoveryError> {
+    let request = get_request(env, &account).ok_or(RecoveryError::NoRequest)?;
+    if request.approvals.len() < get_quorum(env, &account)? {
         return Err(RecoveryError::QuorumNotReached);
     }
-
-    let now = env.ledger().timestamp();
-    let unlock_at = proposal.created_at + RECOVERY_COOLDOWN_SECONDS;
-    if now < unlock_at {
+    let now = env.ledger().sequence();
+    if now < execution_ledger(env, &account)? {
         return Err(RecoveryError::CooldownNotElapsed);
     }
 
-    let old_owner = get_owner(env, account.clone())?;
-    env.storage().set(
-        &RecoveryKey::Owner(account.clone()),
-        &proposal.proposed_new_owner,
-    );
-    env.storage().remove(&proposal_key);
+    let old_owner = get_owner(env, &account)?;
+    let storage = env.storage().persistent();
+    storage.set(&RecoveryKey::Owner(account.clone()), &request.new_owner);
+    storage.remove(&RecoveryKey::RecoveryRequest(account.clone()));
+    bump_config(env, &account);
 
     env.events().publish(
-        (symbol_short(&contract, &env, "AccountRecoveryExecuted"),),
+        (Symbol::new(env, "AccountRecoveryExecuted"),),
         AccountRecoveryExecuted {
-            account: account.clone(),
+            account,
             old_owner,
-            proposed_new_owner: proposal.proposed_new_owner.clone(),
-            executed_at: now,
+            new_owner: request.new_owner.clone(),
+            executed_ledger: now,
         },
     );
-
-    Ok(proposal.proposed_new_owner)
+    Ok(request.new_owner)
 }
 
-/// Cancel a pending recovery proposal. Only the current owner may cancel.
-/// This is the escape hatch that protects against malicious guardian quorums.
-pub fn cancel_recovery(
-    env: &Env,
-    owner: Address,
-    account: Address,
-) -> Result<(), RecoveryError> {
+/// Cancels a pending recovery request. Only the current owner may cancel: this
+/// is the escape hatch that protects against a malicious guardian quorum.
+pub fn cancel_recovery(env: &Env, owner: Address, account: Address) -> Result<(), RecoveryError> {
     owner.require_auth();
 
-    let current_owner = get_owner(env, account.clone())?;
-    if current_owner != owner {
+    if get_owner(env, &account)? != owner {
         return Err(RecoveryError::Unauthorized);
     }
-
-    let proposal_key = RecoveryKey::Proposal(account.clone());
-    if !env.storage()(has(&proposal_key) {
-        return Err(RecoveryError::NoProposal);
+    if get_request(env, &account).is_none() {
+        return Err(RecoveryError::NoRequest);
     }
 
-    env.storage().remove(&proposal_key);
+    env.storage()
+        .persistent()
+        .remove(&RecoveryKey::RecoveryRequest(account.clone()));
+    bump_config(env, &account);
 
     env.events().publish(
-        (symbol_short(&contract, &env, "AccountRecoveryCancelled"),),
+        (Symbol::new(env, "AccountRecoveryCancelled"),),
         AccountRecoveryCancelled {
             account,
-            cancelled_at: env.ledger().timestamp(),
+            cancelled_ledger: env.ledger().sequence(),
         },
     );
-
     Ok(())
 }
 
-/// Return the timestamp at which a pending proposal becomes executable.
-pub fn execution_time(env: &Env, account: Address) -> Result<u64, RecoveryError> {
-    let proposal = get_proposal(env, account).ok_or(Err(RecoveryError::NoProposal))?;
-    Ok(proposal.created_at + RECOVERY_COOLDOWN_SECONDS)
+/// Returns the ledger sequence from which a pending request may be executed.
+pub fn execution_ledger(env: &Env, account: &Address) -> Result<u32, RecoveryError> {
+    get_request(env, account)
+        .ok_or(RecoveryError::NoRequest)?
+        .initiated_ledger
+        .checked_add(RECOVERY_COOLDOWN_LEDGERS)
+        .ok_or(RecoveryError::LedgerOverflow)
 }
 
-/// Helper to build a short Symbol for event topics.
-fn symbol_short(_contract: &(), env: &Env, name: &str) -> soroban_sdk::Symbol {
-    let _ref = env;
-    soroban_sdk:Symbol::new(name)
-}
-
-#[config(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk:{testutils::Address as TestAddress, Env;};
+    use crate::PermissionsContract;
+    use soroban_sdk::{
+        testutils::{storage::Persistent as _, Address as _, Ledger as _},
+        vec,
+    };
 
-    fn setup() -> (Env, Address, Address, Vec<Address>) {
+    const START: u32 = 1_000;
+
+    struct Fixture {
+        env: Env,
+        contract_id: Address,
+        account: Address,
+        owner: Address,
+        new_owner: Address,
+        guardians: Vec<Address>,
+    }
+
+    /// Every call runs in its own contract frame, like a separate invocation.
+    impl Fixture {
+        fn run<T>(&self, f: impl FnOnce(&Env) -> T) -> T {
+            self.env.as_contract(&self.contract_id, || f(&self.env))
+        }
+
+        /// Moves to `sequence`, keeping the contract instance live.
+        fn advance_to(&self, sequence: u32) {
+            self.run(|env| {
+                env.storage()
+                    .instance()
+                    .extend_ttl(PERMISSION_TTL_THRESHOLD, PERMISSION_TTL_BUMP)
+            });
+            self.env.ledger().set_sequence_number(sequence);
+        }
+
+        fn guardian(&self, index: u32) -> Address {
+            self.guardians.get(index).unwrap()
+        }
+
+        fn initialize(&self, guardians: &Vec<Address>, quorum: u32) -> Result<(), RecoveryError> {
+            self.run(|env| {
+                initialize_account(
+                    env,
+                    self.account.clone(),
+                    self.owner.clone(),
+                    guardians.clone(),
+                    quorum,
+                )
+            })
+        }
+
+        fn submit(&self, guardian: &Address) -> Result<RecoveryRequest, RecoveryError> {
+            self.run(|env| {
+                submit_recovery(
+                    env,
+                    guardian.clone(),
+                    self.account.clone(),
+                    self.new_owner.clone(),
+                )
+            })
+        }
+
+        fn approve(&self, guardian: &Address) -> Result<RecoveryRequest, RecoveryError> {
+            self.run(|env| approve_recovery(env, guardian.clone(), self.account.clone()))
+        }
+
+        fn execute(&self) -> Result<Address, RecoveryError> {
+            self.run(|env| execute_recovery(env, self.account.clone()))
+        }
+
+        fn cancel(&self, owner: &Address) -> Result<(), RecoveryError> {
+            self.run(|env| cancel_recovery(env, owner.clone(), self.account.clone()))
+        }
+
+        fn current_owner(&self) -> Result<Address, RecoveryError> {
+            self.run(|env| get_owner(env, &self.account))
+        }
+
+        fn request(&self) -> Option<RecoveryRequest> {
+            self.run(|env| get_request(env, &self.account))
+        }
+
+        fn ttl(&self, key: RecoveryKey) -> u32 {
+            self.run(|env| env.storage().persistent().get_ttl(&key))
+        }
+    }
+
+    fn setup_uninitialized() -> Fixture {
         let env = Env::default();
-        env.ledger().set_timestamp(1_000_000);
-        let owner = TestAddress::generate();
-        let account = TestAddress::generate();
-        let g1 = TestAddress::generate();
-        let g2 = TestAddress::generate();
-        let g3 = TestAddress::generate();
-        let guardians = vec&[&env, g1.clone(), g2.clone(), g3.clone()];
-        initialize_account(&env, account.clone(), owner.clone(), guardians.clone(), 2).unwrap();
-        (env, account, owner, guardians)
+        env.mock_all_auths();
+        env.ledger().set_sequence_number(START);
+        let contract_id = env.register(PermissionsContract, ());
+        let guardians = vec![
+            &env,
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        ];
+        Fixture {
+            contract_id,
+            account: Address::generate(&env),
+            owner: Address::generate(&env),
+            new_owner: Address::generate(&env),
+            guardians,
+            env,
+        }
+    }
+
+    /// Account guarded by three guardians with a quorum of two.
+    fn setup() -> Fixture {
+        let f = setup_uninitialized();
+        assert_eq!(f.initialize(&f.guardians, 2), Ok(()));
+        f
     }
 
     #[test]
-    fn recovery_transfers_ownership_after_cooldown() {
-        let (env, account, owner, guardians) = setup();
-        let new_owner = TestAddress::generate();
+    fn initialize_stores_owner_guardians_and_quorum() {
+        let f = setup();
 
-        submit_recovery(&env, guardians[0].clone(), account.clone(), new_owner.clone())
-            .unwrap();
-        approve_recovery(&env, guardians[1].clone(), account.clone()).unwrap();
-
-        // Cool-down not elapsed.
+        assert_eq!(f.current_owner(), Ok(f.owner.clone()));
         assert_eq!(
-            execute_recovery(&env, account.clone()),
-            Err(RecoveryError::CooldownNotElapsed)
+            f.run(|env| get_guardians(env, &f.account)),
+            Ok(f.guardians.clone())
+        );
+        assert_eq!(f.run(|env| get_quorum(env, &f.account)), Ok(2));
+        assert_eq!(f.request(), None);
+    }
+
+    #[test]
+    fn initialize_extends_the_storage_ttl() {
+        let f = setup();
+
+        for key in [
+            RecoveryKey::Owner(f.account.clone()),
+            RecoveryKey::GuardianList(f.account.clone()),
+            RecoveryKey::Quorum(f.account.clone()),
+        ] {
+            assert!(f.ttl(key) >= PERMISSION_TTL_BUMP);
+        }
+    }
+
+    #[test]
+    fn initialize_is_one_shot() {
+        let f = setup();
+
+        assert_eq!(
+            f.initialize(&f.guardians, 1),
+            Err(RecoveryError::AlreadyInitialized)
+        );
+        assert_eq!(f.run(|env| get_quorum(env, &f.account)), Ok(2));
+    }
+
+    #[test]
+    fn initialize_rejects_invalid_quorums() {
+        let f = setup_uninitialized();
+
+        for quorum in [0, 4] {
+            assert_eq!(
+                f.initialize(&f.guardians, quorum),
+                Err(RecoveryError::InvalidQuorum)
+            );
+        }
+        assert_eq!(
+            f.initialize(&Vec::new(&f.env), 1),
+            Err(RecoveryError::InvalidQuorum)
         );
 
-        env.ledger().set_timestamp(1_000_000 + RECOVERY_COOLDOWN_SECONDS);
-        execute_recovery(&env, account.clone()).unwrap();
-        assert_eq!(get_owner(&env, account.clone()).unwrap(), new_owner);
-        assert!(get_proposal(&env, account).is_none());
-        let _ = owner;
-    }
-
-    #[test]
-    fn owner_can_cancel_during_cooldown() {
-        let (env, account, owner, guardians) = setup();
-        let new_owner = TestAddress::generate();
-
-        submit_recovery(&env, guardians[0].clone(), account.clone(), new_owner.clone())
-            .unwrap();
-        approve_recovery(&env, guardians[1].clone(), account.clone()).unwrap();
-
-        cancel_recovery(&env, owner.clone(), account.clone()).unwrap();
-        assert!(get_proposal(&env, account.clone()).is_none());
-
-        env.ledger().set_timestamp(1_000_000 + RECOVERY_COOLDOWN_SECONDS);
+        let duplicated = vec![&f.env, f.guardian(0), f.guardian(0)];
         assert_eq!(
-            execute_recovery(&env, account.clone()),
-            Err(RecoveryError::NoProposal)
+            f.initialize(&duplicated, 2),
+            Err(RecoveryError::InvalidQuorum)
         );
-        assert_eq!(get_owner(&env, account).unwrap(), owner);
-    }
 
-    #[test]
-    fn requires_quorum_to_execute() {
-        let (env, account, _owner, guardians) = setup();
-        let new_owner = TestAddress::generate();
-        submit_recovery(&env, guardians[0].clone(), account.clone(), new_owner)
-            .unwrap();
-        env.ledger().set_timestamp(1_000_000 + RECOVERY_COOLDOWN_SECONDS);
+        let mut too_many = Vec::new(&f.env);
+        for _ in 0..=MAX_GUARDIANS {
+            too_many.push_back(Address::generate(&f.env));
+        }
         assert_eq!(
-            execute_recovery(&env, account),
-            Err(RecoveryError::QuorumNotReached)
+            f.initialize(&too_many, 2),
+            Err(RecoveryError::InvalidQuorum)
         );
+        assert_eq!(f.current_owner(), Err(RecoveryError::NotInitialized));
     }
 
     #[test]
-    fn nong_guardian_cannot_submit() {
-        let (env, account, _owner, _guardians) = setup();
-        let outsider = TestAddress::generate();
-        let new_owner = TestAddress::generate();
+    fn submit_records_the_request() {
+        let f = setup();
+
+        let request = f.submit(&f.guardian(0)).unwrap();
         assert_eq!(
-            submit_recovery(&env, outsider, account, new_owner),
+            request,
+            RecoveryRequest {
+                owner: f.owner.clone(),
+                new_owner: f.new_owner.clone(),
+                approvals: vec![&f.env, f.guardian(0)],
+                initiated_ledger: START,
+            }
+        );
+        assert_eq!(f.request(), Some(request));
+        assert_eq!(
+            f.run(|env| execution_ledger(env, &f.account)),
+            Ok(START + RECOVERY_COOLDOWN_LEDGERS)
+        );
+        assert!(f.ttl(RecoveryKey::RecoveryRequest(f.account.clone())) >= PERMISSION_TTL_BUMP);
+    }
+
+    #[test]
+    fn submit_rejects_invalid_requests() {
+        let uninitialized = setup_uninitialized();
+        assert_eq!(
+            uninitialized.submit(&uninitialized.guardian(0)),
+            Err(RecoveryError::NotInitialized)
+        );
+
+        let f = setup();
+        assert_eq!(
+            f.submit(&Address::generate(&f.env)),
             Err(RecoveryError::Unauthorized)
         );
+        assert_eq!(
+            f.run(|env| {
+                submit_recovery(env, f.guardian(0), f.account.clone(), f.owner.clone())
+            }),
+            Err(RecoveryError::InvalidNewOwner)
+        );
+
+        f.submit(&f.guardian(0)).unwrap();
+        assert_eq!(
+            f.submit(&f.guardian(1)),
+            Err(RecoveryError::RequestAlreadyExists)
+        );
     }
 
     #[test]
-    fn duplicate_approval_rejected() {
-        let (env, account, _owner, guardians) = setup();
-        let new_owner = TestAddress::generate();
-        submit_recovery(&env, guardians[0].clone(), account.clone(), new_owner)
-            .unwrap();
+    fn approve_rejects_outsiders_duplicates_and_missing_requests() {
+        let f = setup();
+
+        assert_eq!(f.approve(&f.guardian(0)), Err(RecoveryError::NoRequest));
+        f.submit(&f.guardian(0)).unwrap();
         assert_eq!(
-            approve_recovery(&env, guardians[0].clone(), account),
+            f.approve(&f.guardian(0)),
             Err(RecoveryError::AlreadyApproved)
         );
+        assert_eq!(
+            f.approve(&Address::generate(&f.env)),
+            Err(RecoveryError::Unauthorized)
+        );
+        assert_eq!(f.request().unwrap().approvals.len(), 1);
+    }
+
+    #[test]
+    fn recovery_transfers_ownership_after_the_cooldown() {
+        let f = setup();
+        f.submit(&f.guardian(0)).unwrap();
+        assert_eq!(f.approve(&f.guardian(1)).unwrap().approvals.len(), 2);
+
+        f.advance_to(START + RECOVERY_COOLDOWN_LEDGERS - 1);
+        assert_eq!(f.execute(), Err(RecoveryError::CooldownNotElapsed));
+        assert_eq!(f.current_owner(), Ok(f.owner.clone()));
+
+        f.advance_to(START + RECOVERY_COOLDOWN_LEDGERS);
+        assert_eq!(f.execute(), Ok(f.new_owner.clone()));
+        assert_eq!(f.current_owner(), Ok(f.new_owner.clone()));
+        assert_eq!(f.request(), None);
+        assert_eq!(f.execute(), Err(RecoveryError::NoRequest));
+    }
+
+    #[test]
+    fn execution_requires_the_quorum() {
+        let f = setup();
+        f.submit(&f.guardian(0)).unwrap();
+
+        f.advance_to(START + RECOVERY_COOLDOWN_LEDGERS);
+        assert_eq!(f.execute(), Err(RecoveryError::QuorumNotReached));
+        assert_eq!(f.current_owner(), Ok(f.owner.clone()));
+    }
+
+    #[test]
+    fn owner_can_cancel_during_the_cooldown() {
+        let f = setup();
+        f.submit(&f.guardian(0)).unwrap();
+        f.approve(&f.guardian(1)).unwrap();
+
+        assert_eq!(f.cancel(&f.owner), Ok(()));
+        assert_eq!(f.request(), None);
+        assert_eq!(f.cancel(&f.owner), Err(RecoveryError::NoRequest));
+
+        f.advance_to(START + RECOVERY_COOLDOWN_LEDGERS);
+        assert_eq!(f.execute(), Err(RecoveryError::NoRequest));
+        assert_eq!(f.current_owner(), Ok(f.owner.clone()));
+    }
+
+    #[test]
+    fn only_the_owner_can_cancel() {
+        let f = setup();
+        f.submit(&f.guardian(0)).unwrap();
+
+        assert_eq!(f.cancel(&f.guardian(0)), Err(RecoveryError::Unauthorized));
+        assert!(f.request().is_some());
     }
 }

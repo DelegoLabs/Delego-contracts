@@ -16,9 +16,11 @@
 //!
 //! `PermissionError` keeps its historical status-code style by adding the
 //! allocation base (`2000`) to each legacy value (e.g. `ParentNotFound`
-//! moves from `404` to `2404`). The unit tests below enforce that every
-//! `PermissionError` discriminant is inside the contract's range and that
-//! the documented ranges are pairwise disjoint.
+//! moves from `404` to `2404`). Within the same block, `MultiSigError` owns
+//! `2601..=2607`, `RecoveryError` `2701..=2711` and `TicketError` `2801..=2807`.
+//! The unit tests below enforce that every `PermissionError` discriminant is
+//! inside the contract's range and that the documented ranges are pairwise
+//! disjoint.
 
 // Contract crates compile as no_std for release and wasm builds, but keep std
 // enabled during testing so dev-dependencies and test assertions operate normally.
@@ -26,12 +28,19 @@
 #![cfg_attr(not(test), no_std)]
 #![allow(clippy::too_many_arguments)]
 #![warn(missing_docs)]
-mod recovery;
+/// Multi-signature approval management (issue #687).
+pub mod multisig;
+/// Guardian-quorum account recovery (issue #686).
+pub mod recovery;
 mod recurring_quota;
 mod crypto;
 mod sponsorship;
+/// Ephemeral, bounded spend tickets (issue #688).
+pub mod tickets;
+pub use multisig::{MultiSigConfig, MultiSigError, MultiSigProposal};
 pub use recurring_quota::RecurringQuotaConfig;
 pub use sponsorship::{GasSponsorshipQuota, SponsorshipDataKey, SponsorshipPolicy};
+pub use tickets::{SpendTicket, TicketDataKey, TicketError};
 pub use crypto::{
     verify_passkey_signature, verify_passkey_signature_compressed, verify_passkey_signature_flexible,
 };
@@ -6134,6 +6143,96 @@ impl PermissionsContract {
     /// Returns `sponsor`'s remaining sponsorship budget in stroops (0 if unfunded).
     pub fn get_sponsorship_balance(env: Env, sponsor: Address) -> i128 {
         sponsorship::read_balance(&env, &sponsor)
+    }
+
+    // ── Multi-sig approvals (issue #687) ────────────────────────────────────
+
+    /// Registers the multi-sig signer set and threshold of `account`. Requires
+    /// `account`'s authorization and can only be done once.
+    ///
+    /// Unrelated to [`Self::grant_multi_owner`], which governs the spending of
+    /// a delegated allowance.
+    pub fn init_multisig(
+        env: Env,
+        account: Address,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), MultiSigError> {
+        multisig::initialize(&env, account, signers, threshold)
+    }
+
+    /// Returns the multi-sig configuration of `account`.
+    pub fn get_multisig_config(
+        env: Env,
+        account: Address,
+    ) -> Result<MultiSigConfig, MultiSigError> {
+        multisig::get_config(&env, &account)
+    }
+
+    /// Opens a multi-sig proposal and returns its id. Requires the
+    /// authorization of `proposer`, who counts as the first approval.
+    pub fn propose_multisig(
+        env: Env,
+        account: Address,
+        proposer: Address,
+        payload_hash: BytesN<32>,
+    ) -> Result<u64, MultiSigError> {
+        multisig::propose(&env, account, proposer, payload_hash)
+    }
+
+    /// Approves a multi-sig proposal and returns whether the threshold has been
+    /// reached. Requires `signer`'s authorization.
+    pub fn approve_multisig(
+        env: Env,
+        account: Address,
+        signer: Address,
+        proposal_id: u64,
+    ) -> Result<bool, MultiSigError> {
+        multisig::approve(&env, account, signer, proposal_id)
+    }
+
+    /// Returns a multi-sig proposal of `account`.
+    pub fn get_multisig_proposal(
+        env: Env,
+        account: Address,
+        proposal_id: u64,
+    ) -> Result<MultiSigProposal, MultiSigError> {
+        multisig::get_proposal(&env, &account, proposal_id)
+    }
+
+    // ── Spend tickets (issue #688) ──────────────────────────────────────────
+
+    /// Issues a ticket letting `delegate` spend up to `max_amount` on behalf of
+    /// `owner` before `expires_at_ledger`, and returns its id. Requires
+    /// `owner`'s authorization.
+    pub fn issue_spend_ticket(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        max_amount: i128,
+        expires_at_ledger: u32,
+    ) -> Result<u64, TicketError> {
+        tickets::issue(&env, owner, delegate, max_amount, expires_at_ledger)
+    }
+
+    /// Redeems `amount` from a ticket and returns the amount still redeemable.
+    /// Requires the ticket delegate's authorization.
+    pub fn redeem_spend_ticket(
+        env: Env,
+        ticket_id: u64,
+        amount: i128,
+    ) -> Result<i128, TicketError> {
+        tickets::redeem(&env, ticket_id, amount)
+    }
+
+    /// Revokes a ticket. Requires the ticket owner's authorization.
+    pub fn revoke_spend_ticket(env: Env, ticket_id: u64) -> Result<(), TicketError> {
+        tickets::revoke(&env, ticket_id)
+    }
+
+    /// Returns a spend ticket.
+    pub fn get_spend_ticket(env: Env, ticket_id: u64) -> Result<SpendTicket, TicketError> {
+        tickets::get(&env, ticket_id)
     }
 
     /// Pause new grant creation. Admin-only.
