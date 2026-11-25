@@ -2980,6 +2980,93 @@ fn test_deposit_maintenance_reserve_requires_admin() {
 }
 
 #[test]
+fn test_deposit_maintenance_reserve_rejects_non_positive_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(DelegationRegistry, ());
+    let client = DelegationRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    for bad_amount in [0i128, -1i128, -50_000_000i128] {
+        let err = client
+            .try_deposit_maintenance_reserve(&admin, &bad_amount)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(
+            err,
+            soroban_sdk::Error::from_contract_error(DelegationError::InvalidAmount as u32)
+        );
+    }
+}
+
+#[test]
+fn test_deposit_maintenance_reserve_rejects_overflow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(DelegationRegistry, ());
+    let client = DelegationRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let first = client.deposit_maintenance_reserve(&admin, &i128::MAX);
+    assert_eq!(first, i128::MAX);
+
+    let err = client
+        .try_deposit_maintenance_reserve(&admin, &1i128)
+        .unwrap_err()
+        .unwrap();
+
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(DelegationError::ArithmeticOverflow as u32)
+    );
+}
+
+#[test]
+fn test_deposit_maintenance_reserve_emits_event() {
+    use soroban_sdk::IntoVal;
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(DelegationRegistry, ());
+    let client = DelegationRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let first_deposit = 25_000_000i128;
+    let second_deposit = 15_000_000i128;
+
+    assert_eq!(
+        client.deposit_maintenance_reserve(&admin, &first_deposit),
+        first_deposit
+    );
+    let new_balance = client.deposit_maintenance_reserve(&admin, &second_deposit);
+    assert_eq!(new_balance, first_deposit + second_deposit);
+
+    let events = env.events().all();
+    let dep_event = events
+        .iter()
+        .filter(|(contract, topics, _)| {
+            *contract == client.address
+                && topics.len() == 3
+                && topics.get(0) == Some(symbol_short!("DELEGO").into())
+                && topics.get(1) == Some(symbol_short!("resv_dep").into())
+                && topics.get(2) == Some(admin.clone().into_val(&env))
+        })
+        .last();
+
+    assert!(
+        dep_event.is_some(),
+        "maintenance reserve deposit event should have been emitted"
+    );
+
+    let (_, _, data) = dep_event.unwrap();
+    let payload: (i128, i128) = TryFromVal::try_from_val(&env, &data).unwrap();
+    assert_eq!(payload, (second_deposit, first_deposit + second_deposit));
+}
+
+#[test]
 fn test_get_maintenance_reserve_starts_at_zero() {
     let env = Env::default();
     env.mock_all_auths();
