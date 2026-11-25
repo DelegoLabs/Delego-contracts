@@ -44,11 +44,15 @@ impl RecurringQuotaState {
         }
     }
 
-    fn remaining(&self, record_limit: i128) -> i128 {
+    pub(crate) fn remaining(&self, record_limit: i128) -> i128 {
         let epoch_limit = record_limit.min(self.config.per_epoch_quota_stroops);
-        (epoch_limit - self.epoch_spent)
-            .max(0)
-            .min(self.config.lifetime_hard_cap_stroops - self.config.cumulative_lifetime_spent)
+        let epoch_remaining = epoch_limit.saturating_sub(self.epoch_spent).max(0);
+        let lifetime_remaining = self
+            .config
+            .lifetime_hard_cap_stroops
+            .saturating_sub(self.config.cumulative_lifetime_spent)
+            .max(0);
+        epoch_remaining.min(lifetime_remaining)
     }
 }
 
@@ -59,7 +63,7 @@ pub(crate) fn remaining(env: &Env, record: &PermissionRecord) -> i128 {
             state.refresh(env.ledger().sequence());
             state.remaining(record.limit_total)
         }
-        None => record.limit_total - record.spent,
+        None => record.limit_total.saturating_sub(record.spent).max(0),
     }
 }
 

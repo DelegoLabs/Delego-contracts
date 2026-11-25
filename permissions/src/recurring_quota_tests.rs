@@ -257,10 +257,13 @@ fn recurring_relayer_and_channel_share_lifetime_and_rollback_nonce_on_failure() 
         expiration_ledger,
         epoch,
     };
+    // Relayed spends must be signed over the versioned, domain-separated
+    // payload re-derived on-chain (issue #690), not the bare message XDR.
+    let payload = env.as_contract(&contract, || relayed_spend_signing_payload(&env, &message));
     let signature = BytesN::from_array(
         &env,
         &signing_key
-            .sign(&message.to_xdr(&env).iter().collect::<std::vec::Vec<_>>())
+            .sign(&payload.iter().collect::<std::vec::Vec<_>>())
             .to_bytes(),
     );
     client.execute_spend_via_relayer(
@@ -332,6 +335,52 @@ fn recurring_expiry_still_blocks_renewed_allowance() {
             .get_recurring_quota(&owner, &delegate)
             .unwrap()
             .cumulative_lifetime_spent,
+        0
+    );
+}
+
+#[test]
+fn recurring_remaining_saturates_for_over_spent_legacy_state() {
+    let config = recurring_quota::RecurringQuotaConfig {
+        epoch_duration_ledgers: WEEK,
+        per_epoch_quota_stroops: 100,
+        lifetime_hard_cap_stroops: 100,
+        cumulative_lifetime_spent: 0,
+        current_epoch_index: 0,
+    };
+
+    // Spending exactly at or beyond either cap must clamp to zero instead of
+    // panicking on unchecked `i128` subtraction (issue #753).
+    for (epoch_spent, lifetime_spent) in [(100, 0), (150, 0), (0, 100), (0, 150)] {
+        let state = recurring_quota::RecurringQuotaState {
+            config: recurring_quota::RecurringQuotaConfig {
+                cumulative_lifetime_spent: lifetime_spent,
+                ..config.clone()
+            },
+            epoch_spent,
+        };
+        assert_eq!(state.remaining(100), 0);
+    }
+
+    // Legacy permissions without a quota record follow the same rule.
+    let (env, contract, owner, delegate, _) = setup(100, 100);
+    env.as_contract(&contract, || {
+        let key = DataKey::Permission(owner.clone(), delegate.clone());
+        let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
+        record.spent = 150;
+        env.storage().persistent().set(&key, &record);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RecurringQuota(owner.clone(), delegate.clone()));
+    });
+    let record: PermissionRecord = env.as_contract(&contract, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Permission(owner.clone(), delegate.clone()))
+            .unwrap()
+    });
+    assert_eq!(
+        env.as_contract(&contract, || recurring_quota::remaining(&env, &record)),
         0
     );
 }
