@@ -18,6 +18,6 @@ impl SpendAuthorization {
         if self.epoch != current_epoch {
             return Err(PermissionError::StaleEpoch);
         }
-        Ok(()
+        Ok(())
     }
 }

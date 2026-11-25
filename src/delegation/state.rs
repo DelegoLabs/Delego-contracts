@@ -4,7 +4,7 @@ use soroban_sdk::types::ContractData;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-put enum AccountCircuitBreakerStatus {
+pub enum AccountCircuitBreakerStatus {
     Normal,
     Frozen,
 }
@@ -40,10 +40,19 @@ pub struct DelegationState {
     pub is_paused: bool,
     pub epoch_config: EpochConfig,
     pub allowances: Vec<AssetAllowance>,
+    pub expires_at: u32,
+    pub status: DelegationStatus,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DelegationStatus {
+    Active,
+    Expired,
 }
 
 impl DelegationState {
-    pub fn new(env: &Env, owner: Address, agent: Address) -> Self {
+    pub fn new(env: &Env, owner: Address, agent: Address, expires_at: u32) -> Self {
         DelegationState {
             owner,
             agent,
@@ -53,7 +62,14 @@ impl DelegationState {
                 epoch_started_ledger: env.ledger().sequence(),
             },
             allowances: Vec::new(env),
+            expires_at,
+            status: DelegationStatus::Active,
         }
+    }
+
+    /// A delegation is expired if its status was marked Expired or its expiry ledger has passed.
+    pub fn is_expired(&self, now: u32) -> bool {
+        self.status == DelegationStatus::Expired || self.expires_at < now
     }
 
     pub fn increment_epoch(&mut self, env: &Env) {
@@ -109,7 +125,7 @@ impl DelegationState {
         }
         record.spent_stroops = new_spent;
         self.allowances.set(idx, record);
-        Ok(()
+        Ok(())
     }
 }
 
