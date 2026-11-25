@@ -26,7 +26,7 @@
 // every public constant, type, and function carries in this file.
 #![allow(missing_docs)]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
     Symbol, Vec,
 };
 
@@ -640,48 +640,45 @@ pub const DELEGATION_SCHEMA_VERSION: u32 = 2;
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DelegationRecordV1 {
-    /// Unique identifier for the delegation.
-    pub id: u64,
     /// Address of the delegation owner.
     pub owner: Address,
-    /// Identifier of the authorized agent.
-    pub agent_id: BytesN<32>,
-    /// Contract address for which permissions are delegated.
-    pub permissions_contract: Address,
-    /// Current lifecycle status.
-    pub status: DelegationStatus,
-    /// Human-readable label for the delegation.
-    pub label: Symbol,
-    /// Ledger timestamp when the delegation was created.
-    pub created_at: u64,
-    /// Ledger timestamp of the last mutation to this delegation.
-    pub updated_at: u64,
+    /// Address of the authorized agent.
+    pub agent: Address,
     /// Ledger sequence at which the delegation expires.
     pub expires_at_ledger: u32,
-    /// Version number used for history/rollback.
-    pub version: u32,
-    /// Capabilities granted to the delegate, packed into one word.
-    pub permissions: PermissionBitmask,
-    /// Nonce for key revocation tracking.
-    pub nonce: u64,
+    /// Whether the delegation was revoked.
+    pub revoked: bool,
 }
 
 impl DelegationRecordV1 {
     /// Converts a legacy V1 record into the current V2 schema.
-    pub fn into_v2(self) -> DelegationRecord {
+    pub fn into_v2(self, env: &Env, id: u64) -> DelegationRecord {
+        let agent_str = self.agent.to_string();
+        let agent_len = agent_str.len().min(56);
+        let mut agent_str_bytes = [0u8; 56];
+        agent_str.copy_into_slice(&mut agent_str_bytes[..agent_len as usize]);
+        let agent_hash = env
+            .crypto()
+            .sha256(&Bytes::from_slice(env, &agent_str_bytes[..agent_len as usize]))
+            .to_bytes();
+
         DelegationRecord {
-            id: self.id,
+            id,
             owner: self.owner,
-            agent_id: self.agent_id,
-            permissions_contract: self.permissions_contract,
-            status: self.status,
-            label: self.label,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
+            agent_id: agent_hash,
+            permissions_contract: Address::from_str(env, ZERO_CONTRACT_STRKEY),
+            status: if self.revoked {
+                DelegationStatus::Revoked
+            } else {
+                DelegationStatus::Active
+            },
+            label: Symbol::new(env, "V1"),
+            created_at: env.ledger().timestamp(),
+            updated_at: env.ledger().timestamp(),
             expires_at_ledger: self.expires_at_ledger,
-            version: self.version,
-            permissions: self.permissions,
-            nonce: self.nonce,
+            version: 1,
+            permissions: PermissionBitmask::all(),
+            nonce: 0,
         }
     }
 }
@@ -930,6 +927,89 @@ impl DelegationRegistry {
             ttl_ledgers,
             PermissionBitmask::all(),
         )
+    }
+
+    /// Migrates a legacy V1 delegation for `owner` to the canonical id-keyed
+    /// record layout.
+    pub fn migrate_v1_delegation(
+        env: Env,
+        owner: Address,
+    ) -> Result<u64, DelegationError> {
+        owner.require_auth();
+
+        let v1_key = DataKey::DelegationV1(owner.clone());
+        let v1: DelegationRecordV1 = env
+            .storage()
+            .persistent()
+            .get(&v1_key)
+            .ok_or(DelegationError::NotFound)?;
+        if v1.owner != owner {
+            return Err(DelegationError::NotFound);
+        }
+
+        let id = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(1u64);
+        let next_id = id.checked_add(1).ok_or(DelegationError::IdExhausted)?;
+        env.storage().instance().set(&DataKey::NextId, &next_id);
+
+        let record = v1.into_v2(&env, id);
+        let delegation_key = DataKey::Delegation(id);
+        env.storage()
+            .persistent()
+            .set(&delegation_key, &record);
+        env.storage().persistent().extend_ttl(
+            &delegation_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Self::write_delegation_v2(&env, &record);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegationVersion(id), &record.version);
+        env.storage().persistent().extend_ttl(
+            &DataKey::DelegationVersion(id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let user_delegations_key = DataKey::UserDelegations(owner.clone());
+        let mut user_delegations = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<u64>>(&user_delegations_key)
+            .unwrap_or(Vec::new(&env));
+        user_delegations.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&user_delegations_key, &user_delegations);
+        env.storage().persistent().extend_ttl(
+            &user_delegations_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Self::store_snapshot(&env, id, &record);
+        env.storage().persistent().remove(&v1_key);
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        env.events().publish(
+            (EVENT_TOPIC_CONTRACT, symbol_short!("created"), id),
+            DelegationCreatedEvent {
+                delegation_id: id,
+                owner: record.owner,
+                agent: record.agent_id,
+                timestamp: record.updated_at,
+            },
+        );
+
+        Ok(id)
     }
 
     /// Creates a new delegation whose delegate only holds `permissions`.
@@ -3196,11 +3276,7 @@ impl DelegationRegistry {
         let v1: Option<DelegationRecordV1> = env.storage().persistent().get(&v1_key);
         let v1 = v1?;
 
-        if v1.id != delegation_id {
-            return None;
-        }
-
-        let record = v1.into_v2();
+        let record = v1.into_v2(env, delegation_id);
 
         // Write the migrated record under both the canonical and V2 keys so
         // subsequent reads take the fast path, then drop the legacy entry.
