@@ -1,11 +1,22 @@
-use soroban_sdk::{contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec};
-use soroban_sdk::token::{Token, TokenType};
-use soroban_sdk::types::ContractData;
+//! Delegation contract: agent spending bounded by per-asset allowances.
+//!
+//! Every spend must arrive with a [`SpendAuthorization`] that is bound to the
+//! delegation (agent key, epoch, nonce) and signed by the agent's Ed25519 key.
 
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec};
+
+use super::authorizations::SpendAuthorization;
+use super::errors::PermissionError;
+use super::state::{AccountCircuitBreakerStatus, DelegationState};
+
+/// Auxiliary storage keys (instance storage).
 #[contracttype]
-pub enum AccountCircuitBreakerStatus {
-    Normal,
-    Frozen,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    /// Delegation id owned by a delegator account.
+    DelegationByOwner(Address),
+    /// Circuit breaker status of a delegator account.
+    Status(Address),
 }
 
 #[contracttype]
@@ -26,21 +37,47 @@ pub enum DelegationError {
 const MAX_SWEEP_BATCH: u32 = 50;
 const KEEPER_REWARD_STROOPS: i128 = 100;
 
-#[contractimpl]
+#[contract]
 pub struct DelegationContract;
 
 #[contractimpl]
 impl DelegationContract {
-    pub fn pause_delegation(env: Env, delegation_id: Symbol) -> Result<(), PermissionError> {
-        let mut state = Self::get_delegation_state(&env, delegation_id)?;
+    /// Creates a delegation from `owner` to `agent`.
+    pub fn create_delegation(
+        env: Env,
+        delegation_id: Symbol,
+        owner: Address,
+        agent: Address,
+    ) -> Result<(), PermissionError> {
+        owner.require_auth();
+        if env.storage().instance().has(&delegation_id) {
+            return Err(PermissionError::PermissionDenied);
+        }
+        let state = DelegationState::new(&env, owner.clone(), agent);
+        Self::set_delegation_state(&env, delegation_id.clone(), &state);
+        env.storage()
+            .instance()
+            .set(&DataKey::DelegationByOwner(owner.clone()), &delegation_id);
+        Self::set_circuit_breaker_status(&env, owner, AccountCircuitBreakerStatus::Normal);
+        Ok(())
+    }
+
+    pub fn pause_delegation(
+        env: Env,
+        delegation_id: Symbol,
+    ) -> Result<(), PermissionError> {
+        let mut state = Self::get_delegation_state(&env, delegation_id.clone())?;
         state.increment_epoch(&env);
         state.is_paused = true;
         Self::set_delegation_state(&env, delegation_id, &state);
         Ok(())
     }
 
-    pub fn resume_delegation(env: Env, delegation_id: Symbol) -> Result<(), PermissionError> {
-        let mut state = Self::get_delegation_state(&env, delegation_id)?;
+    pub fn resume_delegation(
+        env: Env,
+        delegation_id: Symbol,
+    ) -> Result<(), PermissionError> {
+        let mut state = Self::get_delegation_state(&env, delegation_id.clone())?;
         state.increment_epoch(&env);
         state.is_paused = false;
         Self::set_delegation_state(&env, delegation_id, &state);
@@ -53,41 +90,58 @@ impl DelegationContract {
         token_contract: Address,
         spending_limit_stroops: i128,
     ) -> Result<(), PermissionError> {
-        let mut state = Self::get_delegation_state(&env, delegation_id)?;
+        let mut state = Self::get_delegation_state(&env, delegation_id.clone())?;
         state.add_allowance(&env, token_contract, spending_limit_stroops);
         Self::set_delegation_state(&env, delegation_id, &state);
         Ok(())
     }
 
+    /// Freezes an account: advances the delegation epoch (invalidating every
+    /// in-flight authorization) and pauses spending until reactivated.
     pub fn trigger_emergency_killswitch(
         env: Env,
-        delegator: Symbol,
+        delegator: Address,
     ) -> Result<(), PermissionError> {
-        let mut state = Self::get_delegation_state(&env, delegator.clone())?;
+        delegator.require_auth();
+        let delegation_id: Symbol = env
+            .storage()
+            .instance()
+            .get(&DataKey::DelegationByOwner(delegator.clone()))
+            .ok_or(PermissionError::PermissionDenied)?;
+        let mut state = Self::get_delegation_state(&env, delegation_id.clone())?;
         state.increment_epoch(&env);
         state.is_paused = true;
-        Self::set_delegation_state(&env, delegator.clone(), &state);
+        Self::set_delegation_state(&env, delegation_id, &state);
         Self::set_circuit_breaker_status(
             &env,
             delegator.clone(),
             AccountCircuitBreakerStatus::Frozen,
         );
         env.events().publish(
-            (Symbol::new(&env, "DelegationCircuitBreakerTriggered"), delegator),
+            (
+                Symbol::new(&env, "CircuitBreakerTriggered"),
+                delegator,
+            ),
             state.epoch_config.current_epoch,
         );
         Ok(())
     }
 
+    /// Lifts the circuit breaker; requires the delegator's master key.
     pub fn reactivate_account(
         env: Env,
-        delegator: Symbol,
+        delegator: Address,
     ) -> Result<(), PermissionError> {
         delegator.require_auth();
-        let mut state = Self::get_delegation_state(&env, delegator.clone())?;
+        let delegation_id: Symbol = env
+            .storage()
+            .instance()
+            .get(&DataKey::DelegationByOwner(delegator.clone()))
+            .ok_or(PermissionError::PermissionDenied)?;
+        let mut state = Self::get_delegation_state(&env, delegation_id.clone())?;
         state.increment_epoch(&env);
         state.is_paused = false;
-        Self::set_delegation_state(&env, delegator.clone(), &state);
+        Self::set_delegation_state(&env, delegation_id, &state);
         Self::set_circuit_breaker_status(
             &env,
             delegator,
@@ -96,109 +150,108 @@ impl DelegationContract {
         Ok(())
     }
 
+    /// Executes a delegated spend.
+    ///
+    /// Enforced, in order:
+    /// 1. The account is not frozen by the circuit breaker.
+    /// 2. The delegation is not paused.
+    /// 3. `auth.agent` is the delegation's agent.
+    /// 4. `auth.epoch` matches the delegation's current epoch.
+    /// 5. `auth.nonce` equals the delegation's next expected nonce (replay
+    ///    protection; the stored nonce is incremented on success).
+    /// 6. `auth.amount` is strictly positive.
+    /// 7. `auth.signature` is a valid Ed25519 signature by `auth.agent_pubkey`
+    ///    over the domain-separated XDR payload for this delegation.
+    /// 8. The spend fits within the asset's remaining allowance (checked
+    ///    arithmetic; overflow is reported as
+    ///    [`PermissionError::ExceedsAllowance`]).
+    ///
+    /// A forged signature aborts the invocation (`ed25519_verify` traps), so
+    /// the spend is rejected and no state is written.
     pub fn execute_spend(
         env: Env,
         delegation_id: Symbol,
         auth: SpendAuthorization,
     ) -> Result<(), PermissionError> {
-        let mut state = Self::get_delegation_state(&env, delegation_id)?;
-        if let AccountCircuitBreakerStatus::Frozen =
-            Self::get_circuit_breaker_status(&env, delegation_id.clone())
+        let mut state = Self::get_delegation_state(&env, delegation_id.clone())?;
+
+        if Self::get_circuit_breaker_status(&env, state.owner.clone())
+            == AccountCircuitBreakerStatus::Frozen
         {
-            return Err(PermissionError::Unauthorized);
+            return Err(PermissionError::AccountFrozen);
         }
-        let state = Self::get_delegation_state(&env, delegation_id)?;
-        auth.validate_epoch(state.epoch_config.current_epoch)?;
         if state.is_paused {
             return Err(PermissionError::DelegationPaused);
         }
-        if env.ledger().sequence() > state.epoch_config.epoch_started_ledger {
-            // epoch window is open
+
+        // The authorization must have been issued for this delegation's agent.
+        if auth.agent != state.agent {
+            return Err(PermissionError::PermissionDenied);
         }
-        state.record_spend(&auth.token_contract, auth.amount)?;
+
+        auth.validate_epoch(state.epoch_config.current_epoch as u64)?;
+
+        // Strictly sequential nonce: a replayed authorization carries a nonce
+        // the delegation has already consumed, so it is rejected here before
+        // any state is mutated.
+        if auth.nonce != state.nonce {
+            return Err(PermissionError::InvalidNonce);
+        }
+
+        if auth.amount <= 0 {
+            return Err(PermissionError::InvalidAmount);
+        }
+
+        // Verified last so cheap checks fail first. The host traps when the
+        // signature is forged, rejecting the spend.
+        let payload = auth.signing_payload(&env, delegation_id.clone());
+        env.crypto()
+            .ed25519_verify(&auth.agent_pubkey, &payload, &auth.signature);
+
+        state.record_spend(&auth.asset, auth.amount)?;
+        state.nonce = auth
+            .nonce
+            .checked_add(1)
+            .ok_or(PermissionError::InvalidNonce)?;
         Self::set_delegation_state(&env, delegation_id, &state);
         Ok(())
     }
 
-    /// Sweeps up to `MAX_SWEEP_BATCH` expired delegation records, removing them
-    /// from storage and paying the keeper a reward from the gas rebate pool.
-    /// Active (non-expired) delegations are rejected and cause the whole call to fail.
-    pub fn sweep_expired_delegations(
-        env: Env,
-        keeper: Address,
-        delegation_keys: Vec<BytesN<32>>,
-    ) -> Result<u32, DelegationError> {
-        keeper.require_auth();
-
-        let count = delegation_keys.len();
-        if count == 0 {
-            return Ok(0);
-        }
-        if count > MAX_SWEEP_BATCH {
-            return Err(DelegationError::BatchTooLarge);
-        }
-
-        let now = env.ledger().timestamp();
-
-        // Validate every key first so the sweep is atomic: no partial removal.
-        for i in 0..count {
-            let key = delegation_keys.get(i).unwrap();
-            let record: DelegationRecord = env
-                .storage()
-                .persistent()
-                .get(&key)
-                .ok_or(DelegationError::NotFound)?;
-            let expired = matches!(record.status, DelegationStatus::Expired)
-                || record.expires_at < now;
-            if !expired {
-                return Err(DelegationError::NotExpired);
-            }
-        }
-
-        // Pay the keeper reward from the gas rebate pool before removal.
-        let pool: i128 = env
-            .storage()
-            .instance()
-            .get(&GAS_REBATE_POOL_KEY)
-            .unwrap_or(0);
-        let reward = KEEPER_REWARD_STROOPS
-            .checked_mul(count as i128)
-            .ok_or(DelegationError::RewardUnavailable)?;
-        if pool < reward {
-            return Err(DelegationError::RewardUnavailable);
-        }
+    pub fn get_delegation_state(
+        env: &Env,
+        delegation_id: Symbol,
+    ) -> Result<DelegationState, PermissionError> {
         env.storage()
             .instance()
-            .set(&GAS_REBATE_POOL_KEY, &(pool - reward));
-        let keeper_balance: i128 = env
-            .storage()
-            .instance()
-            .get(&(KEEPER_BALANCE_PREFIX, keeper.clone()))
-            .unwrap_or(0);
-        env.storage().instance().set(
-            &(KEEPER_BALANCE_PREFIX, keeper.clone()),
-            &(keeper_balance + reward),
-        );
-
-        // Remove the validated records.
-        for i in 0..count {
-            let key = delegation_keys.get(i).unwrap();
-            env.storage().persistent().remove(&key);
-        }
-
-        env.events().publish(
-            (Symbol::new(&env, "DelegationsSwept"), keeper),
-            count,
-        );
-
-        Ok(count)
+            .get(&delegation_id)
+            .ok_or(PermissionError::PermissionDenied)
     }
 
-    pub fn get_delegation_state(env: &Env, delegation_id: Symbol) -> Result<DelegationState, PermissionError> {
-        env.storage().instance().get(&delegation_id).unwrap()
-    }
-
-    pub fn set_delegation_state(env: &Env, delegation_id: Symbol, state: &DelegationState) {
+    pub fn set_delegation_state(
+        env: &Env,
+        delegation_id: Symbol,
+        state: &DelegationState,
+    ) {
         env.storage().instance().set(&delegation_id, state);
+    }
+
+    pub fn get_circuit_breaker_status(
+        env: &Env,
+        delegator: Address,
+    ) -> AccountCircuitBreakerStatus {
+        env.storage()
+            .instance()
+            .get(&DataKey::Status(delegator))
+            .unwrap_or(AccountCircuitBreakerStatus::Normal)
+    }
+
+    pub fn set_circuit_breaker_status(
+        env: &Env,
+        delegator: Address,
+        status: AccountCircuitBreakerStatus,
+    ) {
+        env.storage()
+            .instance()
+            .set(&DataKey::Status(delegator), &status);
     }
 }
