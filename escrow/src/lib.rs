@@ -7006,16 +7006,26 @@ impl EscrowContract {
             blend_yield::fund(&env, escrow_id, &record.token, net_received);
         }
         // Revoke any residual allowance the pool may hold after the deposit
-        // (issue #599).
-        if let Some(cfg) = blend_yield::config(&env, escrow_id) {
-            token_safety::revoke_allowance_safe(
-                &env,
-                &record.token,
-                &cfg.lending_pool_contract,
-            );
-            // The balance is now staked: record the deposit ledger so it can
-            // not be withdrawn within the same ledger (issue #594).
-            flash_loan_guard::record_deposit_ledger(&env, escrow_id);
+        // (issue #599), and record the staking deposit ledger so the balance
+        // can not be withdrawn within the same ledger (issue #594).
+        //
+        // Both actions are only meaningful for a deposit that actually
+        // reached the pool. When `should_stake` returned false (low APY,
+        // issue #596) or the pool is detached (issue #597), the funds remain
+        // in the escrow's standard vault and no pool position was opened, so
+        // stamping `FlashLoanKey::StakeDepositLedger` would incorrectly lock
+        // same-ledger release/refund of an escrow that never staked (#767).
+        if stake {
+            if let Some(cfg) = blend_yield::config(&env, escrow_id) {
+                token_safety::revoke_allowance_safe(
+                    &env,
+                    &record.token,
+                    &cfg.lending_pool_contract,
+                );
+                // The balance is now staked: record the deposit ledger so it
+                // can not be withdrawn within the same ledger (issue #594).
+                flash_loan_guard::record_deposit_ledger(&env, escrow_id);
+            }
         }
 
         record.amount = net_received;
