@@ -64,3 +64,23 @@ fn all_escrow_error_codes_are_unique() {
         assert_ne!(pair[0], pair[1], "duplicate EscrowError code: {}", pair[0]);
     }
 }
+
+#[test]
+fn detached_pool_errors_decode_to_exact_variants() {
+    for (error, code) in [
+        (EscrowError::DefiPoolDetached, 496),
+        (EscrowError::DefiPoolAlreadyDetached, 613),
+        (EscrowError::SameLedgerManipulationDetected, 612),
+    ] {
+        assert_eq!(error as u32, code);
+        assert_eq!(EscrowError::try_from(code), Ok(error));
+        assert_eq!(
+            EscrowError::try_from(soroban_sdk::Error::from_contract_error(code)),
+            Ok(error)
+        );
+        assert_eq!(
+            EscrowError::try_from(soroban_sdk::InvokeError::Contract(code)),
+            Ok(error)
+        );
+    }
+}

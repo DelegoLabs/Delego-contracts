@@ -372,3 +372,49 @@ fn get_recurring_quota_bumps_ttl_when_below_threshold() {
     assert!(ttl_after >= PERMISSION_TTL_BUMP);
     assert!(ttl_after > ttl_before);
 }
+
+#[test]
+fn recurring_remaining_saturates_for_over_spent_legacy_state() {
+    let config = recurring_quota::RecurringQuotaConfig {
+        epoch_duration_ledgers: WEEK,
+        per_epoch_quota_stroops: 100,
+        lifetime_hard_cap_stroops: 100,
+        cumulative_lifetime_spent: 0,
+        current_epoch_index: 0,
+    };
+
+    // Spending exactly at or beyond either cap must clamp to zero instead of
+    // panicking on unchecked `i128` subtraction (issue #753).
+    for (epoch_spent, lifetime_spent) in [(100, 0), (150, 0), (0, 100), (0, 150)] {
+        let state = recurring_quota::RecurringQuotaState {
+            config: recurring_quota::RecurringQuotaConfig {
+                cumulative_lifetime_spent: lifetime_spent,
+                ..config.clone()
+            },
+            epoch_spent,
+        };
+        assert_eq!(state.remaining(100), 0);
+    }
+
+    // Legacy permissions without a quota record follow the same rule.
+    let (env, contract, owner, delegate, _) = setup(100, 100);
+    env.as_contract(&contract, || {
+        let key = DataKey::Permission(owner.clone(), delegate.clone());
+        let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
+        record.spent = 150;
+        env.storage().persistent().set(&key, &record);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RecurringQuota(owner.clone(), delegate.clone()));
+    });
+    let record: PermissionRecord = env.as_contract(&contract, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Permission(owner.clone(), delegate.clone()))
+            .unwrap()
+    });
+    assert_eq!(
+        env.as_contract(&contract, || recurring_quota::remaining(&env, &record)),
+        0
+    );
+}

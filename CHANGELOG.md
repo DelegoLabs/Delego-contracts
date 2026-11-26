@@ -23,6 +23,7 @@ will reject the change.
 - Fix `fund_with_lst` so funding a `Created` escrow with LST collateral transitions it to `Funded`,
   sets `ESCROW_FLAG_FUNDED`, refreshes `updated_at`, and bumps the escrow record TTL; repeat LST
   funding is rejected with `LstCollateralAlreadyRecorded` (issue #764).
+- Add regression coverage confirming unique `EscrowError` discriminants and exact decoding of `DefiPoolDetached`, `DefiPoolAlreadyDetached`, and `SameLedgerManipulationDetected` (issue #762).
 - Add pro-rata partial refund settlement (issue #539): `resolve_partial_refund` (buyer and merchant authorization)
   and `arbitrate_partial_refund` (arbiter authorization on disputed escrows), emitting `PartialRefundSettled`.
 - Fix escrow error-code collisions and stale decoding mappings (#706). Preserve
@@ -115,6 +116,7 @@ will reject the change.
 
 ### Unreleased
 
+- Clamp recurring-quota remaining allowance to zero when epoch, lifetime, or legacy spend counters exceed their caps, instead of panicking on underflow (issue #753).
 - `grant` and `grant_child` now reject `ttl_ledgers == 0` with the new `PermissionError::InvalidTtl` (2433)
   (issue #10).
 - Repair the account recovery module (issue #686): valid SDK v22 storage calls with TTL extension, the
