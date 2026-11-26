@@ -34,7 +34,8 @@ pub mod multisig;
 pub mod recovery;
 mod recurring_quota;
 mod crypto;
-mod sponsorship;
+/// Gas fee sponsorship quota and deduction logic (issues #689, #752).
+pub mod sponsorship;
 /// Ephemeral, bounded spend tickets (issue #688).
 pub mod tickets;
 pub use multisig::{MultiSigConfig, MultiSigError, MultiSigProposal};
@@ -49,9 +50,6 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, xdr::ToXdr, Address, BytesN,
     Env, Symbol, Vec,
 };
-
-#[cfg(any(test, feature = "testutils"))]
-use soroban_sdk::testutils::storage::Persistent as _;
 
 const _PERM: Symbol = symbol_short!("PERM");
 const _PENDING_DEC: Symbol = symbol_short!("PEND_DEC");
@@ -1636,28 +1634,23 @@ pub struct PermissionsContract;
 // the ABI entry-point signatures above; they cannot be annotated individually
 // from user code, so the allow lives on the impl block for those generated
 // wrappers only. User-defined functions carry their own scoped allows.
+/// Extends the TTL on a persistent storage key when it falls below [`PERMISSION_TTL_THRESHOLD`].
 #[allow(clippy::too_many_arguments)]
 pub fn bump_persistent_ttl(env: &Env, key: &DataKey) {
-    #[cfg(any(test, feature = "testutils"))]
-    let current_ttl = env.storage().persistent().get_ttl(key);
-    #[cfg(not(any(test, feature = "testutils")))]
-    let current_ttl = 0u32;
-
-    if current_ttl < PERMISSION_TTL_THRESHOLD {
-        env.storage()
-            .persistent()
-            .extend_ttl(key, PERMISSION_TTL_BUMP, PERMISSION_TTL_BUMP);
-    }
+    env.storage()
+        .persistent()
+        .extend_ttl(key, PERMISSION_TTL_THRESHOLD, PERMISSION_TTL_BUMP);
 }
 
-pub fn bump_instance_ttl(env: &Env) {
+/// Placeholder for instance-storage TTL extension.
+pub fn bump_instance_ttl(_env: &Env) {
     // Instance keys that need TTL bumping are tracked separately;
     // this is a no-op for now since instance keys are managed differently.
 }
 
 /// Extends the TTL on a persistent storage key if it falls below the threshold.
 /// This prevents active permissions from being evicted during archival.
-fn extend_persistent_ttl_if_needed(env: &Env, key: &DataKey) {
+pub(crate) fn extend_persistent_ttl_if_needed(env: &Env, key: &DataKey) {
     bump_persistent_ttl(env, key);
 }
 
@@ -1955,6 +1948,47 @@ impl PermissionsContract {
         }
     }
 
+    /// Grant a spending permission bounded to the calendar ledger window
+    /// `[not_before_ledger, not_after_ledger]`.
+    pub fn grant_bounded(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        limit_total: i128,
+        limit_per_tx: i128,
+        allowed_merchants: Vec<Address>,
+        not_before_ledger: u32,
+        not_after_ledger: u32,
+    ) -> Result<(), PermissionError> {
+        if not_after_ledger == 0 || not_before_ledger > not_after_ledger {
+            return Err(PermissionError::InvalidParam);
+        }
+        let current_ledger = env.ledger().sequence();
+        if not_after_ledger <= current_ledger {
+            return Err(PermissionError::InvalidTtl);
+        }
+        let ttl_ledgers = not_after_ledger - current_ledger;
+        Self::grant_impl(
+            env.clone(),
+            owner.clone(),
+            delegate.clone(),
+            limit_total,
+            limit_per_tx,
+            allowed_merchants,
+            ttl_ledgers,
+            false,
+            None,
+        )?;
+        let key = DataKey::Permission(owner, delegate);
+        let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
+        record.not_before_ledger = not_before_ledger;
+        record.not_after_ledger = not_after_ledger;
+        record.expires_at_ledger = not_after_ledger;
+        env.storage().persistent().set(&key, &record);
+        extend_persistent_ttl_if_needed(&env, &key);
+        Ok(())
+    }
+
     /// Explicitly replaces an existing delegation's terms (issue #51).
     ///
     /// Unlike [`Self::grant`], this is permitted on a live (Active/Paused)
@@ -2151,30 +2185,6 @@ impl PermissionsContract {
         }
 
         let expires_at_ledger = Self::grant_expiry_ledger(&env, ttl_ledgers)?;
-
-        let user_perms_key = DataKey::UserPermissions(owner.clone());
-        let mut delegates: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&user_perms_key)
-            .unwrap_or(Vec::new(&env));
-        if !delegates.contains(&delegate) {
-            delegates.push_back(delegate.clone());
-            env.storage().persistent().set(&user_perms_key, &delegates);
-            extend_persistent_ttl_if_needed(&env, &user_perms_key);
-        }
-
-        let user_perms_key = DataKey::UserPermissions(owner.clone());
-        let mut delegates: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&user_perms_key)
-            .unwrap_or(Vec::new(&env));
-        if !delegates.contains(&delegate) {
-            delegates.push_back(delegate.clone());
-            env.storage().persistent().set(&user_perms_key, &delegates);
-            extend_persistent_ttl_if_needed(&env, &user_perms_key);
-        }
 
         let user_perms_key = DataKey::UserPermissions(owner.clone());
         let mut delegates: Vec<Address> = env
@@ -3838,19 +3848,19 @@ impl PermissionsContract {
             let ledgers_since_reset = current_ledger.saturating_sub(record.last_reset_ledger);
             match record.epoch {
                 Epoch::Daily => {
-                    if ledgers_since_reset >= 1 {
+                    if ledgers_since_reset >= 17_280 {
                         record.spent = 0;
                         record.last_reset_ledger = current_ledger;
                     }
                 }
                 Epoch::Weekly => {
-                    if ledgers_since_reset >= 7 {
+                    if ledgers_since_reset >= 120_960 {
                         record.spent = 0;
                         record.last_reset_ledger = current_ledger;
                     }
                 }
                 Epoch::Monthly => {
-                    if ledgers_since_reset >= 30 {
+                    if ledgers_since_reset >= 518_400 {
                         record.spent = 0;
                         record.last_reset_ledger = current_ledger;
                     }
@@ -3879,6 +3889,7 @@ impl PermissionsContract {
             _ => None,
         };
         env.storage().persistent().set(&key, &record);
+        extend_persistent_ttl_if_needed(env, &key);
 
         Self::record_spend_stats(env, owner, delegate, amount);
 
@@ -3922,6 +3933,7 @@ impl PermissionsContract {
                 _ => None,
             };
             env.storage().persistent().set(&parent_key, &parent_record);
+            extend_persistent_ttl_if_needed(env, &parent_key);
         }
 
         Ok(SpendExecutionResult {
@@ -5756,6 +5768,22 @@ impl PermissionsContract {
         Ok(())
     }
 
+    /// Cancel a pending allowance decrease queued for `(owner, delegate)`.
+    /// Only `owner` may cancel a pending decrease.
+    pub fn cancel_pending_decrease(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Result<(), PermissionError> {
+        owner.require_auth();
+        let pend_key = DataKey::PendingDecrement(owner, delegate);
+        if !env.storage().persistent().has(&pend_key) {
+            return Err(PermissionError::NotFound);
+        }
+        env.storage().persistent().remove(&pend_key);
+        Ok(())
+    }
+
     pub fn execute_decrease_allowance(
         env: Env,
         owner: Address,
@@ -6122,6 +6150,23 @@ impl PermissionsContract {
             return Err(PermissionError::RelayerFrozen);
         }
         sponsorship::charge_fee(&env, &sponsor, &relayer, fee_stroops)
+    }
+
+    /// Deactivate `sponsor`'s gas sponsorship policy so no further relayer fees
+    /// or deposits can be processed until reconfigured.
+    pub fn deactivate_sponsorship(env: Env, sponsor: Address) -> Result<(), PermissionError> {
+        sponsorship::deactivate(&env, &sponsor)
+    }
+
+    /// Withdraw `amount` of unspent `token` from `sponsor`'s escrowed
+    /// sponsorship balance back to `sponsor`, returning the remaining balance.
+    pub fn withdraw_sponsorship(
+        env: Env,
+        sponsor: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<i128, PermissionError> {
+        sponsorship::withdraw(&env, &sponsor, &token, amount)
     }
 
     /// Returns `sponsor`'s sponsorship policy, if one is configured.

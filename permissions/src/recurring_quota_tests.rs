@@ -257,10 +257,13 @@ fn recurring_relayer_and_channel_share_lifetime_and_rollback_nonce_on_failure() 
         expiration_ledger,
         epoch,
     };
+    let signing_payload = env.as_contract(&contract, || {
+        crate::relayed_spend_signing_payload(&env, &message)
+    });
     let signature = BytesN::from_array(
         &env,
         &signing_key
-            .sign(&message.to_xdr(&env).iter().collect::<std::vec::Vec<_>>())
+            .sign(&signing_payload.iter().collect::<std::vec::Vec<_>>())
             .to_bytes(),
     );
     client.execute_spend_via_relayer(

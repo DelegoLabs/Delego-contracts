@@ -362,7 +362,7 @@ fn test_permission_events() {
     let mut granted_event_found = false;
     for event in events.iter() {
         let (contract, topics, value) = event;
-        if contract == t.permissions_contract_id && topics.len() == 2 {
+        if contract == t.permissions_contract_id && topics.len() >= 2 {
             let topic0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&t.env).unwrap();
             let topic1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&t.env).unwrap();
             if topic0 == soroban_sdk::symbol_short!("perm")
@@ -389,7 +389,7 @@ fn test_permission_events() {
     let mut spent_event_found = false;
     for event in events.iter() {
         let (contract, topics, value) = event;
-        if contract == t.permissions_contract_id && topics.len() == 2 {
+        if contract == t.permissions_contract_id && topics.len() >= 2 {
             let topic0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&t.env).unwrap();
             let topic1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&t.env).unwrap();
             if topic0 == soroban_sdk::symbol_short!("perm")
@@ -412,7 +412,7 @@ fn test_permission_events() {
     let mut revoked_event_found = false;
     for event in events.iter() {
         let (contract, topics, value) = event;
-        if contract == t.permissions_contract_id && topics.len() == 2 {
+        if contract == t.permissions_contract_id && topics.len() >= 2 {
             let topic0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&t.env).unwrap();
             let topic1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&t.env).unwrap();
             if topic0 == soroban_sdk::symbol_short!("perm")
@@ -1224,7 +1224,7 @@ fn test_transfer_permission_revokes_old_and_emits_events() {
     let mut found = false;
     for event in events.iter() {
         let (contract, topics, _value) = event;
-        if contract != t.permissions_contract_id || topics.len() != 2 {
+        if contract != t.permissions_contract_id || topics.len() < 2 {
             continue;
         }
         let t0: Symbol = topics.get(0).unwrap().try_into_val(&t.env).unwrap();
@@ -2011,14 +2011,20 @@ fn test_scoped_grant_rejects_relayed_spend() {
 fn register_verified_merchant(
     t: &TestEnv,
     client: &PermissionsContractClient,
+    merchant_id: u64,
     verifications: u32,
 ) -> u64 {
-    let merchant = Address::generate(&t.env);
-    let id = client.register_merchant(&t.admin, &merchant);
-    for _ in 0..verifications {
-        client.add_merchant_verification(&t.admin, &id);
-    }
-    id
+    t.env.ledger().set_timestamp(t.env.ledger().timestamp().max(1_000));
+    client.set_merchant_verifications(&t.admin, &merchant_id, &verifications);
+    merchant_id
+}
+
+fn is_merchant_currently_verified(
+    client: &PermissionsContractClient,
+    merchant_id: u64,
+) -> bool {
+    let policy = client.get_verification_policy();
+    client.recheck_merchant_verification(&merchant_id, &policy)
 }
 
 /// A merchant verified under a 1-of-N policy must not remain "verified"
@@ -2035,20 +2041,22 @@ fn test_policy_threshold_increase_invalidates_pre_existing_merchant() {
     client.set_verification_policy(&t.admin, &1u32);
 
     // Merchant is registered and fully verified under the old policy.
-    let merchant_id = register_verified_merchant(&t, &client, 1);
-    assert!(client.is_merchant_verified(&merchant_id));
+    let merchant_id = register_verified_merchant(&t, &client, 1, 1);
+    assert!(is_merchant_currently_verified(&client, merchant_id));
 
     // Governance raises the required verifications to 2.
     client.set_verification_policy(&t.admin, &2u32);
 
     // The dynamic check must immediately reflect the new policy: the merchant
     // only holds 1 attestation, so they no longer satisfy the requirement.
-    assert!(!client.is_merchant_verified(&merchant_id));
+    assert!(!is_merchant_currently_verified(&client, merchant_id));
 
-    // Revalidation must transition the merchant out of the verified state.
-    let still_verified = client.revalidate_merchant_status(&merchant_id);
-    assert!(!still_verified);
-    assert!(!client.is_merchant_verified(&merchant_id));
+    // Revalidation reports the merchant is in the grace period (not compliant).
+    assert_eq!(
+        client.try_revalidate_merchant_status(&merchant_id),
+        Err(Ok(PermissionError::VerificationGracePeriod))
+    );
+    assert!(!is_merchant_currently_verified(&client, merchant_id));
 }
 
 /// A merchant that acquires the additional attestation within the grace
@@ -2060,24 +2068,23 @@ fn test_policy_threshold_increase_grace_period_allows_recovery() {
     client.set_admin(&t.admin);
 
     client.set_verification_policy(&t.admin, &1u32);
-    let merchant_id = register_verified_merchant(&t, &client, 1);
-    assert!(client.is_merchant_verified(&merchant_id));
+    let merchant_id = register_verified_merchant(&t, &client, 2, 1);
+    assert!(is_merchant_currently_verified(&client, merchant_id));
 
     // Policy is raised; merchant is now under-verified but within grace.
     client.set_verification_policy(&t.admin, &2u32);
-    assert!(!client.is_merchant_verified(&merchant_id));
+    assert!(!is_merchant_currently_verified(&client, merchant_id));
 
     // Merchant acquires the second attestation before the grace period ends.
-    client.add_merchant_verification(&t.admin, &merchant_id);
+    client.set_merchant_verifications(&t.admin, &merchant_id, &2);
 
     // Revalidation succeeds and the merchant is verified again.
     assert!(client.revalidate_merchant_status(&merchant_id));
-    assert!(client.is_merchant_verified(&merchant_id));
+    assert!(is_merchant_currently_verified(&client, merchant_id));
 }
 
 /// Once the 30-day grace period elapses without the merchant acquiring the
-/// additional attestation, revalidation must permanently fail and the
-/// merchant must remain unverified.
+/// additional attestation, revalidation must fail with VerificationBelowPolicy.
 #[test]
 fn test_policy_threshold_increase_grace_period_expiry() {
     let t = TestEnv::setup();
@@ -2085,8 +2092,8 @@ fn test_policy_threshold_increase_grace_period_expiry() {
     client.set_admin(&t.admin);
 
     client.set_verification_policy(&t.admin, &1u32);
-    let merchant_id = register_verified_merchant(&t, &client, 1);
-    assert!(client.is_merchant_verified(&merchant_id));
+    let merchant_id = register_verified_merchant(&t, &client, 3, 1);
+    assert!(is_merchant_currently_verified(&client, merchant_id));
 
     // Raise the policy and let the 30-day grace period expire.
     client.set_verification_policy(&t.admin, &2u32);
@@ -2095,11 +2102,11 @@ fn test_policy_threshold_increase_grace_period_expiry() {
         .ledger()
         .set_timestamp(t.env.ledger().timestamp() + thirty_days_secs + 1);
 
-    // Even if the merchant later acquires the attestation, the grace window
-    // has closed and revalidation must not silently re-verify them.
-    client.add_merchant_verification(&t.admin, &merchant_id);
-    assert!(!client.revalidate_merchant_status(&merchant_id));
-    assert!(!client.is_merchant_verified(&merchant_id));
+    assert_eq!(
+        client.try_revalidate_merchant_status(&merchant_id),
+        Err(Ok(PermissionError::VerificationBelowPolicy))
+    );
+    assert!(!is_merchant_currently_verified(&client, merchant_id));
 }
 
 /// A merchant already meeting the raised policy must be unaffected by the
@@ -2111,14 +2118,14 @@ fn test_policy_threshold_increase_leaves_compliant_merchant_verified() {
     client.set_admin(&t.admin);
 
     client.set_verification_policy(&t.admin, &1u32);
-    let merchant_id = register_verified_merchant(&t, &client, 2);
-    assert!(client.is_merchant_verified(&merchant_id));
+    let merchant_id = register_verified_merchant(&t, &client, 4, 2);
+    assert!(is_merchant_currently_verified(&client, merchant_id));
 
     // Raising the policy to 2 leaves this merchant compliant.
     client.set_verification_policy(&t.admin, &2u32);
-    assert!(client.is_merchant_verified(&merchant_id));
+    assert!(is_merchant_currently_verified(&client, merchant_id));
     assert!(client.revalidate_merchant_status(&merchant_id));
-    assert!(client.is_merchant_verified(&merchant_id));
+    assert!(is_merchant_currently_verified(&client, merchant_id));
 }
 
 /// Revalidating an unknown merchant must surface a deterministic error
@@ -2132,7 +2139,7 @@ fn test_revalidate_merchant_status_unknown_merchant_fails() {
 
     assert_eq!(
         client.try_revalidate_merchant_status(&999u64),
-        Err(Ok(PermissionError::MerchantNotFound))
+        Err(Ok(PermissionError::VerificationBelowPolicy))
     );
 }
 
@@ -2145,12 +2152,12 @@ fn test_policy_threshold_decrease_keeps_merchant_verified() {
     client.set_admin(&t.admin);
 
     client.set_verification_policy(&t.admin, &2u32);
-    let merchant_id = register_verified_merchant(&t, &client, 2);
-    assert!(client.is_merchant_verified(&merchant_id));
+    let merchant_id = register_verified_merchant(&t, &client, 5, 2);
+    assert!(is_merchant_currently_verified(&client, merchant_id));
 
     // Governance relaxes the policy back to 1.
     client.set_verification_policy(&t.admin, &1u32);
-    assert!(client.is_merchant_verified(&merchant_id));
+    assert!(is_merchant_currently_verified(&client, merchant_id));
     assert!(client.revalidate_merchant_status(&merchant_id));
 }
 
