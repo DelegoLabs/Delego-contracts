@@ -28,23 +28,24 @@
 #![cfg_attr(not(test), no_std)]
 #![allow(clippy::too_many_arguments)]
 #![warn(missing_docs)]
+mod crypto;
 /// Multi-signature approval management (issue #687).
 pub mod multisig;
 /// Guardian-quorum account recovery (issue #686).
 pub mod recovery;
 mod recurring_quota;
-mod crypto;
 /// Gas fee sponsorship quota and deduction logic (issues #689, #752).
 pub mod sponsorship;
 /// Ephemeral, bounded spend tickets (issue #688).
 pub mod tickets;
+pub use crypto::{
+    verify_passkey_signature, verify_passkey_signature_compressed,
+    verify_passkey_signature_flexible,
+};
 pub use multisig::{MultiSigConfig, MultiSigError, MultiSigProposal};
 pub use recurring_quota::RecurringQuotaConfig;
 pub use sponsorship::{GasSponsorshipQuota, SponsorshipDataKey, SponsorshipPolicy};
 pub use tickets::{SpendTicket, TicketDataKey, TicketError};
-pub use crypto::{
-    verify_passkey_signature, verify_passkey_signature_compressed, verify_passkey_signature_flexible,
-};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, xdr::ToXdr, Address, BytesN,
@@ -956,6 +957,21 @@ pub struct RelayedSpendMessage {
     pub nonce: u64,
     pub expiration_ledger: u32,
     pub epoch: u32,
+}
+
+/// Sponsorship details for [`PermissionsContract::execute_sponsored_relayed_spend`]
+/// (issue #755): which sponsor pays the relayer's fee, how much the fee is,
+/// and the delegate signature / nonce context authorizing the spend itself.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct SponsoredRelayedSpend {
+    pub sponsor: Address,
+    pub fee_stroops: i128,
+    pub nonce: u64,
+    pub expiration_ledger: u32,
+    pub epoch: u32,
+    pub signature: BytesN<64>,
 }
 
 /// Canonical payload a delegate signs off-chain to authorize a gasless spend
@@ -4370,6 +4386,94 @@ impl PermissionsContract {
         epoch: u32,
         signature: BytesN<64>,
     ) -> Result<(), PermissionError> {
+        Self::apply_relayed_spend(
+            &env,
+            &relayer,
+            &owner,
+            &delegate,
+            amount,
+            &merchant,
+            nonce,
+            expiration_ledger,
+            epoch,
+            &signature,
+        )
+    }
+
+    /// Execute a spend on the delegate's behalf from a relayer and reimburse
+    /// the relayer's gas fee from a sponsor's pre-funded sponsorship budget
+    /// (issue #755).
+    ///
+    /// Validation, signature verification, nonce handling and spend application
+    /// are identical to [`Self::execute_spend_via_relayer`]. Only once the spend
+    /// has succeeded is [`sponsorship::charge_fee`] invoked, which deducts
+    /// `fee_stroops` from `sponsor`'s budget and transfers the reimbursement to
+    /// `relayer` through [`sponsorship::deduct_and_reimburse_relayer`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::execute_spend_via_relayer`], plus the
+    /// sponsorship errors raised by [`sponsorship::charge_fee`]:
+    /// [`PermissionError::NotFound`] when `sponsor` has no policy,
+    /// [`PermissionError::PermissionPaused`] when that policy is inactive,
+    /// [`PermissionError::Unauthorized`] when `relayer` is not the policy's
+    /// relayer, [`PermissionError::ExceedsPerTxLimit`] when `fee_stroops`
+    /// exceeds the per-transaction cap, and
+    /// [`PermissionError::ExceedsTotalLimit`] when the budget or the sponsored
+    /// transaction count is exhausted. A failed spend never reaches the
+    /// sponsorship deduction, so its budget is left untouched.
+    // Reason: Soroban ABI entry point — signature is part of the published
+    // on-chain ABI and cannot be restructured without a breaking change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_sponsored_relayed_spend(
+        env: Env,
+        relayer: Address,
+        owner: Address,
+        delegate: Address,
+        amount: i128,
+        merchant: Address,
+        sponsored: SponsoredRelayedSpend,
+    ) -> Result<(), PermissionError> {
+        Self::apply_relayed_spend(
+            &env,
+            &relayer,
+            &owner,
+            &delegate,
+            amount,
+            &merchant,
+            sponsored.nonce,
+            sponsored.expiration_ledger,
+            sponsored.epoch,
+            &sponsored.signature,
+        )?;
+
+        // The spend has been applied successfully — charge the sponsor and pay
+        // the relayer. Any error here reverts the whole invocation, including
+        // the spend, so sponsorship charging stays atomic with execution.
+        sponsorship::charge_fee(&env, &sponsored.sponsor, &relayer, sponsored.fee_stroops)?;
+
+        Ok(())
+    }
+
+    /// Shared implementation behind the relayer spend entrypoints.
+    ///
+    /// Verifies `relayer`'s authorization and signature, validates the spend
+    /// against the delegation policy and applies it. Callers are contract
+    /// entrypoints; state is only mutated once every check has passed.
+    // Reason: internal helper mirroring its entrypoint's ABI-level arguments.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_relayed_spend(
+        env: &Env,
+        relayer: &Address,
+        owner: &Address,
+        delegate: &Address,
+        amount: i128,
+        merchant: &Address,
+        nonce: u64,
+        expiration_ledger: u32,
+        epoch: u32,
+        signature: &BytesN<64>,
+    ) -> Result<(), PermissionError> {
         relayer.require_auth();
 
         // Emergency freeze check: block all spends from frozen relayer addresses.
@@ -4377,7 +4481,7 @@ impl PermissionsContract {
             return Err(PermissionError::RelayerFrozen);
         }
 
-        Self::reject_ephemeral_relayer_spend(&env, &owner, &delegate)?;
+        Self::reject_ephemeral_relayer_spend(env, owner, delegate)?;
 
         if env.ledger().sequence() >= expiration_ledger {
             return Err(PermissionError::SignatureExpired);
@@ -4413,9 +4517,9 @@ impl PermissionsContract {
         // than the bare message XDR, so a signature is bound to this exact
         // contract deployment and semver and cannot be replayed across
         // deployments or after an upgrade.
-        let signing_payload = relayed_spend_signing_payload(&env, &message);
+        let signing_payload = relayed_spend_signing_payload(env, &message);
         env.crypto()
-            .ed25519_verify(&public_key, &signing_payload, &signature);
+            .ed25519_verify(&public_key, &signing_payload, signature);
 
         // Signature verified — apply the same validation rules as a direct
         // execute_spend before mutating state.
@@ -4432,10 +4536,10 @@ impl PermissionsContract {
         // Shared with execute_spend so direct and relayed spends share the
         // same throttle (issue #179).
         // Velocity check for relayed spend path
-        Self::check_velocity(&env, &owner, &delegate)?;
+        Self::check_velocity(env, owner, delegate)?;
 
         // #368: Rolling-window cap, shared with the direct spend path.
-        Self::check_rolling_window(&env, &owner, &delegate, amount)?;
+        Self::check_rolling_window(env, owner, delegate, amount)?;
 
         // Advance the nonce before mutating spend state so a replay attempt
         // within the same ledger is rejected even if apply_spend panics.
@@ -4445,7 +4549,7 @@ impl PermissionsContract {
         // apply_spend increments the child record, walks the full parent chain,
         // updates usage stats, and records the last spend ledger — identical to
         // the direct execute_spend path (issue #55).
-        let result = Self::apply_spend(&env, &owner, &delegate, amount)?;
+        let result = Self::apply_spend(env, owner, delegate, amount)?;
 
         env.events().publish(
             (
@@ -4454,9 +4558,9 @@ impl PermissionsContract {
                 delegate.clone(),
             ),
             PermissionSpendEvent {
-                owner,
-                delegate,
-                merchant,
+                owner: owner.clone(),
+                delegate: delegate.clone(),
+                merchant: merchant.clone(),
                 amount,
                 remaining: result.remaining_allowance,
             },
@@ -4674,7 +4778,10 @@ impl PermissionsContract {
             &DataKey::MultiPermission(primary_owner.clone(), delegate.clone()),
             &record,
         );
-        extend_persistent_ttl_if_needed(&env, &DataKey::MultiPermission(primary_owner.clone(), delegate.clone()));
+        extend_persistent_ttl_if_needed(
+            &env,
+            &DataKey::MultiPermission(primary_owner.clone(), delegate.clone()),
+        );
 
         // Index the grant by delegate so a queued spend can resolve the one
         // grant — and therefore the one quorum — it draws on (issue #377).
@@ -6050,10 +6157,7 @@ impl PermissionsContract {
 
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("rlyr_frz")),
-            RelayerFrozenEvent {
-                admin,
-                relayer,
-            },
+            RelayerFrozenEvent { admin, relayer },
         );
 
         Ok(true)
@@ -7523,14 +7627,14 @@ impl PermissionsContract {
 mod fuzz_tests;
 #[cfg(test)]
 mod integration_tests;
-#[cfg(test)]
-mod quorum_migration_tests;
-#[cfg(test)]
-mod test;
 /// Overflow-arithmetic tests — verifies `overflow-checks = true` is active and
 /// that balance/fee helpers abort or return errors on overflow inputs (issue #536).
 #[cfg(test)]
 mod overflow_arithmetic;
+#[cfg(test)]
+mod quorum_migration_tests;
+#[cfg(test)]
+mod test;
 
 #[cfg(test)]
 mod absent_key_tests {

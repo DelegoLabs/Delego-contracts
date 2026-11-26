@@ -75,9 +75,31 @@ pub fn is_heartbeat_live(heartbeat: &KeeperHeartbeat, now: u64) -> bool {
 }
 
 fn load_heartbeat(env: &Env, keeper: &Address) -> Option<KeeperHeartbeat> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::KeeperHeartbeat(keeper.clone()))
+    let key = DataKey::KeeperHeartbeat(keeper.clone());
+    let heartbeat: Option<KeeperHeartbeat> = env.storage().persistent().get(&key);
+    if heartbeat.is_some() {
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+    heartbeat
+}
+
+/// Loads the keeper assignment for `delegation_id`, extending its persistent
+/// TTL when the entry exists so reads never race the entry's expiration.
+fn load_delegation_keepers(env: &Env, delegation_id: u64) -> Option<DelegationKeepers> {
+    let key = DataKey::DelegationKeepers(delegation_id);
+    let keepers: Option<DelegationKeepers> = env.storage().persistent().get(&key);
+    if keepers.is_some() {
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+    keepers
 }
 
 fn store_heartbeat(env: &Env, heartbeat: &KeeperHeartbeat) {
@@ -196,9 +218,7 @@ impl DelegationRegistry {
 
     /// Returns the keeper assignment for a delegation, if any.
     pub fn get_delegation_keepers(env: Env, delegation_id: u64) -> Option<DelegationKeepers> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::DelegationKeepers(delegation_id))
+        load_delegation_keepers(&env, delegation_id)
     }
 
     /// Returns the keeper that should execute `delegation_id` right now.
@@ -216,10 +236,7 @@ impl DelegationRegistry {
         env: Env,
         delegation_id: u64,
     ) -> Result<Address, DelegationError> {
-        let keepers: DelegationKeepers = env
-            .storage()
-            .persistent()
-            .get(&DataKey::DelegationKeepers(delegation_id))
+        let keepers: DelegationKeepers = load_delegation_keepers(&env, delegation_id)
             .ok_or(DelegationError::KeepersNotConfigured)?;
         let now = env.ledger().timestamp();
 
