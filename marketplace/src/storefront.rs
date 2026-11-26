@@ -80,6 +80,17 @@ pub fn set_storefront_metadata(
     Ok(())
 }
 
+/// Retrieves stored storefront metadata for the given merchant, if present.
+pub fn get_storefront_metadata(
+    env: Env,
+    merchant_id: u64,
+) -> Result<StorefrontMetadata, MarketplaceError> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::StorefrontMetadata(merchant_id))
+        .ok_or(MarketplaceError::MerchantNotFound)
+}
+
 fn is_valid_ipfs_cid(cid: &String) -> bool {
     let len = cid.len();
     if len == 0 || len > MAX_IPFS_CID_LEN {
@@ -187,6 +198,10 @@ mod tests {
         assert_eq!(stored.updated_at, 1234);
         assert_eq!(stored.content_hash, content_hash);
         assert_eq!(stored.ipfs_cid, storefront_cid);
+
+        // Verify get_storefront_metadata returns the same data via client
+        let fetched = f.client.get_storefront_metadata(&merchant_id);
+        assert_eq!(fetched, stored);
     }
 
     #[test]

@@ -833,6 +833,50 @@ pub struct MerchantPrunedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReservePoolConfiguredEvent {
+    pub merchant_id: u64,
+    pub admin: Address,
+    pub reserve_ratio_basis_points: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReservePoolToppedUpEvent {
+    pub merchant_id: u64,
+    pub merchant: Address,
+    pub amount: i128,
+    pub new_balance: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReservePoolWithdrawnEvent {
+    pub merchant_id: u64,
+    pub owner: Address,
+    pub amount: i128,
+    pub remaining_balance: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveOrderOpenedEvent {
+    pub merchant_id: u64,
+    pub reporter: Address,
+    pub order_amount: i128,
+    pub new_active_liability: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveOrderSettledEvent {
+    pub merchant_id: u64,
+    pub reporter: Address,
+    pub order_amount: i128,
+    pub new_active_liability: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommissionTier {
     pub min_settled_volume: i128,
     pub commission_rate_bps: u32,
@@ -1699,6 +1743,14 @@ impl MarketplaceContract {
         content_hash: BytesN<32>,
     ) -> Result<(), MarketplaceError> {
         storefront::set_storefront_metadata(env, merchant_id, caller, ipfs_cid, content_hash)
+    }
+
+    /// Retrieves stored storefront metadata for the given merchant, if present.
+    pub fn get_storefront_metadata(
+        env: Env,
+        merchant_id: u64,
+    ) -> Result<storefront::StorefrontMetadata, MarketplaceError> {
+        storefront::get_storefront_metadata(env, merchant_id)
     }
 
     // --- Category Management ---
@@ -3705,6 +3757,20 @@ impl MarketplaceContract {
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("res_cfg"),
+                merchant_id,
+            ),
+            ReservePoolConfiguredEvent {
+                merchant_id,
+                admin,
+                reserve_ratio_basis_points,
+            },
+        );
+
         Ok(pool)
     }
 
@@ -3741,7 +3807,7 @@ impl MarketplaceContract {
                 .persistent()
                 .get(&key)
                 .unwrap_or(MerchantReservePool {
-                    merchant: merchant_owner,
+                    merchant: merchant_owner.clone(),
                     reserve_balance_stroops: 0,
                     active_escrow_liability: 0,
                     reserve_ratio_basis_points: DEFAULT_RESERVE_RATIO_BPS,
@@ -3756,7 +3822,97 @@ impl MarketplaceContract {
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("res_top"),
+                merchant_id,
+            ),
+            ReservePoolToppedUpEvent {
+                merchant_id,
+                merchant: merchant_owner,
+                amount,
+                new_balance: pool.reserve_balance_stroops,
+            },
+        );
+
         Ok(pool.reserve_balance_stroops)
+    }
+
+    /// Merchant withdrawal of excess dispute reserve funds above active order coverage requirements.
+    pub fn withdraw_reserve_pool(
+        env: Env,
+        owner: Address,
+        merchant_id: u64,
+        amount: i128,
+    ) -> Result<(), MarketplaceError> {
+        owner.require_auth();
+        if amount <= 0 {
+            return Err(MarketplaceError::InvalidReserveAmount);
+        }
+
+        let merchant_record = Self::get_merchant(env.clone(), merchant_id)?;
+        if merchant_record.owner.as_ref() != Some(&owner) {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        let key = DataKey::MerchantReservePool(merchant_id);
+        let mut pool: MerchantReservePool = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(MarketplaceError::ReservePoolNotFound)?;
+
+        if pool.reserve_balance_stroops < amount {
+            return Err(MarketplaceError::InsufficientReserveCoverage);
+        }
+
+        let remaining_balance = pool
+            .reserve_balance_stroops
+            .checked_sub(amount)
+            .ok_or(MarketplaceError::InvalidReserveAmount)?;
+
+        let required_reserve = pool
+            .active_escrow_liability
+            .checked_mul(pool.reserve_ratio_basis_points as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(MarketplaceError::InvalidReserveAmount)?;
+
+        if remaining_balance < required_reserve {
+            return Err(MarketplaceError::InsufficientReserveCoverage);
+        }
+
+        let (_, deposit_token) = Self::get_merchant_deposit(env.clone(), merchant_id)
+            .ok_or(MarketplaceError::DepositNotFound)?;
+
+        use soroban_sdk::token;
+        let token_client = token::Client::new(&env, &deposit_token);
+        token_client.transfer(&env.current_contract_address(), &owner, &amount);
+
+        pool.reserve_balance_stroops = remaining_balance;
+        env.storage().persistent().set(&key, &pool);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("res_wdr"),
+                merchant_id,
+            ),
+            ReservePoolWithdrawnEvent {
+                merchant_id,
+                owner,
+                amount,
+                remaining_balance,
+            },
+        );
+
+        Ok(())
     }
 
     /// Reports that a new escrow order of `order_amount` was opened against
@@ -3820,6 +3976,21 @@ impl MarketplaceContract {
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("res_opn"),
+                merchant_id,
+            ),
+            ReserveOrderOpenedEvent {
+                merchant_id,
+                reporter,
+                order_amount,
+                new_active_liability: pool.active_escrow_liability,
+            },
+        );
+
         Ok(())
     }
 
@@ -3855,6 +4026,21 @@ impl MarketplaceContract {
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("res_stl"),
+                merchant_id,
+            ),
+            ReserveOrderSettledEvent {
+                merchant_id,
+                reporter,
+                order_amount,
+                new_active_liability: pool.active_escrow_liability,
+            },
+        );
+
         Ok(())
     }
 
@@ -7245,5 +7431,65 @@ mod reputation_cross_contract_tests {
             }
             other => panic!("expected ReputationResolution::Available, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_reserve_pool_withdrawal_and_coverage() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (&admin,));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let params = RegisterParams {
+            name: String::from_str(&env, "Reserve Merchant"),
+            description: String::from_str(&env, "Testing reserves"),
+            category: Symbol::new(&env, "general"),
+            image_url: String::from_str(&env, ""),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 0,
+        };
+
+        let (token_id, deposit) = testutil::funded_registration_deposit(&env, &owner);
+        let merchant_id = client.register_merchant(&owner, &params, &token_id, &deposit);
+
+        // Configure reserve pool (10% = 1000 bps)
+        client.configure_reserve_pool(&admin, &merchant_id, &1000);
+
+        // Mint extra token to owner and top up reserve pool
+        let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+        token.mint(&owner, &50_000);
+        client.top_up_reserve(&owner, &merchant_id, &50_000);
+
+        let pool = client.get_merchant_reserve_pool(&merchant_id).unwrap();
+        assert_eq!(pool.reserve_balance_stroops, 50_000);
+        assert_eq!(pool.active_escrow_liability, 0);
+
+        // Open an order with liability 200_000 -> required reserve = 20_000 (10%)
+        client.report_order_opened(&admin, &merchant_id, &200_000);
+        let pool = client.get_merchant_reserve_pool(&merchant_id).unwrap();
+        assert_eq!(pool.active_escrow_liability, 200_000);
+
+        // Withdraw 30_000 leaves 20_000 >= 20_000 (should succeed)
+        client.withdraw_reserve_pool(&owner, &merchant_id, &30_000);
+        let pool = client.get_merchant_reserve_pool(&merchant_id).unwrap();
+        assert_eq!(pool.reserve_balance_stroops, 20_000);
+
+        // Attempting to withdraw 1 more must fail with InsufficientReserveCoverage
+        let err = client.try_withdraw_reserve_pool(&owner, &merchant_id, &1);
+        assert_eq!(err, Err(Ok(MarketplaceError::InsufficientReserveCoverage)));
+
+        // Settle 100_000 of the order liability -> liability becomes 100_000, required = 10_000
+        client.report_order_settled(&admin, &merchant_id, &100_000);
+        let pool = client.get_merchant_reserve_pool(&merchant_id).unwrap();
+        assert_eq!(pool.active_escrow_liability, 100_000);
+
+        // Now can withdraw 10_000 more
+        client.withdraw_reserve_pool(&owner, &merchant_id, &10_000);
+        let pool = client.get_merchant_reserve_pool(&merchant_id).unwrap();
+        assert_eq!(pool.reserve_balance_stroops, 10_000);
     }
 }
