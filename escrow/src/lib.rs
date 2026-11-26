@@ -6869,6 +6869,11 @@ impl EscrowContract {
     /// an open escrow. The share balance and current exchange rate are
     /// recorded so staking appreciation accrued during inspection can be
     /// returned to the buyer at settlement (issue #592).
+    ///
+    /// Funding a `Created` escrow with LST is a funding event: the escrow moves
+    /// to `Funded` and gains [`ESCROW_FLAG_FUNDED`] so release/refund paths and
+    /// the cancellation guard see it as funded (issue #764). An escrow that is
+    /// already `Funded` may still take LST collateral, but only once.
     pub fn fund_with_lst(
         env: Env,
         escrow_id: u64,
@@ -6877,10 +6882,11 @@ impl EscrowContract {
         shares: i128,
     ) -> Result<LstCollateralRecord, EscrowError> {
         buyer.require_auth();
-        let record: EscrowRecord = env
+        let key = DataKey::Escrow(escrow_id);
+        let mut record: EscrowRecord = env
             .storage()
             .persistent()
-            .get(&DataKey::Escrow(escrow_id))
+            .get(&key)
             .ok_or(EscrowError::NotFound)?;
         if buyer != record.buyer {
             return Err(EscrowError::Unauthorized);
@@ -6888,7 +6894,25 @@ impl EscrowContract {
         if record.status != EscrowStatus::Created && record.status != EscrowStatus::Funded {
             return Err(EscrowError::InvalidStatus);
         }
-        lst_support::lock_collateral(&env, escrow_id, &buyer, &lst_token, shares)
+        if lst_support::collateral(&env, escrow_id).is_some() {
+            return Err(EscrowError::LstCollateralAlreadyRecorded);
+        }
+
+        let collateral = lst_support::lock_collateral(&env, escrow_id, &buyer, &lst_token, shares)?;
+
+        if record.status == EscrowStatus::Created {
+            record.status = EscrowStatus::Funded;
+            record.flags.set_flag(ESCROW_FLAG_FUNDED);
+            record.updated_at = env.ledger().timestamp();
+            env.storage().persistent().set(&key, &record);
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
+        Ok(collateral)
     }
 
     /// Read the LST collateral record locked for `escrow_id`, if any.

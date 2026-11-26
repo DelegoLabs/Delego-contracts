@@ -20,6 +20,9 @@ will reject the change.
 
 ### Unreleased
 
+- Fix `fund_with_lst` so funding a `Created` escrow with LST collateral transitions it to `Funded`,
+  sets `ESCROW_FLAG_FUNDED`, refreshes `updated_at`, and bumps the escrow record TTL; repeat LST
+  funding is rejected with `LstCollateralAlreadyRecorded` (issue #764).
 - Add pro-rata partial refund settlement (issue #539): `resolve_partial_refund` (buyer and merchant authorization)
   and `arbitrate_partial_refund` (arbiter authorization on disputed escrows), emitting `PartialRefundSettled`.
 - Fix escrow error-code collisions and stale decoding mappings (#706). Preserve
