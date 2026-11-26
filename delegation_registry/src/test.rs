@@ -1142,6 +1142,32 @@ fn test_get_delegation_bumps_ttl() {
 }
 
 #[test]
+fn test_get_delegation_by_owner_label_bumps_ttl() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "TTL_Bump_V2");
+    let _id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &LARGE_TTL);
+
+    let v2_key = DataKey::DelegationV2(owner.clone(), label.clone());
+
+    let initial_v2_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&v2_key)
+    });
+    assert!(initial_v2_ttl > 17_280);
+
+    // Advance so the remaining TTL drops below the bump threshold, then read via
+    // get_delegation_by_owner_label and verify the DelegationV2 TTL is extended.
+    env.ledger()
+        .set_sequence_number(initial_v2_ttl - 17_280 + 1);
+    let _ = client.get_delegation_by_owner_label(&owner, &label);
+    let refreshed_v2_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&v2_key)
+    });
+    assert!(refreshed_v2_ttl > 17_280);
+}
+
+#[test]
 fn test_is_authorized_bumps_ttl() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();

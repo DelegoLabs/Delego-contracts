@@ -338,3 +338,37 @@ fn recurring_expiry_still_blocks_renewed_allowance() {
         0
     );
 }
+
+#[test]
+fn get_recurring_quota_bumps_ttl_when_below_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_max_entry_ttl(PERMISSION_TTL_BUMP * 2);
+    env.ledger().set_min_persistent_entry_ttl(1_000);
+    env.ledger().set_sequence_number(100);
+
+    let contract = env.register(PermissionsContract, ());
+    let owner = Address::generate(&env);
+    let delegate = Address::generate(&env);
+    let client = PermissionsContractClient::new(&env, &contract);
+
+    client.grant(&owner, &delegate, &1_000, &1_000, &Vec::new(&env), &(WEEK * 8));
+    client.configure_recurring_quota(&owner, &delegate, &WEEK, &1_000, &5_000);
+
+    let key = DataKey::RecurringQuota(owner.clone(), delegate.clone());
+    let initial_ttl = env.as_contract(&contract, || env.storage().persistent().get_ttl(&key));
+    assert!(initial_ttl >= PERMISSION_TTL_BUMP);
+
+    // Advance ledger so remaining TTL falls below PERMISSION_TTL_THRESHOLD.
+    let advance = initial_ttl - PERMISSION_TTL_THRESHOLD + 100;
+    env.ledger().set_sequence_number(100 + advance);
+
+    let ttl_before = env.as_contract(&contract, || env.storage().persistent().get_ttl(&key));
+    assert!(ttl_before < PERMISSION_TTL_THRESHOLD);
+
+    assert!(client.get_recurring_quota(&owner, &delegate).is_some());
+
+    let ttl_after = env.as_contract(&contract, || env.storage().persistent().get_ttl(&key));
+    assert!(ttl_after >= PERMISSION_TTL_BUMP);
+    assert!(ttl_after > ttl_before);
+}
