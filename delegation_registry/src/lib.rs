@@ -25,8 +25,6 @@
 // documentation discipline via code review and the explicit doc comments that
 // every public constant, type, and function carries in this file.
 #![allow(missing_docs)]
-#[cfg(any(test, feature = "testutils"))]
-use soroban_sdk::testutils::storage::Persistent as _;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
     Symbol, Vec,
@@ -41,16 +39,27 @@ pub use heartbeat::{
 /// for roughly 30 days, matching the repository's persistent-storage policy.
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
 
-fn persistent_ttl(env: &Env, key: &DataKey) -> u32 {
-    #[cfg(any(test, feature = "testutils"))]
-    {
-        env.storage().persistent().get_ttl(key)
-    }
-    #[cfg(not(any(test, feature = "testutils")))]
-    {
-        let _ = (env, key);
-        0
-    }
+/// Estimates the remaining storage TTL (in ledgers) of a delegation record
+/// using only on-chain state, so it works in `no_std` production builds where
+/// the test-only `get_ttl` accessor does not exist.
+///
+/// The estimate is the smaller of:
+/// - the ledgers left until `expires_at_ledger`, and
+/// - the ledgers left in the last bump window: `PERSISTENT_BUMP_AMOUNT` minus
+///   the ledgers elapsed since `DataKey::KeeperLastBountyLedger(id)`. When no
+///   bounty has been paid yet the window is assumed fresh (bumped on write).
+fn estimated_storage_ttl(env: &Env, delegation_id: u64, record: &DelegationRecord) -> u32 {
+    let current = env.ledger().sequence();
+    let until_expiry = record.expires_at_ledger.saturating_sub(current);
+    let last_bounty: Option<u32> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::KeeperLastBountyLedger(delegation_id));
+    let bump_window = match last_bounty {
+        Some(last) => PERSISTENT_BUMP_AMOUNT.saturating_sub(current.saturating_sub(last)),
+        None => PERSISTENT_BUMP_AMOUNT,
+    };
+    until_expiry.min(bump_window)
 }
 /// Target TTL (in ledgers) applied when a persistent entry is bumped.
 ///
@@ -3009,10 +3018,9 @@ impl DelegationRegistry {
     /// Off-chain keepers should call this view function to determine whether
     /// submitting a heartbeat transaction is currently profitable.
     ///
-    /// `remaining_ledgers` reports the live Soroban persistent-storage TTL for
-    /// the delegation record — not the application-level `expires_at_ledger` —
-    /// so the field correctly tracks archival risk independent of the
-    /// delegation's own expiry window.
+    /// `remaining_ledgers` is a ledger-based estimate of the storage TTL: the
+    /// smaller of the ledgers left until `expires_at_ledger` and the ledgers
+    /// left in the last bump window (tracked via `KeeperLastBountyLedger`).
     pub fn get_keeper_bounty_status(
         env: Env,
         delegation_id: u64,
@@ -3030,8 +3038,7 @@ impl DelegationRegistry {
         let is_live = record.status == DelegationStatus::Active
             && current_ledger < record.expires_at_ledger;
 
-        let delegation_key = DataKey::Delegation(delegation_id);
-        let storage_ttl: u32 = persistent_ttl(&env, &delegation_key);
+        let storage_ttl: u32 = estimated_storage_ttl(&env, delegation_id, &record);
 
         // A keeper is eligible when:
         //   1. the delegation is live (Active and not yet expired)
@@ -3114,7 +3121,7 @@ impl DelegationRegistry {
 
         // 2. The storage TTL must be approaching the archival threshold.
         let delegation_key = DataKey::Delegation(delegation_id);
-        let storage_ttl: u32 = persistent_ttl(&env, &delegation_key);
+        let storage_ttl: u32 = estimated_storage_ttl(&env, delegation_id, &record);
 
         if storage_ttl >= KEEPER_BOUNTY_THRESHOLD_LEDGERS {
             return Err(DelegationError::NotEligibleForBounty);
@@ -3205,7 +3212,7 @@ impl DelegationRegistry {
         );
 
         // Return the refreshed status (now ineligible due to cooldown reset).
-        let refreshed_ttl: u32 = persistent_ttl(&env, &delegation_key);
+        let refreshed_ttl: u32 = estimated_storage_ttl(&env, delegation_id, &record);
 
         Ok(KeeperBountyStatus {
             delegation_id,
