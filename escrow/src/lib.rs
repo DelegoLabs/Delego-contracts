@@ -6935,7 +6935,7 @@ impl EscrowContract {
             .get(&DataKey::Escrow(escrow_id))
             .ok_or(EscrowError::NotFound)?;
         let completed = match record.status {
-            EscrowStatus::Released => true,
+            EscrowStatus::Released | EscrowStatus::SettledWithPartialRefund => true,
             EscrowStatus::Refunded
             | EscrowStatus::Cancelled
             | EscrowStatus::CancelledByMutualConsent => false,
@@ -20488,6 +20488,151 @@ mod split_settlement_tests {
             f.client.try_settle_partial_refund(&request),
             Err(Ok(EscrowError::InvalidSplitSettlement))
         );
+    }
+}
+
+#[cfg(test)]
+mod lst_collateral_tests {
+    use super::*;
+    use soroban_sdk::{
+        contract, contractimpl, contracttype, testutils::Address as _, token::StellarAssetClient,
+    };
+
+    #[contracttype]
+    enum MockLstKey {
+        Underlying,
+        Rate,
+    }
+
+    #[contract]
+    pub struct MockLstToken;
+
+    #[contractimpl]
+    impl MockLstToken {
+        pub fn __constructor(env: Env, underlying: Address, rate: i128) {
+            env.storage()
+                .instance()
+                .set(&MockLstKey::Underlying, &underlying);
+            env.storage().instance().set(&MockLstKey::Rate, &rate);
+        }
+
+        pub fn exchange_rate(env: Env) -> i128 {
+            env.storage().instance().get(&MockLstKey::Rate).unwrap()
+        }
+
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            from.require_auth();
+            let underlying: Address = env
+                .storage()
+                .instance()
+                .get(&MockLstKey::Underlying)
+                .unwrap();
+            soroban_sdk::token::Client::new(&env, &underlying).transfer(&from, &to, &amount);
+        }
+
+        pub fn balance(env: Env, id: Address) -> i128 {
+            let underlying: Address = env
+                .storage()
+                .instance()
+                .get(&MockLstKey::Underlying)
+                .unwrap();
+            soroban_sdk::token::Client::new(&env, &underlying).balance(&id)
+        }
+    }
+
+    struct Fixture<'a> {
+        env: Env,
+        client: EscrowContractClient<'a>,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+        lst_token: Address,
+        lst_underlying: Address,
+    }
+
+    fn setup(env: &Env) -> Fixture<'_> {
+        soroban_sdk::testutils::Ledger::with_mut(&env.ledger(), |l| {
+            l.min_persistent_entry_ttl = PERSISTENT_BUMP_AMOUNT;
+        });
+        env.mock_all_auths_allowing_non_root_auth();
+        let admin = Address::generate(env);
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
+        let lst_underlying = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
+        let lst_token = env.register(
+            MockLstToken,
+            (lst_underlying.clone(), crate::lst_support::LST_RATE_SCALE),
+        );
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 1_000,
+            treasury: Address::generate(env),
+            min_amount: 100,
+            max_amount: 1_000_000,
+            min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(env, &contract_id);
+        StellarAssetClient::new(env, &token).mint(&buyer, &1_000_000);
+        StellarAssetClient::new(env, &lst_underlying).mint(&buyer, &1_000);
+        admin_actions_test::approve(env, &client, &admin, AdminAction::AddToken(token.clone()));
+        client.set_lst_whitelisted(&admin, &lst_token, &true);
+        Fixture {
+            env: env.clone(),
+            client,
+            buyer,
+            seller,
+            token,
+            lst_token,
+            lst_underlying,
+        }
+    }
+
+    #[test]
+    fn settle_lst_collateral_after_partial_refund_releases_shares() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.client.deposit(
+            &f.buyer,
+            &f.seller,
+            &f.token,
+            &10_000,
+            &BytesN::from_array(&env, &[7u8; 32]),
+            &10_000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
+        f.client
+            .fund_with_lst(&escrow_id, &f.buyer, &f.lst_token, &100);
+        f.client.dispute(&escrow_id, &f.buyer);
+        let request = SplitSettlementRequest {
+            escrow_id,
+            buyer_refund_amount: 4_000,
+            merchant_payout_amount: 5_400,
+            buyer_signature: BytesN::from_array(&env, &[0u8; 64]),
+            merchant_signature: BytesN::from_array(&env, &[0u8; 64]),
+        };
+        assert!(f.client.settle_partial_refund(&request));
+        assert_eq!(
+            f.client.get_escrow(&escrow_id).status,
+            EscrowStatus::SettledWithPartialRefund
+        );
+
+        let settlement = f.client.settle_lst_collateral(&escrow_id);
+        assert_eq!(settlement.merchant_shares, 100);
+        assert_eq!(settlement.buyer_shares, 0);
+        assert!(f.client.get_lst_collateral(&escrow_id).is_none());
+
+        let lst_client = soroban_sdk::token::Client::new(&env, &f.lst_underlying);
+        assert_eq!(lst_client.balance(&f.seller), 100);
+        assert_eq!(lst_client.balance(&f.buyer), 900);
+        assert_eq!(lst_client.balance(&f.client.address), 0);
     }
 }
 
