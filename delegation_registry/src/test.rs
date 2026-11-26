@@ -4096,3 +4096,94 @@ fn test_sweep_does_not_panic_when_no_keepers_configured() {
     // Nothing to assert for keepers — just confirming no panic.
     assert!(client.get_delegation_keepers(&id).is_none());
 }
+
+#[test]
+fn test_set_delegation_keepers_active_emits_event() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Keeper_Ok");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let primary = Address::generate(&env);
+    let secondary = Address::generate(&env);
+
+    client.set_delegation_keepers(&id, &primary, &secondary);
+
+    let keepers = client.get_delegation_keepers(&id).unwrap();
+    assert_eq!(keepers.primary, primary);
+    assert_eq!(keepers.secondary, secondary);
+
+    let events = env.events().all();
+    let (_, topics, data) = events.last().unwrap();
+    assert_eq!(topics.len(), 3);
+    assert_eq!(
+        Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(),
+        EVENT_TOPIC_CONTRACT
+    );
+    assert_eq!(
+        Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap(),
+        symbol_short!("kpr_set")
+    );
+    assert_eq!(u64::try_from_val(&env, &topics.get(2).unwrap()).unwrap(), id);
+    let (p, s) = <(Address, Address)>::try_from_val(&env, &data).unwrap();
+    assert_eq!(p, primary);
+    assert_eq!(s, secondary);
+}
+
+#[test]
+fn test_set_delegation_keepers_rejects_revoked() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Keeper_Rev");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    client.revoke_delegation(&id);
+
+    let result = client.try_set_delegation_keepers(
+        &id,
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
+    assert_eq!(result, Err(Ok(DelegationError::NotActive)));
+    assert!(client.get_delegation_keepers(&id).is_none());
+}
+
+#[test]
+fn test_set_delegation_keepers_rejects_expired() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Keeper_Exp");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+    let expires_at = client.get_delegation(&id).expires_at_ledger;
+
+    env.ledger().set_sequence_number(expires_at);
+    let result = client.try_set_delegation_keepers(
+        &id,
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
+    assert_eq!(result, Err(Ok(DelegationError::Expired)));
+    assert!(client.get_delegation_keepers(&id).is_none());
+}
+
+#[test]
+fn test_set_delegation_keepers_rejects_paused_and_unknown() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Keeper_Pau");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    client.pause_delegation(&id);
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    assert_eq!(
+        client.try_set_delegation_keepers(&id, &a, &b),
+        Err(Ok(DelegationError::NotActive))
+    );
+    assert_eq!(
+        client.try_set_delegation_keepers(&999, &a, &b),
+        Err(Ok(DelegationError::NotFound))
+    );
+}
