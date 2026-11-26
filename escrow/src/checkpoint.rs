@@ -364,6 +364,21 @@ pub fn position(env: &Env, pool: &Address, escrow_id: u64) -> YieldPosition {
         .unwrap_or_else(|| YieldPosition::new(pool_state(env, pool).checkpoint))
 }
 
+/// Position of `escrow_id` with yield accrued up to the pool's current
+/// checkpoint included, without changing storage.
+pub fn position_view(
+    env: &Env,
+    pool: &Address,
+    escrow_id: u64,
+) -> Result<YieldPosition, CheckpointError> {
+    let state = pool_state(env, pool);
+    let mut pos = position(env, pool, escrow_id);
+    let earned = yield_between(pos.shares, &pos.checkpoint, &state.checkpoint)?;
+    pos.pending_yield = add(pos.pending_yield, earned)?;
+    pos.checkpoint = state.checkpoint;
+    Ok(pos)
+}
+
 fn save(env: &Env, pool: &Address, state: &YieldPoolState, escrow: Option<(u64, &YieldPosition)>) {
     let pool_key = CheckpointKey::Pool(pool.clone());
     env.storage().persistent().set(&pool_key, state);
@@ -577,6 +592,7 @@ mod tests {
         env.as_contract(&contract.address(), || {
             stake(&env, &pool, 1, 600).unwrap();
             stake(&env, &pool, 2, 400).unwrap();
+            env.storage().instance().extend_ttl(518_400, 518_400);
         });
         env.ledger().with_mut(|l| l.sequence_number += 20 * DAY);
         env.as_contract(&contract.address(), || {

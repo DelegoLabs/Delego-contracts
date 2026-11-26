@@ -55,8 +55,8 @@
 #![cfg_attr(not(test), no_std)]
 #![warn(missing_docs)]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
-    IntoVal, InvokeError, Map, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    Bytes, BytesN, Env, IntoVal, InvokeError, Map, Symbol, Vec,
 };
 use soroban_sdk::xdr::ToXdr;
 use delego_interfaces::LendingPoolClient;
@@ -83,7 +83,7 @@ pub use yield_guard::{is_yield_viable, YieldBypassedLowApy};
 
 /// MasterChef-style yield accrual checkpointing for pro-rata returns (issue #598).
 pub mod checkpoint;
-pub use checkpoint::{YieldCheckpoint, YieldPoolState, YieldPosition};
+pub use checkpoint::{CheckpointError, YieldCheckpoint, YieldPoolState, YieldPosition};
 
 /// Multi-hop path payment validation and surplus refund helper.
 pub mod path_payment;
@@ -14078,6 +14078,29 @@ impl EscrowContract {
             );
         }
         proposal
+    }
+
+    /// Record `amount` of yield realised by `pool` at the current ledger in
+    /// the pro-rata accumulator. Funding and redemption keep each escrow's
+    /// position in step with this pool state.
+    pub fn sync_yield_checkpoint(
+        env: Env,
+        pool: Address,
+        amount: i128,
+    ) -> Result<YieldCheckpoint, CheckpointError> {
+        checkpoint::record_accrual(&env, &pool, amount)
+    }
+
+    /// Current pro-rata yield accounting state of `pool`.
+    pub fn get_yield_pool_state(env: Env, pool: Address) -> YieldPoolState {
+        checkpoint::pool_state(&env, &pool)
+    }
+
+    /// Yield position of `escrow_id` in `pool`, including yield accrued since
+    /// the position was last settled.
+    pub fn get_escrow_yield_position(env: Env, pool: Address, escrow_id: u64) -> YieldPosition {
+        checkpoint::position_view(&env, &pool, escrow_id)
+            .unwrap_or_else(|error| panic_with_error!(&env, error))
     }
 }
 
