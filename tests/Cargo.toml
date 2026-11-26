@@ -58,3 +58,7 @@ path = "delegation_epoch_test.rs"
 [[test]]
 name = "sub_orders_integration"
 path = "src/sub_orders_integration.rs"
+
+[[test]]
+name = "review_attestation"
+path = "src/review_attestation.rs"

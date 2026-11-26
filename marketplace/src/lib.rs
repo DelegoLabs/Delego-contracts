@@ -18,9 +18,15 @@ use soroban_sdk::{
 
 /// Fee discount calculator for merchants staking platform governance tokens.
 pub mod fees;
+/// Single-use review attestations issued by escrow on release (issue #558).
+pub mod review_attestation;
 /// Storefront metadata storage and update support.
 pub mod storefront;
 pub use fees::*;
+pub use review_attestation::{
+    ReviewAttestation, ReviewAttestationConsumedEvent, ReviewAttestationIssuedEvent,
+    REVIEW_ATTESTATION_TTL_LEDGERS,
+};
 pub mod catalog;
 pub mod oracle;
 pub use oracle::*;
@@ -447,6 +453,18 @@ pub enum MarketplaceError {
     AttestationAlreadyCommitted = 5035,
     /// No product hash attestation has been committed for this `product_id`.
     ProductAttestationNotFound = 5036,
+    /// A review attestation has already been issued for this order; an order
+    /// backs at most one attestation (issue #558).
+    ReviewAttestationAlreadyIssued = 5037,
+    /// No live review attestation exists for this order (never issued, or its
+    /// 30-day TTL expired) (issue #558).
+    ReviewAttestationNotFound = 5038,
+    /// The review attestation has already been consumed by a filed review and
+    /// cannot be used again (issue #558).
+    ReviewAttestationConsumed = 5039,
+    /// The buyer or merchant supplied with a review attestation does not match
+    /// the issued record (issue #558).
+    ReviewAttestationMismatch = 5040,
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,6 +1041,11 @@ pub enum DataKey {
     /// and cannot be migrated unambiguously, because a bare `product_id` does
     /// not identify the owning merchant; they must be re-committed.
     ProductAttestation(u64, u64),
+    /// Single-use review attestation for a settled order (issue #558).
+    ///
+    /// Held in temporary storage with a 30-day TTL; see the
+    /// [`review_attestation`] module.
+    ReviewAttestation(u64),
 }
 
 /// Mirror of `EntityRole` from `delego-reputation` for cross-contract deserialization.
@@ -6125,6 +6148,60 @@ impl MarketplaceContract {
     /// Return the currently configured authorised escrow address, if any.
     pub fn get_authorized_escrow(env: Env) -> Option<Address> {
         catalog::get_authorized_escrow(env)
+    }
+
+    // -----------------------------------------------------------------------
+    // Review attestations (issue #558) — delegates to the review_attestation
+    // module
+    // -----------------------------------------------------------------------
+
+    /// Issue a single-use review attestation for a released order.
+    ///
+    /// Callable only by the configured escrow contract or the admin.
+    ///
+    /// See [`review_attestation::issue_review_attestation`] for full
+    /// documentation.
+    pub fn issue_review_attestation(
+        env: Env,
+        caller: Address,
+        order_id: u64,
+        buyer: Address,
+        merchant: Address,
+    ) -> Result<ReviewAttestation, MarketplaceError> {
+        review_attestation::issue_review_attestation(env, caller, order_id, buyer, merchant)
+    }
+
+    /// Return the live review attestation for `order_id`, if any.
+    pub fn get_review_attestation(env: Env, order_id: u64) -> Option<ReviewAttestation> {
+        review_attestation::get_review_attestation(env, order_id)
+    }
+
+    /// Whether `buyer` holds an unconsumed attestation for `order_id` with
+    /// `merchant`. Read-only: verifying never burns the attestation.
+    pub fn verify_review_attestation(
+        env: Env,
+        order_id: u64,
+        buyer: Address,
+        merchant: Address,
+    ) -> bool {
+        review_attestation::verify_review_attestation(env, order_id, buyer, merchant)
+    }
+
+    /// Verify a review attestation and mark it consumed, returning the
+    /// consumed record.
+    ///
+    /// Callable only by the configured reputation contract or the admin.
+    ///
+    /// See [`review_attestation::consume_review_attestation`] for full
+    /// documentation.
+    pub fn consume_review_attestation(
+        env: Env,
+        caller: Address,
+        order_id: u64,
+        buyer: Address,
+        merchant: Address,
+    ) -> Result<ReviewAttestation, MarketplaceError> {
+        review_attestation::consume_review_attestation(env, caller, order_id, buyer, merchant)
     }
 
     /// Return the [`catalog::SkuRecord`] for `(merchant_id, sku_id)`.
