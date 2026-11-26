@@ -777,6 +777,10 @@ pub enum DelegationError {
     /// Both the primary and secondary keepers missed their heartbeat window
     /// (issue #576).
     NoLiveKeeper = 4032,
+    /// The supplied amount is invalid (must be strictly positive).
+    InvalidAmount = 4033,
+    /// An arithmetic operation overflowed its integer bounds.
+    ArithmeticOverflow = 4034,
 }
 
 /// The delegation registry contract.
@@ -2982,7 +2986,7 @@ impl DelegationRegistry {
         }
 
         if amount_stroops <= 0 {
-            return Err(DelegationError::InvalidTtl); // Reuse for "invalid amount"
+            return Err(DelegationError::InvalidAmount);
         }
 
         let current: i128 = env
@@ -2993,7 +2997,7 @@ impl DelegationRegistry {
 
         let new_total = current
             .checked_add(amount_stroops)
-            .ok_or(DelegationError::IdExhausted)?;
+            .ok_or(DelegationError::ArithmeticOverflow)?;
 
         env.storage()
             .instance()
@@ -3001,6 +3005,11 @@ impl DelegationRegistry {
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        env.events().publish(
+            (EVENT_TOPIC_CONTRACT, symbol_short!("resv_dep"), caller),
+            (amount_stroops, new_total),
+        );
 
         Ok(new_total)
     }
@@ -3650,6 +3659,8 @@ mod error_code_uniqueness_tests {
             (DelegationError::SubAccountAddressTaken, 4030u32),
             (DelegationError::KeepersNotConfigured, 4031u32),
             (DelegationError::NoLiveKeeper, 4032u32),
+            (DelegationError::InvalidAmount, 4033u32),
+            (DelegationError::ArithmeticOverflow, 4034u32),
         ];
 
         for (variant, expected) in codes {
@@ -3689,6 +3700,8 @@ mod error_code_uniqueness_tests {
             DelegationError::SubAccountAddressTaken as u32,
             DelegationError::KeepersNotConfigured as u32,
             DelegationError::NoLiveKeeper as u32,
+            DelegationError::InvalidAmount as u32,
+            DelegationError::ArithmeticOverflow as u32,
         ];
         seen.sort_unstable();
         for pair in seen.windows(2) {
