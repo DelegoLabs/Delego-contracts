@@ -1,10 +1,9 @@
 #![cfg(test)]
 
 use crate::{
-    ChannelRelayedSpendMessage, ChannelSpendSignature, MerchantAllowlist,
-    MultiOwnerSpendEvent, PermissionError, PermissionStatus,
-    PermissionsContract, PermissionsContractClient, RelayedSpendMessage,
-    ScopedPermissionConfig, SpendProposalApprovedEvent,
+    ChannelRelayedSpendMessage, ChannelSpendSignature, MerchantAllowlist, MultiOwnerSpendEvent,
+    PermissionError, PermissionStatus, PermissionsContract, PermissionsContractClient,
+    RelayedSpendMessage, ScopedPermissionConfig, SpendProposalApprovedEvent, SponsoredRelayedSpend,
     MAX_PENDING_SPEND_PROPOSALS, SPEND_PROPOSAL_TTL_LEDGERS,
 };
 use ed25519_dalek::{Signer, SigningKey};
@@ -682,6 +681,136 @@ fn test_execute_spend_via_relayer_succeeds() {
 
     assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 60);
     assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 1);
+}
+
+// ── Issue #755: sponsored relayer spends ─────────────────────────────────────
+
+/// A sponsored relayed spend debits the owner's allowance and reimburses the
+/// relayer from the sponsor's pre-funded budget (issue #755).
+#[test]
+fn test_execute_sponsored_spend_via_relayer_reimburses_relayer() {
+    use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
+
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+    let sponsor = Address::generate(&t.env);
+
+    let fee_token = t
+        .env
+        .register_stellar_asset_contract_v2(Address::generate(&t.env))
+        .address();
+    StellarAssetClient::new(&t.env, &fee_token).mint(&sponsor, &1_000_000);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(&t.buyer, &t.agent, &100, &50, &merchants, &3600u32);
+
+    client.configure_sponsorship(&sponsor, &relayer, &fee_token, &10_000, &3u32);
+    client.fund_sponsorship(&sponsor, &30_000);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 5);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 100;
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 40,
+        nonce: 0,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
+
+    let sponsored = SponsoredRelayedSpend {
+        sponsor: sponsor.clone(),
+        fee_stroops: 2_500,
+        nonce: 0,
+        expiration_ledger,
+        epoch: 0,
+        signature,
+    };
+    client
+        .execute_sponsored_relayed_spend(&relayer, &t.buyer, &t.agent, &40, &t.seller, &sponsored);
+
+    // The owner's allowance is debited by the spend only, never by the fee.
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 60);
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 1);
+
+    // The relayer is reimbursed from the sponsor's pre-funded budget.
+    assert_eq!(
+        TokenClient::new(&t.env, &fee_token).balance(&relayer),
+        2_500
+    );
+    assert_eq!(client.get_sponsorship_balance(&sponsor), 27_500);
+    assert_eq!(
+        client
+            .get_sponsorship_policy(&sponsor)
+            .unwrap()
+            .remaining_tx_count,
+        2
+    );
+}
+
+/// A sponsored relayed spend that fails validation never reaches the
+/// sponsorship deduction, leaving the budget and relayer balance untouched.
+#[test]
+fn test_execute_sponsored_spend_via_relayer_failed_spend_keeps_sponsorship_budget() {
+    use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
+
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+    let sponsor = Address::generate(&t.env);
+
+    let fee_token = t
+        .env
+        .register_stellar_asset_contract_v2(Address::generate(&t.env))
+        .address();
+    StellarAssetClient::new(&t.env, &fee_token).mint(&sponsor, &1_000_000);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(&t.buyer, &t.agent, &100, &50, &merchants, &3600u32);
+
+    client.configure_sponsorship(&sponsor, &relayer, &fee_token, &10_000, &3u32);
+    client.fund_sponsorship(&sponsor, &30_000);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 6);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 100;
+    // Expected nonce is 0; signing nonce 1 fails the replay check after the
+    // signature has been verified, so no spend or fee is applied.
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 40,
+        nonce: 1,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let signature = sign_relayed_spend(&t.env, &t.permissions_contract_id, &signing_key, message);
+
+    let sponsored = SponsoredRelayedSpend {
+        sponsor: sponsor.clone(),
+        fee_stroops: 2_500,
+        nonce: 1,
+        expiration_ledger,
+        epoch: 0,
+        signature,
+    };
+    let result = client.try_execute_sponsored_relayed_spend(
+        &relayer, &t.buyer, &t.agent, &40, &t.seller, &sponsored,
+    );
+    assert_eq!(result, Err(Ok(PermissionError::InvalidNonce)));
+
+    assert_eq!(client.get_sponsorship_balance(&sponsor), 30_000);
+    assert_eq!(TokenClient::new(&t.env, &fee_token).balance(&relayer), 0);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 100);
 }
 
 /// A second relayed spend inside the configured velocity interval is rejected

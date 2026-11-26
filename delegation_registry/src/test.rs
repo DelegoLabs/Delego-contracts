@@ -4187,3 +4187,60 @@ fn test_set_delegation_keepers_rejects_paused_and_unknown() {
         Err(Ok(DelegationError::NotFound))
     );
 }
+
+// ── Issue #759: keeper reads extend persistent TTL ────────────────────────────
+
+/// Remaining persistent TTL of `key` as seen by the contract.
+fn persistent_ttl(env: &Env, contract: &Address, key: &DataKey) -> u32 {
+    env.as_contract(contract, || env.storage().persistent().get_ttl(key))
+}
+
+#[test]
+fn test_keeper_reads_extend_persistent_ttl() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Keeper_TTL");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &LARGE_TTL);
+    let primary = Address::generate(&env);
+    let secondary = Address::generate(&env);
+    client.set_delegation_keepers(&id, &primary, &secondary);
+    let _ = client.submit_heartbeat(&primary);
+
+    let heartbeat_key = DataKey::KeeperHeartbeat(primary.clone());
+    let keepers_key = DataKey::DelegationKeepers(id);
+
+    // Both entries are created at ledger 0, so their remaining TTL equals the
+    // ledger at which they would expire.
+    let heartbeat_expiry = persistent_ttl(&env, &client.address, &heartbeat_key);
+    let keepers_expiry = persistent_ttl(&env, &client.address, &keepers_key);
+    assert!(heartbeat_expiry > PERSISTENT_BUMP_THRESHOLD);
+    assert!(keepers_expiry > PERSISTENT_BUMP_THRESHOLD);
+
+    // Advance until both entries sit below the bump threshold but are still live.
+    env.ledger().set_sequence_number(
+        heartbeat_expiry.max(keepers_expiry) - PERSISTENT_BUMP_THRESHOLD + 1,
+    );
+
+    // Liveness checks and keeper reads must keep both entries alive.
+    assert!(client.check_keeper_liveness(&primary));
+    assert!(client.get_delegation_keepers(&id).is_some());
+    assert!(persistent_ttl(&env, &client.address, &heartbeat_key) > PERSISTENT_BUMP_THRESHOLD);
+    assert!(persistent_ttl(&env, &client.address, &keepers_key) > PERSISTENT_BUMP_THRESHOLD);
+
+    // get_keeper_heartbeat extends the heartbeat entry it returns.
+    let heartbeat_expiry =
+        env.ledger().sequence() + persistent_ttl(&env, &client.address, &heartbeat_key);
+    env.ledger()
+        .set_sequence_number(heartbeat_expiry - PERSISTENT_BUMP_THRESHOLD + 1);
+    assert!(client.get_keeper_heartbeat(&primary).is_some());
+    assert!(persistent_ttl(&env, &client.address, &heartbeat_key) > PERSISTENT_BUMP_THRESHOLD);
+
+    // resolve_execution_keeper extends the keeper assignment entry.
+    let keepers_expiry =
+        env.ledger().sequence() + persistent_ttl(&env, &client.address, &keepers_key);
+    env.ledger()
+        .set_sequence_number(keepers_expiry - PERSISTENT_BUMP_THRESHOLD + 1);
+    assert_eq!(client.resolve_execution_keeper(&id), primary);
+    assert!(persistent_ttl(&env, &client.address, &keepers_key) > PERSISTENT_BUMP_THRESHOLD);
+}
