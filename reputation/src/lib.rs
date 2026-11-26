@@ -20,7 +20,14 @@ use soroban_sdk::{
 };
 
 pub mod algorithm;
+pub mod arbitration;
+pub use arbitration::{
+    ArbitrationDeadlinePenaltyEvent, ArbitrationFinalizedEvent, ArbitrationPanelInitializedEvent,
+    ArbitrationVoteCastEvent, DisputeAssignment, VoteOutcome,
+};
 pub mod appeals;
+#[cfg(test)]
+mod arbitration_test;
 pub use appeals::{
     AppealConfig, AppealOutcome, AppealStatus, AppealVote, AppealedReview, ReviewAppeal,
 };
@@ -3957,6 +3964,12 @@ impl ReputationContract {
         stealth::merchant_review_count(&env, &merchant)
     }
 
+    /// Whether an anonymous-review ticket commitment is registered and not
+    /// yet redeemed (issue #775).
+    pub fn is_anonymous_ticket_live(env: Env, commitment: BytesN<32>) -> bool {
+        stealth::is_ticket_live(&env, &commitment)
+    }
+
     // --- Fraud Reporting ---
 
     /// File a fraud report with staked bond. Reporter must bond 50 USDC (or configured amount).
@@ -4699,6 +4712,55 @@ impl ReputationContract {
     /// Average review rating in basis points derived from the snapshot path.
     pub fn get_snapshot_average(env: Env, merchant: Address) -> u32 {
         snapshot::current_average(&env, &merchant)
+    }
+
+    // --- Arbitration Panels (issue #774) ---
+
+    /// Admin-only: initialize a five-arbiter panel and its first assignment.
+    pub fn initialize_arbitration_panel(
+        env: Env,
+        admin: Address,
+        dispute_id: u64,
+        arbiters: Vec<Address>,
+        assigned_arbiter: Address,
+    ) -> Result<(), ReputationError> {
+        admin.require_auth();
+        Self::require_caller_is_admin(&env, &admin)?;
+        arbitration::initialize_panel(&env, dispute_id, arbiters, assigned_arbiter)
+    }
+
+    /// Cast a vote as a member of a dispute's arbiter panel.
+    pub fn cast_arbitration_vote(
+        env: Env,
+        arbiter: Address,
+        dispute_id: u64,
+        outcome: VoteOutcome,
+    ) -> Result<ArbiterTally, ReputationError> {
+        arbitration::cast_vote(&env, dispute_id, &arbiter, outcome)
+    }
+
+    /// Read the current arbiter tally for a dispute.
+    pub fn get_arbitration_tally(
+        env: Env,
+        dispute_id: u64,
+    ) -> Result<ArbiterTally, ReputationError> {
+        arbitration::get_tally(&env, dispute_id)
+    }
+
+    /// Whether an arbiter already voted on a dispute.
+    pub fn has_arbitration_voted(env: Env, dispute_id: u64, arbiter: Address) -> bool {
+        arbitration::has_voted(&env, dispute_id, &arbiter)
+    }
+
+    /// Apply an overdue arbiter's penalty and reassign the dispute. Callable
+    /// by anyone, but the caller is authenticated like other cleanup paths.
+    pub fn check_arbitration_deadline(
+        env: Env,
+        caller: Address,
+        dispute_id: u64,
+    ) -> Result<bool, ReputationError> {
+        caller.require_auth();
+        arbitration::check_arbiter_deadline(&env, dispute_id)
     }
 }
 

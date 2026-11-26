@@ -10,18 +10,13 @@
 //! withdrawal / yield claim path requires `current_ledger > deposit_ledger`.
 use soroban_sdk::{contracttype, panic_with_error, Env};
 
-use crate::EscrowError;
-
-/// TTL threshold (in ledgers) below which the deposit-ledger entry is bumped.
-const BUMP_THRESHOLD: u32 = 17_280;
-/// TTL (in ledgers) the deposit-ledger entry is extended to when bumped.
-const BUMP_AMOUNT: u32 = 518_400;
+use crate::{EscrowError, PERSISTENT_BUMP_AMOUNT, PERSISTENT_BUMP_THRESHOLD};
 
 /// Storage keys owned by the flash loan guard. Kept in their own namespace so
 /// the main `DataKey` enum does not grow.
 #[contracttype]
 #[derive(Clone)]
-enum FlashLoanKey {
+pub(crate) enum FlashLoanKey {
     /// Ledger sequence at which the escrow's balance was staked.
     StakeDepositLedger(u64),
 }
@@ -48,14 +43,21 @@ pub fn record_deposit_ledger(env: &Env, escrow_id: u64) {
         .set(&key, &env.ledger().sequence());
     env.storage()
         .persistent()
-        .extend_ttl(&key, BUMP_THRESHOLD, BUMP_AMOUNT);
+        .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 }
 
 /// Returns the recorded staking deposit ledger of `escrow_id`, if any.
 pub fn deposit_ledger(env: &Env, escrow_id: u64) -> Option<u32> {
-    env.storage()
-        .persistent()
-        .get(&FlashLoanKey::StakeDepositLedger(escrow_id))
+    let key = FlashLoanKey::StakeDepositLedger(escrow_id);
+    let ledger: Option<u32> = env.storage().persistent().get(&key);
+    if ledger.is_some() {
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+    ledger
 }
 
 /// Requires `current_ledger > deposit_ledger` before a withdrawal or yield

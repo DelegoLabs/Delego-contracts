@@ -22,3 +22,7 @@ pub mod defi_fixture;
 /// Flash loan protection guard tests — same-ledger deposit and withdrawal of a
 /// staked escrow balance is rejected (issue #594).
 pub mod flash_loan_guard;
+
+/// Persistent storage TTL regressions for emergency, yield, and flash-loan
+/// guard keys (issue #768).
+pub mod storage_ttl;

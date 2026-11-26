@@ -110,7 +110,7 @@ pub mod blend;
 pub use blend::{BlendLendingPool, BlendLendingPoolTrait};
 /// Liquid staking token (LST) escrow collateral tracked in shares (issue #592).
 pub mod lst_support;
-pub use lst_support::LstCollateralRecord;
+pub use lst_support::{LstCollateralRecord, LstWhitelistUpdated};
 /// Health factor floor enforcement for staked escrow vaults (issue #593).
 pub mod vault_safety;
 pub use vault_safety::{assert_vault_health, HealthFactorWarning};
@@ -6856,7 +6856,7 @@ impl EscrowContract {
         allowed: bool,
     ) -> Result<(), EscrowError> {
         Self::require_admin(&env, &admin)?;
-        lst_support::set_whitelisted(&env, &lst_token, allowed);
+        lst_support::set_whitelisted(&env, &lst_token, allowed)?;
         Ok(())
     }
 
@@ -14068,9 +14068,16 @@ impl EscrowContract {
         env: Env,
         escrow_id: u64,
     ) -> Option<EmergencyRescueProposal> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::EmergencyRescueProposal(escrow_id))
+        let key = DataKey::EmergencyRescueProposal(escrow_id);
+        let proposal: Option<EmergencyRescueProposal> = env.storage().persistent().get(&key);
+        if proposal.is_some() {
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+        proposal
     }
 }
 
