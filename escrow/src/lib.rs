@@ -6899,6 +6899,11 @@ impl EscrowContract {
         }
 
         let collateral = lst_support::lock_collateral(&env, escrow_id, &buyer, &lst_token, shares)?;
+        let collateral_value = lst_support::share_value(
+            collateral.initial_share_balance,
+            collateral.exchange_rate_snapshot,
+        )?;
+        vault_safety::check_vault_health(&env, escrow_id, collateral_value, record.amount)?;
 
         if record.status == EscrowStatus::Created {
             record.status = EscrowStatus::Funded;
@@ -6918,6 +6923,79 @@ impl EscrowContract {
     /// Read the LST collateral record locked for `escrow_id`, if any.
     pub fn get_lst_collateral(env: Env, escrow_id: u64) -> Option<LstCollateralRecord> {
         lst_support::collateral(&env, escrow_id)
+    }
+
+    /// Resolve the current collateral value for `escrow_id` (using live LST
+    /// share valuation when LST collateral is locked, otherwise the escrowed
+    /// principal amount).
+    fn vault_collateral_value(env: &Env, escrow_id: u64) -> Result<i128, EscrowError> {
+        if let Some(lst) = lst_support::collateral(env, escrow_id) {
+            let rate = lst_support::exchange_rate(env, &lst.lst_token_address)?;
+            return lst_support::share_value(lst.initial_share_balance, rate);
+        }
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        Ok(record.amount)
+    }
+
+    /// Compute the current health factor (in basis points, where `10_000` = 1.0)
+    /// for `escrow_id` against `debt_value`. Returns `None` when `debt_value == 0`.
+    pub fn get_vault_health_bps(
+        env: Env,
+        escrow_id: u64,
+        debt_value: i128,
+    ) -> Result<Option<i128>, EscrowError> {
+        let collateral_value = Self::vault_collateral_value(&env, escrow_id)?;
+        vault_safety::health_factor_bps(collateral_value, debt_value)
+    }
+
+    /// Validate that borrowing `additional_debt` on top of `current_debt`
+    /// against `escrow_id`'s collateral keeps the vault health factor at or
+    /// above [`vault_safety::MIN_HEALTH_FACTOR_BPS`] (12_500 bps), emitting a
+    /// [`HealthFactorWarning`] if it falls below 13_000 bps.
+    pub fn check_vault_borrow(
+        env: Env,
+        escrow_id: u64,
+        current_debt: i128,
+        additional_debt: i128,
+    ) -> Result<(), EscrowError> {
+        let collateral_value = Self::vault_collateral_value(&env, escrow_id)?;
+        vault_safety::assert_can_borrow(
+            &env,
+            escrow_id,
+            collateral_value,
+            current_debt,
+            additional_debt,
+        )
+    }
+
+    /// Validate that withdrawing `withdraw_value` of collateral from
+    /// `escrow_id` against `debt_value` keeps the vault health factor at or
+    /// above [`vault_safety::MIN_HEALTH_FACTOR_BPS`] (12_500 bps), emitting a
+    /// [`HealthFactorWarning`] if it falls below 13_000 bps.
+    pub fn check_vault_collateral_withdrawal(
+        env: Env,
+        escrow_id: u64,
+        debt_value: i128,
+        withdraw_value: i128,
+    ) -> Result<(), EscrowError> {
+        let collateral_value = Self::vault_collateral_value(&env, escrow_id)?;
+        vault_safety::assert_can_withdraw_collateral(
+            &env,
+            escrow_id,
+            collateral_value,
+            debt_value,
+            withdraw_value,
+        )
+    }
+
+    /// Return the ledger sequence at which `escrow_id`'s balance was staked in
+    /// a lending pool, if any (issue #594).
+    pub fn get_stake_deposit_ledger(env: Env, escrow_id: u64) -> Option<u32> {
+        flash_loan_guard::deposit_ledger(&env, escrow_id)
     }
 
     /// Settle LST collateral once the escrow is terminal. On `Released` the
