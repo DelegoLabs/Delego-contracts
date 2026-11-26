@@ -27,6 +27,8 @@ pub use appeals::{
 #[cfg(test)]
 mod appeals_test;
 #[cfg(test)]
+mod attestation_test;
+#[cfg(test)]
 mod blinded_review_test;
 pub mod flags;
 #[cfg(test)]
@@ -383,6 +385,26 @@ pub struct EscrowRecordMirror {
     pub timeout_ledger: u32,
 }
 
+/// Structural mirror of the marketplace contract's `ReviewAttestation` wire
+/// shape (issue #558); see [`EscrowStatusMirror`] for why this mirrors rather
+/// than imports the type. Field names must stay in sync with
+/// `delego-marketplace`'s `ReviewAttestation`, or the decode fails closed and
+/// the review is rejected as [`ReputationError::ReviewAttestationInvalid`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewAttestationMirror {
+    /// Order the attestation was issued for.
+    pub order_id: u64,
+    /// Buyer that settled the order.
+    pub buyer: Address,
+    /// Merchant the order was placed with.
+    pub merchant: Address,
+    /// Ledger sequence at which the attestation was issued.
+    pub issued_ledger: u32,
+    /// `true` once the attestation has backed a review.
+    pub consumed: bool,
+}
+
 /// Proof binding a review to a specific, independently verifiable escrow
 /// settlement (issue #286). Submitted to
 /// [`ReputationContract::submit_verified_review`], which calls back into
@@ -656,6 +678,12 @@ pub enum ReputationError {
     AppealWindowNotExpired = 3040,
     /// Review rating is outside the accepted `20..=100` range (issue #584).
     InvalidRatingValue = 3046,
+    /// No marketplace review-attestation authority has been configured, so
+    /// attested reviews cannot be verified (issue #558).
+    ReviewAttestationAuthorityNotSet = 3047,
+    /// The review attestation could not be verified or consumed by the
+    /// configured marketplace contract (issue #558).
+    ReviewAttestationInvalid = 3048,
 }
 
 #[cfg(test)]
@@ -739,6 +767,8 @@ mod error_code_allocation {
             ReputationError::AppealWindowExpired as u32,
             ReputationError::AppealWindowNotExpired as u32,
             ReputationError::InvalidRatingValue as u32,
+            ReputationError::ReviewAttestationAuthorityNotSet as u32,
+            ReputationError::ReviewAttestationInvalid as u32,
         ];
         for code in codes {
             assert!(
@@ -1067,6 +1097,18 @@ pub enum DataKey {
     AppealArbiter(Address),
     /// Bond forfeited to a charity address, in stroops.
     AppealCharityBalance(Address),
+}
+
+/// Storage keys owned by the storefront review-attestation feature
+/// (issue #558).
+///
+/// Kept separate from [`DataKey`] because that enum is at the contract-spec
+/// variant limit, so extending it would be rejected at compile time.
+#[contracttype]
+pub enum ReviewAttestationKey {
+    /// Marketplace contract whose review attestations this contract accepts
+    /// and consumes when a review is filed. Set by the admin.
+    Authority,
 }
 
 /// Maximum basis points value (100.00%), used both for ratings/scores and
@@ -4169,6 +4211,30 @@ impl ReputationContract {
         if rating < MIN_RATING || rating > MAX_RATING {
             return Err(ReputationError::InvalidRating);
         }
+        Self::store_review_commitment(
+            &env,
+            reviewer,
+            merchant,
+            review_id,
+            rating,
+            content_hash,
+            verified_purchase,
+        )
+    }
+
+    /// Shared writer for the review commitment and its per-merchant index.
+    ///
+    /// Callers are responsible for authorization and rating validation before
+    /// reaching this helper.
+    fn store_review_commitment(
+        env: &Env,
+        reviewer: Address,
+        merchant: Address,
+        review_id: u64,
+        rating: u32,
+        content_hash: BytesN<32>,
+        verified_purchase: bool,
+    ) -> Result<(), ReputationError> {
         let commitment_key = DataKey::ReviewCommitment(review_id);
         if env.storage().persistent().has(&commitment_key) {
             return Err(ReputationError::DuplicateReviewCommitment);
@@ -4194,7 +4260,7 @@ impl ReputationContract {
             .storage()
             .persistent()
             .get(&merchant_reviews_key)
-            .unwrap_or_else(|| Vec::new(&env));
+            .unwrap_or_else(|| Vec::new(env));
         review_ids.push_back(review_id);
         env.storage()
             .persistent()
@@ -4205,6 +4271,124 @@ impl ReputationContract {
             PERSISTENT_BUMP_AMOUNT,
         );
         Ok(())
+    }
+
+    // --- Storefront review attestations (issue #558) ---
+
+    /// Configure the marketplace contract whose review attestations this
+    /// contract verifies and consumes when a review is filed. Admin-only.
+    pub fn set_review_attestation_authority(
+        env: Env,
+        admin: Address,
+        marketplace: Address,
+    ) -> Result<(), ReputationError> {
+        admin.require_auth();
+        Self::require_caller_is_admin(&env, &admin)?;
+
+        env.storage()
+            .instance()
+            .set(&ReviewAttestationKey::Authority, &marketplace);
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        Ok(())
+    }
+
+    /// Return the configured marketplace review-attestation authority, if any.
+    pub fn get_review_attestation_authority(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&ReviewAttestationKey::Authority)
+    }
+
+    /// File a review backed by a marketplace-issued review attestation
+    /// (issue #558).
+    ///
+    /// The marketplace contract issues one [`ReviewAttestationMirror`] per
+    /// order it releases, and this call consumes it atomically: the configured
+    /// authority's `consume_review_attestation` verifies that `reviewer` is the
+    /// order's buyer and `merchant` its seller, and marks the attestation
+    /// consumed, so the same order can back exactly one review.
+    ///
+    /// If the consumer rejects the attestation — unknown, expired, already
+    /// used, or bound to a different buyer/merchant — the review is refused
+    /// with [`ReputationError::ReviewAttestationInvalid`] and nothing is
+    /// stored. The returned attestation is re-checked here as well, so a
+    /// malfunctioning authority cannot slip an attestation for another order
+    /// past the contract.
+    ///
+    /// On success the review commitment is stored with
+    /// `verified_purchase = true`.
+    pub fn submit_attested_review(
+        env: Env,
+        reviewer: Address,
+        merchant: Address,
+        order_id: u64,
+        rating: u32,
+        content_hash: BytesN<32>,
+    ) -> Result<(), ReputationError> {
+        reviewer.require_auth();
+
+        if reviewer == merchant {
+            return Err(ReputationError::InvalidParam);
+        }
+        if rating < MIN_RATING || rating > MAX_RATING {
+            return Err(ReputationError::InvalidRating);
+        }
+        if Self::is_frozen(env.clone(), merchant.clone()) {
+            return Err(ReputationError::EntityFrozen);
+        }
+
+        let marketplace: Address = env
+            .storage()
+            .instance()
+            .get(&ReviewAttestationKey::Authority)
+            .ok_or(ReputationError::ReviewAttestationAuthorityNotSet)?;
+
+        // Refuse a duplicate before spending the buyer's attestation.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::ReviewCommitment(order_id))
+        {
+            return Err(ReputationError::DuplicateReviewCommitment);
+        }
+
+        let args = soroban_sdk::vec![
+            &env,
+            env.current_contract_address().into_val(&env),
+            order_id.into_val(&env),
+            reviewer.clone().into_val(&env),
+            merchant.clone().into_val(&env),
+        ];
+        let call = env.try_invoke_contract::<ReviewAttestationMirror, InvokeError>(
+            &marketplace,
+            &Symbol::new(&env, "consume_review_attestation"),
+            args,
+        );
+        let attestation = match call {
+            Ok(Ok(attestation)) => attestation,
+            _ => return Err(ReputationError::ReviewAttestationInvalid),
+        };
+
+        let matches_order = attestation.order_id == order_id
+            && attestation.buyer == reviewer
+            && attestation.merchant == merchant
+            && attestation.consumed;
+        if !matches_order {
+            return Err(ReputationError::ReviewAttestationInvalid);
+        }
+
+        Self::store_review_commitment(
+            &env,
+            reviewer,
+            merchant,
+            order_id,
+            rating,
+            content_hash,
+            true,
+        )
     }
 
     // --- Review appeals (issue #583) ---
