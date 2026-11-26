@@ -628,23 +628,6 @@ pub enum DataKey {
     KeeperLastBountyLedger(u64),
     /// Legacy (V1) delegation record keyed by owner address.
     DelegationV1(Address),
-    /// Current (V2) delegation record keyed by owner address and label.
-    DelegationV2(Address, Symbol),
-    /// Schema version marker for the delegation storage layout.
-    SchemaVersion,
-    /// Sliding-window spend velocity limit configured for a delegation
-    /// (issue #494), keyed by delegation id.
-    SpendRateLimit(u64),
-    /// Merchant whitelist filter configured for a delegation (issue #493).
-    MerchantFilter(u64),
-    /// Cumulative stroops spent by a delegation with a specific merchant
-    /// (issue #493).
-    MerchantSpent(u64, Address),
-    /// Latest liveness heartbeat submitted by a keeper (issue #576).
-    KeeperHeartbeat(Address),
-    /// Primary/secondary keeper assignment for a delegation (issue #576).
-    DelegationKeepers(u64),
-}
 
 /// Current delegation storage schema version.
 pub const DELEGATION_SCHEMA_VERSION: u32 = 2;
@@ -2378,6 +2361,10 @@ impl DelegationRegistry {
             DataKey::SpendRateLimit(delegation_id),
             DataKey::MerchantFilter(delegation_id),
             DataKey::KeeperLastBountyLedger(delegation_id),
+            // Issue #760: keeper assignment stored by heartbeat.rs must be
+            // removed when the delegation is swept so no orphaned config
+            // entries remain in persistent storage.
+            DataKey::DelegationKeepers(delegation_id),
         ] {
             if env.storage().persistent().has(&key) {
                 env.storage().persistent().remove(&key);

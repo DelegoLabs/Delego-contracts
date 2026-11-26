@@ -3893,3 +3893,94 @@ fn test_reactivate_sub_account_emits_event() {
     // Reactivating an already-active sub-account is a no-op.
     assert!(!client.reactivate_sub_account(&owner, &sub_id));
 }
+
+// ── Issue #760: DelegationKeepers swept with expired delegations ──────────────
+
+#[test]
+fn test_sweep_expired_removes_delegation_keepers() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Keepers_Sweep");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+
+    // Register a primary and secondary keeper for the delegation.
+    let primary = Address::generate(&env);
+    let secondary = Address::generate(&env);
+    client.set_delegation_keepers(&id, &primary, &secondary);
+
+    // Confirm keepers are stored before the sweep.
+    assert!(
+        client.get_delegation_keepers(&id).is_some(),
+        "keepers should be present before sweep"
+    );
+
+    // Advance past the expiry ledger and sweep.
+    env.ledger().set_sequence_number(300);
+    let mut ids = Vec::new(&env);
+    ids.push_back(id);
+    let swept = client.sweep_expired(&ids);
+
+    assert_eq!(swept.len(), 1, "delegation should have been swept");
+    assert_eq!(swept.get(0).unwrap(), id);
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Expired);
+
+    // After sweep, DelegationKeepers entry must be gone (issue #760).
+    assert!(
+        client.get_delegation_keepers(&id).is_none(),
+        "DelegationKeepers must be removed after sweep_expired"
+    );
+}
+
+#[test]
+fn test_sweep_expired_batch_removes_delegation_keepers() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Keepers_Batch");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+
+    let primary = Address::generate(&env);
+    let secondary = Address::generate(&env);
+    client.set_delegation_keepers(&id, &primary, &secondary);
+
+    assert!(
+        client.get_delegation_keepers(&id).is_some(),
+        "keepers should be present before batch sweep"
+    );
+
+    env.ledger().set_sequence_number(300);
+    let result = client.sweep_expired_batch(&1u64, &10u32);
+
+    assert_eq!(result.swept_records_count, 1, "one delegation should be swept");
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Expired);
+
+    // DelegationKeepers must be removed by sweep_expired_batch (issue #760).
+    assert!(
+        client.get_delegation_keepers(&id).is_none(),
+        "DelegationKeepers must be removed after sweep_expired_batch"
+    );
+}
+
+#[test]
+fn test_sweep_does_not_panic_when_no_keepers_configured() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "No_Keepers");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+
+    // No set_delegation_keepers call — sweep must still succeed cleanly.
+    env.ledger().set_sequence_number(300);
+    let mut ids = Vec::new(&env);
+    ids.push_back(id);
+    let swept = client.sweep_expired(&ids);
+
+    assert_eq!(swept.len(), 1);
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Expired);
+    // Nothing to assert for keepers — just confirming no panic.
+    assert!(client.get_delegation_keepers(&id).is_none());
+}
