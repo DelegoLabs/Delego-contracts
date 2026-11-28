@@ -196,6 +196,28 @@ fn test_already_initialized_returns_typed_error() {
 }
 
 #[test]
+fn test_initialize_rejects_zero_admin() {
+    let env = Env::default();
+    let contract_id = env.register(DelegationRegistry, ());
+    let client = DelegationRegistryClient::new(&env, &contract_id);
+
+    // Neither the all-zero account nor the all-zero contract sentinel may be
+    // accepted: nobody can sign for them, so the admin role would be dead.
+    for strkey in [ZERO_ACCOUNT_STRKEY, ZERO_CONTRACT_STRKEY] {
+        let zero = Address::from_str(&env, strkey);
+        assert_eq!(
+            client.try_initialize(&zero),
+            Err(Ok(DelegationError::InvalidParam))
+        );
+    }
+
+    // The rejected calls left no admin stored, so a real address still wins.
+    let admin = Address::generate(&env);
+    assert!(client.initialize(&admin));
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
 fn test_get_admin_returns_admin_address() {
     let (_, client, admin, _, _, _) = setup();
 
@@ -1803,6 +1825,27 @@ fn test_non_admin_cannot_propose_successor() {
 
     // get_admin is unaffected.
     assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_propose_admin_rejects_zero_address() {
+    let (env, client, admin, _, _, _) = setup();
+    env.mock_all_auths();
+
+    for strkey in [ZERO_ACCOUNT_STRKEY, ZERO_CONTRACT_STRKEY] {
+        let zero = Address::from_str(&env, strkey);
+        assert_eq!(
+            client.try_propose_admin(&zero),
+            Err(Ok(DelegationError::InvalidParam))
+        );
+    }
+
+    // No pending proposal was stored and the current admin is unchanged.
+    assert_eq!(client.get_admin(), admin);
+    assert_eq!(
+        client.try_accept_admin(),
+        Err(Ok(DelegationError::NoPendingAdmin))
+    );
 }
 
 #[test]

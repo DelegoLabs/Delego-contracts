@@ -18,7 +18,7 @@ use crate::{
 
 /// Minimal mock LST token implementing `exchange_rate` and `transfer`/`balance`
 /// is not needed when we test `get_vault_health_bps` / `check_vault_borrow` /
-/// `check_vault_collateral_withdrawal` on standard escrows, and we can also
+/// `check_vault_withdrawal` on standard escrows, and we can also
 /// provide a mock LST contract for `fund_with_lst` health checks.
 #[contract]
 struct MockLstToken;
@@ -141,12 +141,12 @@ fn vault_health_healthy_warning_and_unsafe_on_borrow_and_withdrawal() {
 
     // Healthy collateral withdrawal: (10_000 - 1_000) / 6_000 = 15_000 bps.
     s.client
-        .check_vault_collateral_withdrawal(&s.escrow_id, &6_000, &1_000);
+        .check_vault_withdrawal(&s.escrow_id, &6_000, &1_000);
 
     // Unsafe collateral withdrawal: (10_000 - 3_000) / 6_000 = 11_666 bps (< 12_500).
     assert_eq!(
         s.client
-            .try_check_vault_collateral_withdrawal(&s.escrow_id, &6_000, &3_000),
+            .try_check_vault_withdrawal(&s.escrow_id, &6_000, &3_000),
         Err(Ok(EscrowError::UnsafeHealthFactor))
     );
 }

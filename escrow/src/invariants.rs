@@ -4,8 +4,8 @@
 //! lifecycle. These invariants are used for property-based testing and provide
 //! mathematical guarantees about contract behavior.
 
-use crate::{EscrowRecord, EscrowStatus};
-use soroban_sdk::{contracttype, Address, Env, Vec};
+use crate::{EscrowRecord, EscrowStatus, ESCROW_FLAG_DISPUTED};
+use soroban_sdk::{contracttype, Address};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,12 +102,80 @@ pub fn verify_terminal_state_irrevocability(record: &EscrowRecord) -> bool {
 
 /// Invariant 9: Fulfillment Phase Consistency
 ///
+/// A coarse lifecycle phase derived from [`EscrowRecord`]'s `status` and
+/// `flags`. It is a **derived view only** — computed on the fly and never
+/// persisted — so it does not alter `EscrowRecord`'s XDR layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EscrowFulfillmentPhase {
+    /// Neither party has funded the escrow yet (`status == Created`).
+    Unfunded,
+    /// Funds are locked and the escrow is awaiting fulfilment.
+    Funded,
+    /// The buyer is inspecting delivered goods.
+    InInspection,
+    /// The escrow reached a terminal settlement state.
+    Settled,
+    /// The escrow is under dispute or appeal.
+    Disputed,
+}
+
+impl EscrowFulfillmentPhase {
+    /// Derives the fulfilment phase for `record` from its `status` and `flags`.
+    ///
+    /// `status` is the primary discriminator; the disputed flag refines a
+    /// `Funded` escrow that is already under dispute but has not yet been moved
+    /// to the `Disputed` status.
+    pub fn of(record: &EscrowRecord) -> EscrowFulfillmentPhase {
+        match record.status {
+            EscrowStatus::Created => EscrowFulfillmentPhase::Unfunded,
+            EscrowStatus::Funded => {
+                if record.flags.has_flag(ESCROW_FLAG_DISPUTED) {
+                    EscrowFulfillmentPhase::Disputed
+                } else {
+                    EscrowFulfillmentPhase::Funded
+                }
+            }
+            EscrowStatus::Inspection => EscrowFulfillmentPhase::InInspection,
+            EscrowStatus::Disputed | EscrowStatus::InitialRuling => {
+                EscrowFulfillmentPhase::Disputed
+            }
+            EscrowStatus::Released
+            | EscrowStatus::Refunded
+            | EscrowStatus::Cancelled
+            | EscrowStatus::CancelledByMutualConsent
+            | EscrowStatus::SettledWithPartialRefund => EscrowFulfillmentPhase::Settled,
+        }
+    }
+}
+
 /// Plain English:
 ///   A funded escrow awaiting merchant acceptance must remain in
 ///   FundedAwaitingAcceptance until the merchant accepts or the buyer
 ///   claims an unaccepted refund after the acceptance timeout.
-pub fn verify_fulfillment_phase_consistency(_record: &EscrowRecord) -> bool {
-    true
+///
+/// Security Property:
+///   The derived [`EscrowFulfillmentPhase`] must agree with the underlying
+///   `status`/`flags`; a mismatch would signal a corrupted record.
+pub fn verify_fulfillment_phase_consistency(record: &EscrowRecord) -> bool {
+    match EscrowFulfillmentPhase::of(record) {
+        EscrowFulfillmentPhase::Unfunded => record.status == EscrowStatus::Created,
+        EscrowFulfillmentPhase::Funded => record.status == EscrowStatus::Funded,
+        EscrowFulfillmentPhase::InInspection => record.status == EscrowStatus::Inspection,
+        EscrowFulfillmentPhase::Disputed => {
+            matches!(
+                record.status,
+                EscrowStatus::Disputed | EscrowStatus::InitialRuling
+            )
+        }
+        EscrowFulfillmentPhase::Settled => matches!(
+            record.status,
+            EscrowStatus::Released
+                | EscrowStatus::Refunded
+                | EscrowStatus::Cancelled
+                | EscrowStatus::CancelledByMutualConsent
+                | EscrowStatus::SettledWithPartialRefund
+        ),
+    }
 }
 
 /// Invariant 3: Non-Negative Balances
@@ -330,8 +398,10 @@ mod tests {
             status,
             flags: crate::EscrowFlags(0),
             created_at: 1000,
+            created_ledger: 1000,
             updated_at: 1000,
             timeout_ledger: 2000,
+            receipt_token_id: None,
         }
     }
 

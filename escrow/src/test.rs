@@ -56,6 +56,7 @@ use soroban_sdk::{
         Seller,
         Enabled,
         ReentryRejected,
+        RefundReentryRejected,
         SawReleasedState,
     }
 
@@ -121,12 +122,17 @@ use soroban_sdk::{
             let client = EscrowContractClient::new(&_env, &escrow);
             let nested_partial = client.try_partial_release(&escrow_id, &caller, &1i128);
             let nested_release = client.try_release(&escrow_id, &caller, &seller);
+            let nested_refund = client.try_partial_refund(&escrow_id, &caller, &1i128);
             let rejected = nested_partial == Err(Ok(EscrowError::ReentrancyDetected))
                 && nested_release == Err(Ok(EscrowError::ReentrancyDetected));
             let record = client.get_escrow(&escrow_id);
             _env.storage()
                 .instance()
                 .set(&ReentrantTokenKey::ReentryRejected, &rejected);
+            _env.storage().instance().set(
+                &ReentrantTokenKey::RefundReentryRejected,
+                &(nested_refund == Err(Ok(EscrowError::ReentrancyDetected))),
+            );
             _env.storage().instance().set(
                 &ReentrantTokenKey::SawReleasedState,
                 &(record.status == crate::EscrowStatus::Released),
@@ -146,6 +152,13 @@ use soroban_sdk::{
             env.storage()
                 .instance()
                 .get(&ReentrantTokenKey::ReentryRejected)
+                .unwrap_or(false)
+        }
+
+        pub fn refund_reentry_rejected(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&ReentrantTokenKey::RefundReentryRejected)
                 .unwrap_or(false)
         }
 
@@ -2560,6 +2573,45 @@ use soroban_sdk::{
         let record = client.get_escrow(&escrow_id);
         assert_eq!(record.status, crate::EscrowStatus::Released);
         assert_eq!(record.released_amount, 1_000i128);
+    }
+
+    #[test]
+    fn test_partial_refund_rejects_reentry_during_token_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, escrow_contract) = setup_client(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token = env.register(ReentrantToken, ());
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[73u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &1_000i128,
+            &order_id,
+            &1_000u32,
+            &None,
+            &None,
+        );
+
+        // The seller may refund before the timeout elapses; the malicious token
+        // attempts to re-enter `partial_refund` from inside `transfer`.
+        let token_client = ReentrantTokenClient::new(&env, &token);
+        token_client.configure_reentry(&escrow_contract, &escrow_id, &seller, &seller, &true);
+
+        let result = client.partial_refund(&escrow_id, &seller, &400i128);
+
+        assert_eq!(result.refunded, 400i128);
+        assert_eq!(result.remaining, 600i128);
+        assert!(!result.fully_refunded);
+        // The re-entrant refund must have been rejected with ReentrancyDetected.
+        assert!(token_client.refund_reentry_rejected());
+        let record = client.get_escrow(&escrow_id);
+        assert_eq!(record.refunded_amount, 400i128);
+        assert_eq!(record.status, crate::EscrowStatus::Funded);
     }
 
     // ─── Issue #35: updated_at lifecycle tests ──────────────────────────────
