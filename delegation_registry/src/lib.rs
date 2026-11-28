@@ -637,6 +637,21 @@ pub enum DataKey {
     KeeperLastBountyLedger(u64),
     /// Legacy (V1) delegation record keyed by owner address.
     DelegationV1(Address),
+    /// Current-schema (V2) delegation record keyed by owner address and label.
+    DelegationV2(Address, Symbol),
+    /// Schema version stamped alongside the V2 record for lazy migration.
+    SchemaVersion,
+    /// Rolling spend-rate limit configuration for a delegation (issue #690).
+    SpendRateLimit(u64),
+    /// Merchant whitelist filter configured for a delegation.
+    MerchantFilter(u64),
+    /// Cumulative stroops spent with a single merchant by a delegation.
+    MerchantSpent(u64, Address),
+    /// Primary/secondary keeper assignment for a delegation (issue #576).
+    DelegationKeepers(u64),
+    /// Latest heartbeat recorded for a keeper (issue #576).
+    KeeperHeartbeat(Address),
+}
 
 /// Current delegation storage schema version.
 pub const DELEGATION_SCHEMA_VERSION: u32 = 2;
@@ -818,6 +833,10 @@ impl DelegationRegistry {
     /// * [`DelegationError::AlreadyInitialized`] - an admin address is already
     ///   stored; the call has no effect and never reassigns the admin.
     pub fn initialize(env: Env, admin: Address) -> Result<bool, DelegationError> {
+        // A zero admin would pin the registry to an address nobody can sign for.
+        if is_zero_address(&env, &admin) {
+            return Err(DelegationError::InvalidParam);
+        }
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(DelegationError::AlreadyInitialized);
         }
@@ -849,6 +868,11 @@ impl DelegationRegistry {
             .ok_or(DelegationError::NotInitialized)?;
 
         current_admin.require_auth();
+
+        // A zero successor would make the pending transfer unclaimable.
+        if is_zero_address(&env, &new_admin) {
+            return Err(DelegationError::InvalidParam);
+        }
 
         env.storage()
             .instance()

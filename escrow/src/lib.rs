@@ -6976,7 +6976,7 @@ impl EscrowContract {
     /// `escrow_id` against `debt_value` keeps the vault health factor at or
     /// above [`vault_safety::MIN_HEALTH_FACTOR_BPS`] (12_500 bps), emitting a
     /// [`HealthFactorWarning`] if it falls below 13_000 bps.
-    pub fn check_vault_collateral_withdrawal(
+    pub fn check_vault_withdrawal(
         env: Env,
         escrow_id: u64,
         debt_value: i128,
@@ -9320,6 +9320,25 @@ impl EscrowContract {
         caller: Address,
         refund_amount: i128,
     ) -> Result<PartialRefundResult, EscrowError> {
+        // The token transfers below are external calls: run the whole refund
+        // under the re-entrancy lock, and commit every state mutation before
+        // any external call (Checks-Effects-Interactions) so a malicious token
+        // can neither re-enter before the record write is durable nor observe a
+        // stale record.
+        with_reentrancy_guard(&env, || {
+            Self::partial_refund_inner(&env, escrow_id, caller, refund_amount)
+        })
+    }
+
+    /// Unguarded refund body. Callers must go through
+    /// [`Self::partial_refund_internal`] so the re-entrancy lock is held across
+    /// the token transfers (Checks-Effects-Interactions).
+    fn partial_refund_inner(
+        env: &Env,
+        escrow_id: u64,
+        caller: Address,
+        refund_amount: i128,
+    ) -> Result<PartialRefundResult, EscrowError> {
         let key = DataKey::Escrow(escrow_id);
         let mut record: EscrowRecord = match env.storage().persistent().get(&key) {
             Some(rec) => rec,
@@ -9334,7 +9353,7 @@ impl EscrowContract {
 
         // Flash loan protection (issue #594): a staked balance can not be
         // refunded in the same ledger it was deposited.
-        flash_loan_guard::guard_staked_withdrawal(&env, escrow_id)?;
+        flash_loan_guard::guard_staked_withdrawal(env, escrow_id)?;
 
         let timeout_reached = env.ledger().sequence() >= record.timeout_ledger;
 
@@ -9397,14 +9416,8 @@ impl EscrowContract {
         // Strict conservation of this refund slice (issue #547).
         assert_value_conservation(refund_amount, refund_amount, 0, 0)?;
 
-        blend_yield::redeem(&env, record.escrow_id);
-        let token_client = soroban_sdk::token::Client::new(&env, &record.token);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &record.buyer,
-            &refund_amount,
-        );
-
+        // --- Effects: apply and persist all state mutations before any
+        // external call (Checks-Effects-Interactions) ---
         record.refunded_amount = record
             .refunded_amount
             .checked_add(refund_amount)
@@ -9445,6 +9458,16 @@ impl EscrowContract {
             },
         );
 
+        // --- Interactions: external calls happen only after state is
+        // committed ---
+        blend_yield::redeem(env, record.escrow_id);
+        let token_client = soroban_sdk::token::Client::new(env, &record.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &record.buyer,
+            &refund_amount,
+        );
+
         // On full refund, distribute accrued yield to buyer if yield config exists (issue #360)
         if fully_refunded {
             let yield_config: Option<YieldConfig> = env
@@ -9452,7 +9475,7 @@ impl EscrowContract {
                 .persistent()
                 .get(&DataKey::EscrowYieldConfig(escrow_id));
             if let Some(cfg) = &yield_config {
-                let (yield_amount, held_seconds) = Self::compute_yield(&record, Some(cfg), &env)?;
+                let (yield_amount, held_seconds) = Self::compute_yield(&record, Some(cfg), env)?;
                 
                 // Check if yield split configuration exists (issue #360)
                 let split_config: Option<YieldSplitConfig> = env
@@ -16978,6 +17001,7 @@ mod value_conservation_tests {
             flags: EscrowFlags(0),
             order_id: BytesN::from_array(env, &[7; 32]),
             created_at: 0,
+            created_ledger: 0,
             updated_at: 0,
             timeout_ledger: 0,
             receipt_token_id: None,
@@ -18127,6 +18151,7 @@ mod reentrancy_tests {
                         flags: EscrowFlags(0),
                         order_id: BytesN::from_array(&env, &[0u8; 32]),
                         created_at: 0u64,
+                        created_ledger: 0u64,
                         updated_at: 0u64,
                         timeout_ledger: 0u32,
                         receipt_token_id: None,
