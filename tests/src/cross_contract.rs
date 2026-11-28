@@ -18,8 +18,7 @@ use delego_tests::fixtures::create_mock_token_contract;
 use ed25519_dalek::{Signer, SigningKey};
 use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::Address as _, testutils::Ledger as _, Address, BytesN, Env,
-    InvokeError, Vec,
+    testutils::Address as _, testutils::Ledger as _, Address, BytesN, Env, InvokeError, Vec,
 };
 
 /// Deterministic test keypair plus its raw ed25519 public key bytes, mirroring
@@ -88,6 +87,8 @@ impl TestEnv {
             treasury,
             min_amount,
             max_amount,
+            min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
         };
         let escrow_contract_id = env.register(EscrowContract, (config,));
         let permissions_contract_id = env.register(PermissionsContract, ());
@@ -790,10 +791,10 @@ where
 
 /// Canonical disjoint ranges per contract (issue #269).
 const ERROR_CODE_RANGES: &[(&str, u32, u32)] = &[
-    ("escrow",          1, 1_999),
+    ("escrow", 1, 1_999),
     ("permissions", 2_000, 2_999),
-    ("reputation",  3_000, 3_999),
-    ("delegation",  4_000, 4_999),
+    ("reputation", 3_000, 3_999),
+    ("delegation", 4_000, 4_999),
     ("marketplace", 5_000, 5_999),
 ];
 
@@ -824,11 +825,31 @@ fn test_error_codes_are_unique_across_contracts() {
 fn test_error_codes_are_in_allocated_ranges() {
     // Each contract's codes must fall strictly within its assigned range.
     let contract_codes: &[(&str, std::vec::Vec<u32>, u32, u32)] = &[
-        ("escrow",      collect_error_codes::<EscrowError>(),          1, 1_999),
-        ("permissions", collect_error_codes::<PermissionError>(),  2_000, 2_999),
-        ("reputation",  collect_error_codes::<ReputationError>(),  3_000, 3_999),
-        ("delegation",  collect_error_codes::<DelegationError>(),  4_000, 4_999),
-        ("marketplace", collect_error_codes::<MarketplaceError>(), 5_000, 5_999),
+        ("escrow", collect_error_codes::<EscrowError>(), 1, 1_999),
+        (
+            "permissions",
+            collect_error_codes::<PermissionError>(),
+            2_000,
+            2_999,
+        ),
+        (
+            "reputation",
+            collect_error_codes::<ReputationError>(),
+            3_000,
+            3_999,
+        ),
+        (
+            "delegation",
+            collect_error_codes::<DelegationError>(),
+            4_000,
+            4_999,
+        ),
+        (
+            "marketplace",
+            collect_error_codes::<MarketplaceError>(),
+            5_000,
+            5_999,
+        ),
     ];
 
     for (name, codes, lo, hi) in contract_codes {
@@ -859,7 +880,6 @@ fn test_error_code_ranges_are_pairwise_disjoint() {
         );
     }
 }
-
 
 /// Randomized cross-contract escrow lifecycle test (#524). One generated
 /// sequence contains 10,000 calls; invalid actions are deliberately included

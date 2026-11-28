@@ -25,9 +25,7 @@
 //! and a stealth key cannot be reused to link several reviews together.
 
 use crate::{ReputationError, PERSISTENT_BUMP_AMOUNT, PERSISTENT_BUMP_THRESHOLD};
-use soroban_sdk::{
-    contracttype, symbol_short, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol,
-};
+use soroban_sdk::{contracttype, symbol_short, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol};
 
 /// Upper bound on the encrypted review ciphertext, in bytes.
 pub const MAX_ENCRYPTED_PAYLOAD_LEN: u32 = 4_096;
@@ -215,9 +213,8 @@ pub fn submit_review(
 
     let count_key = Key::MerchantCount(merchant.clone());
     let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
-    env.storage()
-        .persistent()
-        .set(&count_key, &count.saturating_add(1));
+    let next_count = count.checked_add(1).ok_or(ReputationError::InvalidParam)?;
+    env.storage().persistent().set(&count_key, &next_count);
     bump(env, &count_key);
 
     env.events().publish(
@@ -247,15 +244,140 @@ pub fn review(env: &Env, review_id: u64) -> Option<AnonymousReview> {
 
 /// Number of anonymous reviews recorded for `merchant`.
 pub fn merchant_review_count(env: &Env, merchant: &Address) -> u64 {
-    env.storage()
-        .persistent()
-        .get(&Key::MerchantCount(merchant.clone()))
-        .unwrap_or(0)
+    let key = Key::MerchantCount(merchant.clone());
+    let count: Option<u64> = env.storage().persistent().get(&key);
+    if count.is_some() {
+        bump(env, &key);
+    }
+    count.unwrap_or(0)
 }
 
 /// Whether a ticket commitment is registered and not yet redeemed.
 pub fn is_ticket_live(env: &Env, commitment: &BytesN<32>) -> bool {
-    env.storage()
-        .persistent()
-        .has(&Key::Ticket(commitment.clone()))
+    let key = Key::Ticket(commitment.clone());
+    let live = env.storage().persistent().has(&key);
+    if live {
+        bump(env, &key);
+    }
+    live
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ReputationConfig, ReputationContract, ReputationContractClient};
+    use soroban_sdk::testutils::{storage::Persistent, Address as _, Ledger};
+
+    fn setup(env: &Env) -> (ReputationContractClient<'_>, Address, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let contract_id = env.register(
+            ReputationContract,
+            (
+                admin.clone(),
+                ReputationConfig {
+                    decay_window_seconds: 90 * 24 * 60 * 60,
+                    min_transactions_threshold: 5,
+                    dispute_penalty_bps: 500,
+                    freeze_threshold_flags: 3,
+                },
+            ),
+        );
+        (
+            ReputationContractClient::new(env, &contract_id),
+            contract_id,
+            admin,
+        )
+    }
+
+    #[test]
+    fn ticket_liveness_getter_tracks_issuance_and_redemption() {
+        let env = Env::default();
+        let (client, contract_id, _admin) = setup(&env);
+        let merchant = Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[7u8; 32]);
+
+        assert!(!client.is_anonymous_ticket_live(&commitment));
+        client.issue_anonymous_review_ticket(&merchant, &commitment);
+        assert!(client.is_anonymous_ticket_live(&commitment));
+
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .remove(&Key::Ticket(commitment.clone()));
+        });
+        assert!(!client.is_anonymous_ticket_live(&commitment));
+    }
+
+    #[test]
+    fn ticket_liveness_read_extends_ttl() {
+        let env = Env::default();
+        let (client, contract_id, _admin) = setup(&env);
+        let merchant = Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[11u8; 32]);
+        client.issue_anonymous_review_ticket(&merchant, &commitment);
+
+        env.as_contract(&contract_id, || {
+            env.storage().instance().extend_ttl(1_000_000, 1_000_000);
+        });
+        let initial = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&Key::Ticket(commitment.clone()))
+        });
+        env.ledger()
+            .with_mut(|li| li.sequence_number += initial - PERSISTENT_BUMP_THRESHOLD + 1);
+
+        let before = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&Key::Ticket(commitment.clone()))
+        });
+        assert!(client.is_anonymous_ticket_live(&commitment));
+        let after = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&Key::Ticket(commitment.clone()))
+        });
+        assert!(after > before);
+        assert!(after >= PERSISTENT_BUMP_AMOUNT);
+    }
+
+    #[test]
+    fn merchant_count_read_extends_ttl() {
+        let env = Env::default();
+        let (client, contract_id, _admin) = setup(&env);
+        let merchant = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let key = Key::MerchantCount(merchant.clone());
+            env.storage().persistent().set(&key, &3u64);
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+            env.storage().instance().extend_ttl(1_000_000, 1_000_000);
+        });
+        let initial = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&Key::MerchantCount(merchant.clone()))
+        });
+        env.ledger()
+            .with_mut(|li| li.sequence_number += initial - PERSISTENT_BUMP_THRESHOLD + 1);
+
+        let before = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&Key::MerchantCount(merchant.clone()))
+        });
+        assert_eq!(client.get_anon_review_count(&merchant), 3);
+        let after = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&Key::MerchantCount(merchant.clone()))
+        });
+        assert!(after > before);
+        assert!(after >= PERSISTENT_BUMP_AMOUNT);
+    }
 }

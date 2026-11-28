@@ -16,14 +16,25 @@ use soroban_sdk::{
     InvokeError, String, Symbol, Vec,
 };
 
-/// Storefront metadata storage and update support.
-pub mod storefront;
 /// Fee discount calculator for merchants staking platform governance tokens.
 pub mod fees;
+/// Single-use review attestations issued by escrow on release (issue #558).
+pub mod review_attestation;
+/// Storefront metadata storage and update support.
+pub mod storefront;
 pub use fees::*;
-pub mod oracle;
+pub use review_attestation::{
+    ReviewAttestation, ReviewAttestationConsumedEvent, ReviewAttestationIssuedEvent,
+    REVIEW_ATTESTATION_TTL_LEDGERS,
+};
 pub mod catalog;
+pub mod oracle;
 pub use oracle::*;
+/// Merchant security bond staking and slash enforcement (issue #551).
+pub mod bond;
+pub use bond::{
+    BondDepositedEvent, BondSlashedEvent, BondStakingTrait, MerchantBond, BOND_LOCK_PERIOD_SECS,
+};
 /// Listing storage TTL constants and metadata (issue #477).
 pub mod constants;
 pub use constants::*;
@@ -161,7 +172,7 @@ pub struct LiquidationReserve {
 /// Dispute reserve fund pool tracking a merchant's solvency against its open
 /// escrow book (issue #509).
 ///
-/// `reserve_balance_stroops` must cover `active_escrow_liability_stroops` at
+/// `reserve_balance_stroops` must cover `active_escrow_liability` at
 /// `reserve_ratio_basis_points` (e.g. `1000` == 10%) or new order intake is
 /// refused via [`MarketplaceContract::report_order_opened`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,7 +180,7 @@ pub struct LiquidationReserve {
 pub struct MerchantReservePool {
     pub merchant: Address,
     pub reserve_balance_stroops: i128,
-    pub active_escrow_liability_stroops: i128,
+    pub active_escrow_liability: i128,
     pub reserve_ratio_basis_points: u32,
 }
 
@@ -182,6 +193,7 @@ pub struct MerchantReservePool {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub struct ProductAttestation {
+    pub merchant_id: u64,
     pub product_id: u64,
     pub content_hash: BytesN<32>,
     pub committed_ledger: u32,
@@ -335,7 +347,7 @@ impl From<MerchantValidationError> for MarketplaceError {
 /// | `ReputationError`   | 2000..=2999      |
 /// | `DelegationError`   | 3000..=3999      |
 /// | `MarketplaceError`  | 4000..=5999      |
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum MarketplaceError {
@@ -424,7 +436,9 @@ pub enum MarketplaceError {
     /// Batch exceeds the maximum allowed listing count.
     BatchTooLarge = 4048,
     /// No [`CancellationPenaltyConfig`] has been set by the admin yet.
-    CancellationPenaltyNotConfigured = 4050,
+    CancellationPenaltyMissing = 4050,
+    /// Storefront metadata updates are blocked while the merchant is suspended.
+    MerchantSuspended = 4051,
     /// No dispute reserve pool has been configured for this merchant (issue #509).
     ReservePoolNotFound = 5031,
     /// Merchant's reserve balance does not cover the active escrow liability
@@ -436,9 +450,21 @@ pub enum MarketplaceError {
     InvalidReserveRatio = 5034,
     /// A product hash attestation has already been committed for this
     /// `product_id`; attestations are immutable once committed (issue #507).
-    ProductAttestationAlreadyCommitted = 5035,
+    AttestationAlreadyCommitted = 5035,
     /// No product hash attestation has been committed for this `product_id`.
     ProductAttestationNotFound = 5036,
+    /// A review attestation has already been issued for this order; an order
+    /// backs at most one attestation (issue #558).
+    ReviewAttestationAlreadyIssued = 5037,
+    /// No live review attestation exists for this order (never issued, or its
+    /// 30-day TTL expired) (issue #558).
+    ReviewAttestationNotFound = 5038,
+    /// The review attestation has already been consumed by a filed review and
+    /// cannot be used again (issue #558).
+    ReviewAttestationConsumed = 5039,
+    /// The buyer or merchant supplied with a review attestation does not match
+    /// the issued record (issue #558).
+    ReviewAttestationMismatch = 5040,
 }
 
 // ---------------------------------------------------------------------------
@@ -667,7 +693,7 @@ pub struct CancellationPenaltyConfig {
     pub penalty_amount_stroops: i128,
     /// Number of merchant-initiated cancellations tolerated before the
     /// merchant is automatically suspended.
-    pub max_cancellations_before_suspension: u32,
+    pub max_cancellations: u32,
 }
 
 #[contracttype]
@@ -825,6 +851,50 @@ pub struct MerchantPrunedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReservePoolConfiguredEvent {
+    pub merchant_id: u64,
+    pub admin: Address,
+    pub reserve_ratio_basis_points: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReservePoolToppedUpEvent {
+    pub merchant_id: u64,
+    pub merchant: Address,
+    pub amount: i128,
+    pub new_balance: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReservePoolWithdrawnEvent {
+    pub merchant_id: u64,
+    pub owner: Address,
+    pub amount: i128,
+    pub remaining_balance: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveOrderOpenedEvent {
+    pub merchant_id: u64,
+    pub reporter: Address,
+    pub order_amount: i128,
+    pub new_active_liability: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveOrderSettledEvent {
+    pub merchant_id: u64,
+    pub reporter: Address,
+    pub order_amount: i128,
+    pub new_active_liability: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommissionTier {
     pub min_settled_volume: i128,
     pub commission_rate_bps: u32,
@@ -878,7 +948,7 @@ pub struct SkuInventory {
 
 // --- Storage Keys ---
 
-#[contracttype]
+#[contracttype(export = false)]
 pub enum DataKey {
     Admin,
     PendingAdmin,
@@ -962,7 +1032,28 @@ pub enum DataKey {
     /// Dispute reserve fund pool for a merchant (issue #509).
     MerchantReservePool(u64),
     /// Immutable product hash attestation committed at checkout time (issue #507).
-    ProductAttestation(u64),
+    ///
+    /// Keyed by `(merchant_id, product_id)`: product ids are merchant-scoped,
+    /// so two merchants may attest the same numeric product id independently.
+    /// This replaces the globally keyed `ProductAttestation(u64)` layout, which
+    /// allowed one merchant to occupy another merchant's product id. Legacy
+    /// entries written under the old key are not reachable through this variant
+    /// and cannot be migrated unambiguously, because a bare `product_id` does
+    /// not identify the owning merchant; they must be re-committed.
+    ProductAttestation(u64, u64),
+    /// Single-use review attestation for a settled order (issue #558).
+    ///
+    /// Held in temporary storage with a 30-day TTL; see the
+    /// [`review_attestation`] module.
+    ReviewAttestation(u64),
+}
+
+/// Mirror of `EntityRole` from `delego-reputation` for cross-contract deserialization.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntityRole {
+    Merchant,
+    BuyerAgent,
 }
 
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.
@@ -970,6 +1061,7 @@ pub enum DataKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExternalReputationScore {
     pub entity: Address,
+    pub role: EntityRole,
     pub score: u32,
     pub total_transactions: u64,
     pub successful_transactions: u64,
@@ -1103,14 +1195,6 @@ pub const MAX_VERIFIERS: u32 = 50;
 
 /// Minimum settlement amount (in stroops) that triggers a liquidation reserve.
 /// Orders below this threshold are exempt from the 10% reserve requirement.
-pub const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_000; // 100 XLM
-
-/// Fraction of the settlement amount held as a liquidation reserve, in basis points.
-/// 1000 bps = 10%.
-pub const RESERVE_BPS: u32 = 1000;
-
-/// Number of ledgers the liquidation reserve is locked before the merchant can withdraw.
-/// ~24 hours at 5 s/ledger.
 pub const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_000; // 100 XLM
 
 /// Fraction of a high-value settlement held as a liquidation reserve, in basis points.
@@ -1682,6 +1766,14 @@ impl MarketplaceContract {
         content_hash: BytesN<32>,
     ) -> Result<(), MarketplaceError> {
         storefront::set_storefront_metadata(env, merchant_id, caller, ipfs_cid, content_hash)
+    }
+
+    /// Retrieves stored storefront metadata for the given merchant, if present.
+    pub fn get_storefront_metadata(
+        env: Env,
+        merchant_id: u64,
+    ) -> Result<storefront::StorefrontMetadata, MarketplaceError> {
+        storefront::get_storefront_metadata(env, merchant_id)
     }
 
     // --- Category Management ---
@@ -2371,8 +2463,7 @@ impl MarketplaceContract {
 
         // Check merchant status - must be active (Verified or Registered)
         match merchant.status {
-            MerchantStatus::Verified | MerchantStatus::Registered => {
-            }
+            MerchantStatus::Verified | MerchantStatus::Registered => {}
             MerchantStatus::Suspended => return Err(MarketplaceError::MerchantFrozen),
             MerchantStatus::Closed => return Err(MarketplaceError::MerchantClosed),
             MerchantStatus::Banned => return Err(MarketplaceError::MerchantBanned),
@@ -2986,9 +3077,16 @@ impl MarketplaceContract {
     /// the insurance pool so no tokens are left behind.
     pub fn route_fee_disbursements(
         env: Env,
+        admin: Address,
         token: Address,
         amount: i128,
     ) -> Result<(), MarketplaceError> {
+        // Authenticate the caller - admin only
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone())? {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
         if amount <= 0 {
             return Err(MarketplaceError::InvalidParam);
         }
@@ -3190,7 +3288,7 @@ impl MarketplaceContract {
         if config.penalty_amount_stroops <= 0 {
             return Err(MarketplaceError::InvalidParam);
         }
-        if config.max_cancellations_before_suspension == 0 {
+        if config.max_cancellations == 0 {
             return Err(MarketplaceError::InvalidParam);
         }
         env.storage()
@@ -3208,7 +3306,7 @@ impl MarketplaceContract {
 
     /// Return the number of penalised merchant-initiated cancellations
     /// charged against `merchant_id` so far.
-    pub fn get_merchant_cancellation_strikes(env: Env, merchant_id: u64) -> u32 {
+    pub fn get_cancellation_strikes(env: Env, merchant_id: u64) -> u32 {
         env.storage()
             .persistent()
             .get(&DataKey::MerchantCancellationStrikes(merchant_id))
@@ -3220,7 +3318,7 @@ impl MarketplaceContract {
     /// merchant's staked registration deposit and pays it to `buyer` as
     /// compensation for the inconvenience, then increments the merchant's
     /// strike counter. Once the strike counter reaches
-    /// `max_cancellations_before_suspension`, the merchant is automatically
+    /// `max_cancellations`, the merchant is automatically
     /// suspended exactly like [`Self::suspend_merchant`] would.
     ///
     /// Callable only by the platform admin or the configured authorized
@@ -3232,7 +3330,7 @@ impl MarketplaceContract {
     /// # Errors
     /// * [`MarketplaceError::Unauthorized`] — caller is neither admin nor the
     ///   authorized escrow contract.
-    /// * [`MarketplaceError::CancellationPenaltyNotConfigured`] — no config
+    /// * [`MarketplaceError::CancellationPenaltyMissing`] — no config
     ///   has been set via [`Self::set_cancellation_penalty_config`].
     /// * [`MarketplaceError::MerchantClosed`] / [`MarketplaceError::MerchantBanned`]
     ///   — merchant is not in a state that can be penalised further.
@@ -3263,7 +3361,7 @@ impl MarketplaceContract {
             .storage()
             .instance()
             .get(&DataKey::CancellationPenaltyConfig)
-            .ok_or(MarketplaceError::CancellationPenaltyNotConfigured)?;
+            .ok_or(MarketplaceError::CancellationPenaltyMissing)?;
 
         let deposit_amount: i128 = env
             .storage()
@@ -3314,7 +3412,7 @@ impl MarketplaceContract {
         );
 
         let mut auto_suspended = false;
-        if strike_count >= config.max_cancellations_before_suspension
+        if strike_count >= config.max_cancellations
             && merchant.status != MerchantStatus::Suspended
             && merchant.status != MerchantStatus::Inactive
         {
@@ -3348,7 +3446,11 @@ impl MarketplaceContract {
         }
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("cnclpen"), merchant_id),
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("cnclpen"),
+                merchant_id,
+            ),
             MerchantCancellationPenalizedEvent {
                 merchant_id,
                 buyer,
@@ -3662,17 +3764,36 @@ impl MarketplaceContract {
 
         let key = DataKey::MerchantReservePool(merchant_id);
         let mut pool: MerchantReservePool =
-            env.storage().persistent().get(&key).unwrap_or(MerchantReservePool {
-                merchant: owner,
-                reserve_balance_stroops: 0,
-                active_escrow_liability_stroops: 0,
-                reserve_ratio_basis_points,
-            });
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(MerchantReservePool {
+                    merchant: owner,
+                    reserve_balance_stroops: 0,
+                    active_escrow_liability: 0,
+                    reserve_ratio_basis_points,
+                });
         pool.reserve_ratio_basis_points = reserve_ratio_basis_points;
         env.storage().persistent().set(&key, &pool);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("res_cfg"),
+                merchant_id,
+            ),
+            ReservePoolConfiguredEvent {
+                merchant_id,
+                admin,
+                reserve_ratio_basis_points,
+            },
+        );
+
         Ok(pool)
     }
 
@@ -3705,21 +3826,116 @@ impl MarketplaceContract {
 
         let key = DataKey::MerchantReservePool(merchant_id);
         let mut pool: MerchantReservePool =
-            env.storage().persistent().get(&key).unwrap_or(MerchantReservePool {
-                merchant: merchant_owner,
-                reserve_balance_stroops: 0,
-                active_escrow_liability_stroops: 0,
-                reserve_ratio_basis_points: DEFAULT_RESERVE_RATIO_BPS,
-            });
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(MerchantReservePool {
+                    merchant: merchant_owner.clone(),
+                    reserve_balance_stroops: 0,
+                    active_escrow_liability: 0,
+                    reserve_ratio_basis_points: DEFAULT_RESERVE_RATIO_BPS,
+                });
         pool.reserve_balance_stroops = pool
             .reserve_balance_stroops
             .checked_add(amount)
             .ok_or(MarketplaceError::InvalidReserveAmount)?;
         env.storage().persistent().set(&key, &pool);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("res_top"),
+                merchant_id,
+            ),
+            ReservePoolToppedUpEvent {
+                merchant_id,
+                merchant: merchant_owner,
+                amount,
+                new_balance: pool.reserve_balance_stroops,
+            },
+        );
+
         Ok(pool.reserve_balance_stroops)
+    }
+
+    /// Merchant withdrawal of excess dispute reserve funds above active order coverage requirements.
+    pub fn withdraw_reserve_pool(
+        env: Env,
+        owner: Address,
+        merchant_id: u64,
+        amount: i128,
+    ) -> Result<(), MarketplaceError> {
+        owner.require_auth();
+        if amount <= 0 {
+            return Err(MarketplaceError::InvalidReserveAmount);
+        }
+
+        let merchant_record = Self::get_merchant(env.clone(), merchant_id)?;
+        if merchant_record.owner.as_ref() != Some(&owner) {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        let key = DataKey::MerchantReservePool(merchant_id);
+        let mut pool: MerchantReservePool = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(MarketplaceError::ReservePoolNotFound)?;
+
+        if pool.reserve_balance_stroops < amount {
+            return Err(MarketplaceError::InsufficientReserveCoverage);
+        }
+
+        let remaining_balance = pool
+            .reserve_balance_stroops
+            .checked_sub(amount)
+            .ok_or(MarketplaceError::InvalidReserveAmount)?;
+
+        let required_reserve = pool
+            .active_escrow_liability
+            .checked_mul(pool.reserve_ratio_basis_points as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(MarketplaceError::InvalidReserveAmount)?;
+
+        if remaining_balance < required_reserve {
+            return Err(MarketplaceError::InsufficientReserveCoverage);
+        }
+
+        let (_, deposit_token) = Self::get_merchant_deposit(env.clone(), merchant_id)
+            .ok_or(MarketplaceError::DepositNotFound)?;
+
+        use soroban_sdk::token;
+        let token_client = token::Client::new(&env, &deposit_token);
+        token_client.transfer(&env.current_contract_address(), &owner, &amount);
+
+        pool.reserve_balance_stroops = remaining_balance;
+        env.storage().persistent().set(&key, &pool);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("res_wdr"),
+                merchant_id,
+            ),
+            ReservePoolWithdrawnEvent {
+                merchant_id,
+                owner,
+                amount,
+                remaining_balance,
+            },
+        );
+
+        Ok(())
     }
 
     /// Reports that a new escrow order of `order_amount` was opened against
@@ -3753,15 +3969,18 @@ impl MarketplaceContract {
 
         let key = DataKey::MerchantReservePool(merchant_id);
         let mut pool: MerchantReservePool =
-            env.storage().persistent().get(&key).unwrap_or(MerchantReservePool {
-                merchant: owner,
-                reserve_balance_stroops: 0,
-                active_escrow_liability_stroops: 0,
-                reserve_ratio_basis_points: DEFAULT_RESERVE_RATIO_BPS,
-            });
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(MerchantReservePool {
+                    merchant: owner,
+                    reserve_balance_stroops: 0,
+                    active_escrow_liability: 0,
+                    reserve_ratio_basis_points: DEFAULT_RESERVE_RATIO_BPS,
+                });
 
         let projected_liability = pool
-            .active_escrow_liability_stroops
+            .active_escrow_liability
             .checked_add(order_amount)
             .ok_or(MarketplaceError::InvalidReserveAmount)?;
         let required_reserve = projected_liability
@@ -3773,11 +3992,28 @@ impl MarketplaceContract {
             return Err(MarketplaceError::InsufficientReserveCoverage);
         }
 
-        pool.active_escrow_liability_stroops = projected_liability;
+        pool.active_escrow_liability = projected_liability;
         env.storage().persistent().set(&key, &pool);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("res_opn"),
+                merchant_id,
+            ),
+            ReserveOrderOpenedEvent {
+                merchant_id,
+                reporter,
+                order_amount,
+                new_active_liability: pool.active_escrow_liability,
+            },
+        );
+
         Ok(())
     }
 
@@ -3806,12 +4042,28 @@ impl MarketplaceContract {
             .get(&key)
             .ok_or(MarketplaceError::ReservePoolNotFound)?;
 
-        pool.active_escrow_liability_stroops =
-            (pool.active_escrow_liability_stroops - order_amount).max(0);
+        pool.active_escrow_liability = (pool.active_escrow_liability - order_amount).max(0);
         env.storage().persistent().set(&key, &pool);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("res_stl"),
+                merchant_id,
+            ),
+            ReserveOrderSettledEvent {
+                merchant_id,
+                reporter,
+                order_amount,
+                new_active_liability: pool.active_escrow_liability,
+            },
+        );
+
         Ok(())
     }
 
@@ -3823,12 +4075,14 @@ impl MarketplaceContract {
     // claim the buyer agreed to different terms. The commitment is
     // write-once: there is no update entry point.
 
-    /// Commits `content_hash` for `product_id`, immutably. Requires an auth
-    /// entry from `merchant`, who must be the registered owner of
-    /// `merchant_id`. Fails with
-    /// [`MarketplaceError::ProductAttestationAlreadyCommitted`] if this
-    /// `product_id` already has a commitment — attestations cannot be
-    /// overwritten.
+    /// Commits `content_hash` for `(merchant_id, product_id)`, immutably.
+    /// Requires an auth entry from `merchant`, who must be the registered
+    /// owner of `merchant_id`, and the merchant must be operational
+    /// (`Registered` or `Verified`). Fails with
+    /// [`MarketplaceError::AttestationAlreadyCommitted`] if this
+    /// merchant has already attested `product_id` — attestations cannot be
+    /// overwritten. Product ids are merchant-scoped, so different merchants
+    /// can attest the same `product_id` independently.
     pub fn commit_product_attestation(
         env: Env,
         merchant: Address,
@@ -3841,22 +4095,34 @@ impl MarketplaceContract {
         if merchant_record.owner.as_ref() != Some(&merchant) {
             return Err(MarketplaceError::Unauthorized);
         }
+        match merchant_record.status {
+            MerchantStatus::Registered | MerchantStatus::Verified => {}
+            MerchantStatus::Suspended => return Err(MarketplaceError::MerchantFrozen),
+            MerchantStatus::Closed => return Err(MarketplaceError::MerchantClosed),
+            MerchantStatus::Banned => return Err(MarketplaceError::MerchantBanned),
+            MerchantStatus::Inactive => return Err(MarketplaceError::MerchantInactive),
+            MerchantStatus::Maintenance => return Err(MarketplaceError::MaintenanceActive),
+            MerchantStatus::All => return Err(MarketplaceError::InvalidParam),
+        }
 
-        let key = DataKey::ProductAttestation(product_id);
+        let key = DataKey::ProductAttestation(merchant_id, product_id);
         if env.storage().persistent().has(&key) {
-            return Err(MarketplaceError::ProductAttestationAlreadyCommitted);
+            return Err(MarketplaceError::AttestationAlreadyCommitted);
         }
 
         let committed_ledger = env.ledger().sequence();
         let attestation = ProductAttestation {
+            merchant_id,
             product_id,
             content_hash: content_hash.clone(),
             committed_ledger,
         };
         env.storage().persistent().set(&key, &attestation);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         env.events().publish(
             (
@@ -3875,31 +4141,39 @@ impl MarketplaceContract {
         Ok(())
     }
 
-    /// Returns the committed attestation for `product_id`, if any.
-    pub fn get_product_attestation(env: Env, product_id: u64) -> Option<ProductAttestation> {
+    /// Returns the attestation committed by `merchant_id` for `product_id`,
+    /// if any. The merchant id is part of the key, so this can never return
+    /// another merchant's attestation for the same product id.
+    pub fn get_product_attestation(
+        env: Env,
+        merchant_id: u64,
+        product_id: u64,
+    ) -> Option<ProductAttestation> {
         env.storage()
             .persistent()
-            .get(&DataKey::ProductAttestation(product_id))
+            .get(&DataKey::ProductAttestation(merchant_id, product_id))
     }
 
     /// Cryptographically verifies that `expected_hash` matches the hash
-    /// committed on-chain for `product_id` at checkout time.
+    /// committed on-chain by `merchant_id` for `product_id` at checkout time.
     ///
     /// Used by dispute arbitrators to cross-reference the merchant's current
     /// claims against the immutable original commitment, and by buyers to
     /// independently confirm their order matches what was anchored at
     /// purchase time. Fails with
-    /// [`MarketplaceError::ProductAttestationNotFound`] if nothing was ever
-    /// committed for `product_id`.
+    /// [`MarketplaceError::ProductAttestationNotFound`] if that merchant never
+    /// committed an attestation for `product_id`; attestations belonging to a
+    /// different merchant are never consulted.
     pub fn verify_product_attestation(
         env: Env,
+        merchant_id: u64,
         product_id: u64,
         expected_hash: BytesN<32>,
     ) -> Result<bool, MarketplaceError> {
         let attestation: ProductAttestation = env
             .storage()
             .persistent()
-            .get(&DataKey::ProductAttestation(product_id))
+            .get(&DataKey::ProductAttestation(merchant_id, product_id))
             .ok_or(MarketplaceError::ProductAttestationNotFound)?;
         Ok(attestation.content_hash == expected_hash)
     }
@@ -5876,6 +6150,60 @@ impl MarketplaceContract {
         catalog::get_authorized_escrow(env)
     }
 
+    // -----------------------------------------------------------------------
+    // Review attestations (issue #558) — delegates to the review_attestation
+    // module
+    // -----------------------------------------------------------------------
+
+    /// Issue a single-use review attestation for a released order.
+    ///
+    /// Callable only by the configured escrow contract or the admin.
+    ///
+    /// See [`review_attestation::issue_review_attestation`] for full
+    /// documentation.
+    pub fn issue_review_attestation(
+        env: Env,
+        caller: Address,
+        order_id: u64,
+        buyer: Address,
+        merchant: Address,
+    ) -> Result<ReviewAttestation, MarketplaceError> {
+        review_attestation::issue_review_attestation(env, caller, order_id, buyer, merchant)
+    }
+
+    /// Return the live review attestation for `order_id`, if any.
+    pub fn get_review_attestation(env: Env, order_id: u64) -> Option<ReviewAttestation> {
+        review_attestation::get_review_attestation(env, order_id)
+    }
+
+    /// Whether `buyer` holds an unconsumed attestation for `order_id` with
+    /// `merchant`. Read-only: verifying never burns the attestation.
+    pub fn verify_review_attestation(
+        env: Env,
+        order_id: u64,
+        buyer: Address,
+        merchant: Address,
+    ) -> bool {
+        review_attestation::verify_review_attestation(env, order_id, buyer, merchant)
+    }
+
+    /// Verify a review attestation and mark it consumed, returning the
+    /// consumed record.
+    ///
+    /// Callable only by the configured reputation contract or the admin.
+    ///
+    /// See [`review_attestation::consume_review_attestation`] for full
+    /// documentation.
+    pub fn consume_review_attestation(
+        env: Env,
+        caller: Address,
+        order_id: u64,
+        buyer: Address,
+        merchant: Address,
+    ) -> Result<ReviewAttestation, MarketplaceError> {
+        review_attestation::consume_review_attestation(env, caller, order_id, buyer, merchant)
+    }
+
     /// Return the [`catalog::SkuRecord`] for `(merchant_id, sku_id)`.
     pub fn get_sku_record(
         env: Env,
@@ -5888,6 +6216,9 @@ impl MarketplaceContract {
     /// Return all SKU IDs in the catalog for `merchant_id`.
     pub fn get_merchant_catalog(env: Env, merchant_id: u64) -> Vec<Symbol> {
         catalog::get_merchant_catalog(env, merchant_id)
+    }
+
+    // -----------------------------------------------------------------------
     // Bulk Listing Registration (issue #559) — delegates to catalog module
     // -----------------------------------------------------------------------
 
@@ -6011,7 +6342,7 @@ mod error_code_uniqueness_tests {
     const DELEGATION_ERROR_RANGE: (u32, u32) = (3000, 3999);
     const MARKETPLACE_ERROR_RANGE: (u32, u32) = (4000, 5999);
 
-    fn marketplace_error_codes() -> [u32; 50] {
+    fn marketplace_error_codes() -> [u32; 51] {
         [
             MarketplaceError::AlreadyInitialized as u32,
             MarketplaceError::NotInitialized as u32,
@@ -6699,7 +7030,7 @@ mod merchant_operational_view_tests {
 #[cfg(test)]
 mod listing_ttl_tests {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::testutils::{storage::Persistent as _, Address as _, Ledger};
 
     struct Ctx {
         env: Env,
@@ -6727,8 +7058,7 @@ mod listing_ttl_tests {
             metadata_uri: None,
             required_verifications: 0,
         };
-        let merchant_id =
-            testutil::register_merchant_with_deposit(&env, &client, &owner, &params);
+        let merchant_id = testutil::register_merchant_with_deposit(&env, &client, &owner, &params);
         let sku = Symbol::new(&env, "ttl_item");
         let mut listings = Vec::new(&env);
         listings.push_back(catalog::ListingParams {
@@ -6738,7 +7068,21 @@ mod listing_ttl_tests {
             initial_stock: 5,
         });
         client.batch_register_listings(&owner, &listings);
-        Ctx { env, id, client, owner, merchant_id, sku }
+        // Keep the contract instance alive across the eviction windows these
+        // tests advance through; the host refuses calls once it is archived.
+        env.as_contract(&id, || {
+            env.storage()
+                .instance()
+                .extend_ttl(LISTING_BUMP_LEDGERS * 5, LISTING_BUMP_LEDGERS * 6)
+        });
+        Ctx {
+            env,
+            id,
+            client,
+            owner,
+            merchant_id,
+            sku,
+        }
     }
 
     fn listing_ttl(ctx: &Ctx) -> u32 {
@@ -6764,12 +7108,18 @@ mod listing_ttl_tests {
     fn reads_bump_listing_ttl_across_eviction_window() {
         let ctx = setup();
         // Cross the threshold, read, then outlive the original expiry.
-        advance(&ctx.env, LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1);
+        advance(
+            &ctx.env,
+            LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1,
+        );
         assert!(listing_ttl(&ctx) < LISTING_THRESHOLD_LEDGERS);
         ctx.client.get_listing(&ctx.merchant_id, &ctx.sku);
         assert_eq!(listing_ttl(&ctx), LISTING_BUMP_LEDGERS);
 
-        advance(&ctx.env, LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1);
+        advance(
+            &ctx.env,
+            LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1,
+        );
         let listing = ctx.client.get_listing(&ctx.merchant_id, &ctx.sku);
         assert_eq!(listing.available_stock, 5);
         assert_eq!(ctx.client.get_merchant_listings(&ctx.merchant_id).len(), 1);
@@ -6778,7 +7128,10 @@ mod listing_ttl_tests {
     #[test]
     fn bump_listing_ttl_refreshes_and_returns_metadata() {
         let ctx = setup();
-        advance(&ctx.env, LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1);
+        advance(
+            &ctx.env,
+            LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1,
+        );
         let meta = ctx.client.bump_listing_ttl(&ctx.merchant_id, &ctx.sku);
         assert_eq!(listing_ttl(&ctx), LISTING_BUMP_LEDGERS);
         assert_eq!(meta.merchant, ctx.owner);
@@ -6809,8 +7162,12 @@ mod listing_ttl_tests {
             &10u32,
         );
         let admin = ctx.client.get_admin();
-        advance(&ctx.env, LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1);
-        ctx.client.decrement_stock(&admin, &ctx.merchant_id, &sku, &1u32);
+        advance(
+            &ctx.env,
+            LISTING_BUMP_LEDGERS - LISTING_THRESHOLD_LEDGERS + 1,
+        );
+        ctx.client
+            .decrement_stock(&admin, &ctx.merchant_id, &sku, &1u32);
         let ttl = ctx.env.as_contract(&ctx.id, || {
             ctx.env
                 .storage()
@@ -6818,5 +7175,398 @@ mod listing_ttl_tests {
                 .get_ttl(&DataKey::SkuRecord(ctx.merchant_id, sku.clone()))
         });
         assert_eq!(ttl, LISTING_BUMP_LEDGERS);
+    }
+}
+
+#[cfg(test)]
+mod product_attestation_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    struct Ctx {
+        env: Env,
+        client: MarketplaceContractClient<'static>,
+        admin: Address,
+    }
+
+    fn setup() -> Ctx {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+        Ctx { env, client, admin }
+    }
+
+    fn params(env: &Env, name: &str, required_verifications: u32) -> RegisterParams {
+        RegisterParams {
+            name: String::from_str(env, name),
+            description: String::from_str(env, "attestation test merchant"),
+            category: symbol_short!("retail"),
+            image_url: String::from_str(env, "https://example.com/img.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications,
+        }
+    }
+
+    fn register(ctx: &Ctx, name: &str, required_verifications: u32) -> (Address, u64) {
+        let owner = Address::generate(&ctx.env);
+        let id = testutil::register_merchant_with_deposit(
+            &ctx.env,
+            &ctx.client,
+            &owner,
+            &params(&ctx.env, name, required_verifications),
+        );
+        (owner, id)
+    }
+
+    fn hash(env: &Env, byte: u8) -> BytesN<32> {
+        BytesN::from_array(env, &[byte; 32])
+    }
+
+    #[test]
+    fn merchants_can_independently_attest_same_product_id() {
+        let ctx = setup();
+        let (owner_a, merchant_a) = register(&ctx, "Merchant A", 0);
+        let (owner_b, merchant_b) = register(&ctx, "Merchant B", 0);
+        let product_id = 7u64;
+
+        ctx.client.commit_product_attestation(
+            &owner_a,
+            &merchant_a,
+            &product_id,
+            &hash(&ctx.env, 1),
+        );
+        ctx.client.commit_product_attestation(
+            &owner_b,
+            &merchant_b,
+            &product_id,
+            &hash(&ctx.env, 2),
+        );
+
+        let attestation_a = ctx
+            .client
+            .get_product_attestation(&merchant_a, &product_id)
+            .expect("merchant A attestation");
+        let attestation_b = ctx
+            .client
+            .get_product_attestation(&merchant_b, &product_id)
+            .expect("merchant B attestation");
+
+        assert_eq!(attestation_a.merchant_id, merchant_a);
+        assert_eq!(attestation_a.product_id, product_id);
+        assert_eq!(attestation_a.content_hash, hash(&ctx.env, 1));
+        assert_eq!(attestation_b.merchant_id, merchant_b);
+        assert_eq!(attestation_b.product_id, product_id);
+        assert_eq!(attestation_b.content_hash, hash(&ctx.env, 2));
+
+        assert!(ctx.client.verify_product_attestation(
+            &merchant_a,
+            &product_id,
+            &hash(&ctx.env, 1)
+        ));
+        assert!(ctx.client.verify_product_attestation(
+            &merchant_b,
+            &product_id,
+            &hash(&ctx.env, 2)
+        ));
+        assert!(!ctx.client.verify_product_attestation(
+            &merchant_a,
+            &product_id,
+            &hash(&ctx.env, 2)
+        ));
+    }
+
+    #[test]
+    fn one_merchant_cannot_read_or_verify_anothers_attestation() {
+        let ctx = setup();
+        let (owner_a, merchant_a) = register(&ctx, "Merchant A", 0);
+        let (_owner_b, merchant_b) = register(&ctx, "Merchant B", 0);
+        let product_id = 11u64;
+
+        ctx.client.commit_product_attestation(
+            &owner_a,
+            &merchant_a,
+            &product_id,
+            &hash(&ctx.env, 5),
+        );
+
+        // Merchant B has no attestation for the same product id.
+        assert!(ctx
+            .client
+            .get_product_attestation(&merchant_b, &product_id)
+            .is_none());
+        assert_eq!(
+            ctx.client
+                .try_verify_product_attestation(&merchant_b, &product_id, &hash(&ctx.env, 5)),
+            Err(Ok(MarketplaceError::ProductAttestationNotFound))
+        );
+    }
+
+    #[test]
+    fn duplicate_commit_for_same_merchant_and_product_is_rejected() {
+        let ctx = setup();
+        let (owner, merchant_id) = register(&ctx, "Merchant", 0);
+        let product_id = 3u64;
+
+        ctx.client.commit_product_attestation(
+            &owner,
+            &merchant_id,
+            &product_id,
+            &hash(&ctx.env, 1),
+        );
+        assert_eq!(
+            ctx.client.try_commit_product_attestation(
+                &owner,
+                &merchant_id,
+                &product_id,
+                &hash(&ctx.env, 2)
+            ),
+            Err(Ok(MarketplaceError::AttestationAlreadyCommitted))
+        );
+        // Original commitment is unchanged.
+        assert_eq!(
+            ctx.client
+                .get_product_attestation(&merchant_id, &product_id)
+                .unwrap()
+                .content_hash,
+            hash(&ctx.env, 1)
+        );
+    }
+
+    #[test]
+    fn registered_and_verified_merchants_can_commit() {
+        let ctx = setup();
+        let (registered_owner, registered_id) = register(&ctx, "Registered", 1);
+
+        let (verified_owner, verified_id) = register(&ctx, "Verified", 1);
+        let verifier = Address::generate(&ctx.env);
+        ctx.client.add_verifier(
+            &ctx.admin,
+            &Verifier {
+                address: verifier.clone(),
+                label: symbol_short!("verif"),
+                registered_at: ctx.env.ledger().sequence() as u64,
+            },
+        );
+        ctx.client.verify_merchant(&verified_id, &verifier);
+
+        assert_eq!(
+            ctx.client.get_merchant(&registered_id).status,
+            MerchantStatus::Registered
+        );
+        assert_eq!(
+            ctx.client.get_merchant(&verified_id).status,
+            MerchantStatus::Verified
+        );
+
+        ctx.client.commit_product_attestation(
+            &registered_owner,
+            &registered_id,
+            &1u64,
+            &hash(&ctx.env, 1),
+        );
+        ctx.client.commit_product_attestation(
+            &verified_owner,
+            &verified_id,
+            &1u64,
+            &hash(&ctx.env, 2),
+        );
+
+        assert!(ctx
+            .client
+            .get_product_attestation(&registered_id, &1u64)
+            .is_some());
+        assert!(ctx
+            .client
+            .get_product_attestation(&verified_id, &1u64)
+            .is_some());
+    }
+
+    #[test]
+    fn non_operational_merchants_are_rejected_without_persisting() {
+        let ctx = setup();
+        let (suspended_owner, suspended_id) = register(&ctx, "Suspended", 1);
+        let (banned_owner, banned_id) = register(&ctx, "Banned", 1);
+        let (closed_owner, closed_id) = register(&ctx, "Closed", 1);
+
+        ctx.client.suspend_merchant(&ctx.admin, &suspended_id);
+        ctx.client.ban_merchant(&ctx.admin, &banned_id);
+        ctx.client
+            .close_merchant(&ctx.admin, &closed_id, &Symbol::new(&ctx.env, "test"));
+
+        assert_eq!(
+            ctx.client.try_commit_product_attestation(
+                &suspended_owner,
+                &suspended_id,
+                &9u64,
+                &hash(&ctx.env, 1)
+            ),
+            Err(Ok(MarketplaceError::MerchantFrozen))
+        );
+        assert_eq!(
+            ctx.client.try_commit_product_attestation(
+                &banned_owner,
+                &banned_id,
+                &9u64,
+                &hash(&ctx.env, 2)
+            ),
+            Err(Ok(MarketplaceError::MerchantBanned))
+        );
+        assert_eq!(
+            ctx.client.try_commit_product_attestation(
+                &closed_owner,
+                &closed_id,
+                &9u64,
+                &hash(&ctx.env, 3)
+            ),
+            Err(Ok(MarketplaceError::MerchantClosed))
+        );
+
+        for merchant_id in [suspended_id, banned_id, closed_id] {
+            assert!(ctx
+                .client
+                .get_product_attestation(&merchant_id, &9u64)
+                .is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod reputation_cross_contract_tests {
+    use super::*;
+    use delego_reputation::{
+        ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
+    };
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{Address, Env, String, Symbol};
+
+    #[test]
+    fn get_merchant_view_detailed_resolves_reputation() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        // Deploy reputation contract with a threshold of 1 so the score is unmasked.
+        let rep_admin = Address::generate(&env);
+        let rep_id = env.register(
+            ReputationContract,
+            (
+                rep_admin.clone(),
+                ReputationConfig {
+                    decay_window_seconds: 90 * 24 * 60 * 60,
+                    min_transactions_threshold: 1,
+                    dispute_penalty_bps: 500,
+                    freeze_threshold_flags: 3,
+                },
+            ),
+        );
+        let rep_client = ReputationContractClient::new(&env, &rep_id);
+
+        // Register a merchant and record one successful transaction so there
+        // is a reputation score to read back.
+        let owner = Address::generate(&env);
+        let (token_id, deposit) = crate::testutil::funded_registration_deposit(&env, &owner);
+        let merchant_id = client.register_merchant(
+            &owner,
+            &RegisterParams {
+                name: String::from_str(&env, "Cross-contract Merchant"),
+                description: String::from_str(&env, ""),
+                category: Symbol::new(&env, "general"),
+                image_url: String::from_str(&env, ""),
+                metadata: None,
+                metadata_uri: None,
+                required_verifications: 0,
+            },
+            &token_id,
+            &deposit,
+        );
+
+        rep_client.record_transaction(
+            &rep_admin,
+            &1u64,
+            &owner,
+            &Address::generate(&env),
+            &1_000i128,
+            &TransactionOutcome::Released,
+        );
+
+        // Wire the reputation contract to the merchant.
+        client.set_merchant_reputation(&admin, &merchant_id, &Some(rep_id.clone()));
+
+        // The detailed view must decode the cross-contract response without
+        // falling back to CallFailed.
+        let detailed = client.get_merchant_view_detailed(&merchant_id);
+        match detailed.reputation {
+            ReputationResolution::Available(score, _) => {
+                let expected = rep_client.get_reputation(&owner).score;
+                assert_eq!(score, expected);
+            }
+            other => panic!("expected ReputationResolution::Available, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_reserve_pool_withdrawal_and_coverage() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (&admin,));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let params = RegisterParams {
+            name: String::from_str(&env, "Reserve Merchant"),
+            description: String::from_str(&env, "Testing reserves"),
+            category: Symbol::new(&env, "general"),
+            image_url: String::from_str(&env, ""),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 0,
+        };
+
+        let (token_id, deposit) = testutil::funded_registration_deposit(&env, &owner);
+        let merchant_id = client.register_merchant(&owner, &params, &token_id, &deposit);
+
+        // Configure reserve pool (10% = 1000 bps)
+        client.configure_reserve_pool(&admin, &merchant_id, &1000);
+
+        // Mint extra token to owner and top up reserve pool
+        let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+        token.mint(&owner, &50_000);
+        client.top_up_reserve(&owner, &merchant_id, &50_000);
+
+        let pool = client.get_merchant_reserve_pool(&merchant_id).unwrap();
+        assert_eq!(pool.reserve_balance_stroops, 50_000);
+        assert_eq!(pool.active_escrow_liability, 0);
+
+        // Open an order with liability 200_000 -> required reserve = 20_000 (10%)
+        client.report_order_opened(&admin, &merchant_id, &200_000);
+        let pool = client.get_merchant_reserve_pool(&merchant_id).unwrap();
+        assert_eq!(pool.active_escrow_liability, 200_000);
+
+        // Withdraw 30_000 leaves 20_000 >= 20_000 (should succeed)
+        client.withdraw_reserve_pool(&owner, &merchant_id, &30_000);
+        let pool = client.get_merchant_reserve_pool(&merchant_id).unwrap();
+        assert_eq!(pool.reserve_balance_stroops, 20_000);
+
+        // Attempting to withdraw 1 more must fail with InsufficientReserveCoverage
+        let err = client.try_withdraw_reserve_pool(&owner, &merchant_id, &1);
+        assert_eq!(err, Err(Ok(MarketplaceError::InsufficientReserveCoverage)));
+
+        // Settle 100_000 of the order liability -> liability becomes 100_000, required = 10_000
+        client.report_order_settled(&admin, &merchant_id, &100_000);
+        let pool = client.get_merchant_reserve_pool(&merchant_id).unwrap();
+        assert_eq!(pool.active_escrow_liability, 100_000);
+
+        // Now can withdraw 10_000 more
+        client.withdraw_reserve_pool(&owner, &merchant_id, &10_000);
+        let pool = client.get_merchant_reserve_pool(&merchant_id).unwrap();
+        assert_eq!(pool.reserve_balance_stroops, 10_000);
     }
 }

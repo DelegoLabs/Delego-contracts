@@ -1452,7 +1452,7 @@ pub struct ArbiterTally {
 ```rust
 pub trait FlagReportingTrait {
     fn flag_review(env: Env, reporter: Address, review_id: u64, bond_amount: i128) -> Result<bool, ReputationError>;
-    fn resolve_flag(env: Env, arbiter: Address, flag_id: u64, upheld: bool) -> Result<bool, ReputationError>;
+    fn resolve_review_flag(env: Env, arbiter: Address, flag_id: u64, upheld: bool) -> Result<bool, ReputationError>;
 }
 ```
 

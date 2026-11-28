@@ -1,13 +1,11 @@
 use crate::{
     normalize_symbol, AdminAcceptedEvent, AdminProposedEvent, CategoryChange, CategoryEntry,
-    DataKey, MarketplaceContract, MarketplaceContractClient, MarketplaceError, Merchant,
-    MerchantCategoryChangedEvent, MerchantCursor, MerchantOperationalView,
+    CommissionTier, DataKey, MarketplaceContract, MarketplaceContractClient, MarketplaceError,
+    Merchant, MerchantCategoryChangedEvent, MerchantCursor, MerchantOperationalView,
     MerchantRegisteredEvent, MerchantStats, MerchantStatus, MerchantValidationError,
-    RegisterParams, VerificationPolicy, Verifier, VerifierPage,
-    MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN, MAX_METADATA_LEN, MAX_NAME_LEN, MAX_VERIFIERS,
-    CommissionTier, MerchantVolumeRecord,
-    TreasurySplitConfig, RESERVE_LOCK_LEDGERS,
-    VerifierPage, MAX_VERIFIERS,
+    MerchantVolumeRecord, RegisterParams, TreasurySplitConfig, VerificationPolicy, Verifier,
+    VerifierPage, VerifierPage, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN, MAX_METADATA_LEN,
+    MAX_NAME_LEN, MAX_VERIFIERS, MAX_VERIFIERS, RESERVE_LOCK_LEDGERS,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -1177,15 +1175,20 @@ fn test_commission_tier_defaults_and_configuration() {
         min_settled_volume: 0,
         commission_rate_bps: 400,
     });
-    let err = f
-        .client
-        .try_set_commission_tiers(&stranger, &new_tiers);
+    let err = f.client.try_set_commission_tiers(&stranger, &new_tiers);
     assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::Unauthorized);
 
     // Admin can reconfigure tiers.
     f.client.set_commission_tiers(&f.admin, &new_tiers);
     assert_eq!(f.client.get_commission_tiers().len(), 1);
-    assert_eq!(f.client.get_commission_tiers().get(0).unwrap().commission_rate_bps, 400);
+    assert_eq!(
+        f.client
+            .get_commission_tiers()
+            .get(0)
+            .unwrap()
+            .commission_rate_bps,
+        400
+    );
 }
 
 #[test]
@@ -1392,7 +1395,10 @@ fn test_merchant_operational_view_unregistered_merchant_not_found() {
     let f = TestFixture::setup();
 
     let err = f.client.try_get_merchant_operational_view(&999);
-    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::MerchantNotFound);
+    assert_eq!(
+        err.unwrap_err().unwrap(),
+        MarketplaceError::MerchantNotFound
+    );
 }
 
 #[test]
@@ -1947,7 +1953,7 @@ fn test_treasury_split_routes_fees_with_zero_residual() {
     let fee_amount: i128 = 10_000;
     token_client.mint(&f._contract_id, &fee_amount);
 
-    f.client.route_fee_disbursements(&fee_amount);
+    f.client.route_fee_disbursements(&f.admin, &token_id, &fee_amount);
 
     assert_eq!(token_client.balance(&dao), 7_000);
     assert_eq!(token_client.balance(&arbiter), 2_000);
@@ -1980,7 +1986,7 @@ fn test_treasury_split_remainder_routed_to_insurance_pool() {
     let fee_amount: i128 = 1_001;
     token_client.mint(&f._contract_id, &fee_amount);
 
-    f.client.route_fee_disbursements(&fee_amount);
+    f.client.route_fee_disbursements(&f.admin, &token_id, &fee_amount);
 
     let dao_share = fee_amount * 7_000 / 10_000;
     let arbiter_share = fee_amount * 2_000 / 10_000;
@@ -2013,6 +2019,77 @@ fn test_treasury_split_rejects_invalid_bps_sum() {
 }
 
 #[test]
+#[should_panic(expected = "HostError: Error(Auth, InvalidAction)")]
+fn test_route_fee_disbursements_requires_admin_auth() {
+    let f = TestFixture::setup();
+    let dao = Address::generate(&f.env);
+    let arbiter = Address::generate(&f.env);
+    let insurance = Address::generate(&f.env);
+    let unauthorized_user = Address::generate(&f.env);
+
+    let config = TreasurySplitConfig {
+        dao_treasury: dao.clone(),
+        dao_bps: 7_000,
+        arbiter_pool: arbiter.clone(),
+        arbiter_bps: 2_000,
+        insurance_pool: insurance.clone(),
+        insurance_bps: 1_000,
+    };
+    f.client.set_treasury_split_config(&f.admin, &config);
+
+    let (token_id, token_client) = deploy_token(&f.env, &f.admin);
+    f.client.set_fee_token(&f.admin, &token_id);
+
+    let fee_amount: i128 = 10_000;
+    token_client.mint(&f._contract_id, &fee_amount);
+
+    // This should panic because unauthorized_user is not the admin
+    f.client.route_fee_disbursements(&unauthorized_user, &token_id, &fee_amount);
+}
+
+#[test]
+fn test_route_fee_disbursements_rejects_non_admin() {
+    let f = TestFixture::setup();
+    let dao = Address::generate(&f.env);
+    let arbiter = Address::generate(&f.env);
+    let insurance = Address::generate(&f.env);
+    let unauthorized_user = Address::generate(&f.env);
+
+    let config = TreasurySplitConfig {
+        dao_treasury: dao.clone(),
+        dao_bps: 7_000,
+        arbiter_pool: arbiter.clone(),
+        arbiter_bps: 2_000,
+        insurance_pool: insurance.clone(),
+        insurance_bps: 1_000,
+    };
+    f.client.set_treasury_split_config(&f.admin, &config);
+
+    let (token_id, token_client) = deploy_token(&f.env, &f.admin);
+    f.client.set_fee_token(&f.admin, &token_id);
+
+    let fee_amount: i128 = 10_000;
+    token_client.mint(&f._contract_id, &fee_amount);
+
+    // Mock authorization for the unauthorized user
+    f.env.mock_all_auths();
+    
+    // This should return Unauthorized error
+    let err = f.client.try_route_fee_disbursements(&unauthorized_user, &token_id, &fee_amount);
+    
+    assert_eq!(
+        err.unwrap_err().unwrap(),
+        MarketplaceError::Unauthorized
+    );
+    
+    // Verify no funds were transferred
+    assert_eq!(token_client.balance(&dao), 0);
+    assert_eq!(token_client.balance(&arbiter), 0);
+    assert_eq!(token_client.balance(&insurance), 0);
+    assert_eq!(token_client.balance(&f._contract_id), fee_amount);
+}
+
+#[test]
 fn test_liquidation_reserve_locked_for_high_value_order() {
     let f = TestFixture::setup();
     let owner = Address::generate(&f.env);
@@ -2034,12 +2111,8 @@ fn test_liquidation_reserve_locked_for_high_value_order() {
     let order_id: u64 = 1;
     let order_value: i128 = 20_000;
     f.env.ledger().set_sequence_number(1_000);
-    f.client.lock_liquidation_reserve(
-        &merchant_id,
-        &order_id,
-        &order_value,
-        &buyer,
-    );
+    f.client
+        .lock_liquidation_reserve(&merchant_id, &order_id, &order_value, &buyer);
 
     let reserve = f
         .client
@@ -2147,8 +2220,7 @@ fn test_liquidation_reserve_can_be_liquidated_by_arbiter() {
     f.client.set_reserve_token(&f.admin, &token_id);
     token_client.mint(&f._contract_id, &2_000);
 
-    f.client
-        .liquidate_reserve(&arbiter, &order_id, &buyer);
+    f.client.liquidate_reserve(&arbiter, &order_id, &buyer);
 
     assert_eq!(token_client.balance(&buyer), 2_000);
     assert_eq!(token_client.balance(&f._contract_id), 0);
@@ -2909,7 +2981,7 @@ fn test_merchant_cancellation_penalty_deducts_bond_and_compensates_buyer() {
         &f.admin,
         &crate::CancellationPenaltyConfig {
             penalty_amount_stroops: 2_000_000,
-            max_cancellations_before_suspension: 2,
+            max_cancellations: 2,
         },
     );
 
@@ -2919,18 +2991,18 @@ fn test_merchant_cancellation_penalty_deducts_bond_and_compensates_buyer() {
     f.client
         .record_merchant_cancellation(&f.admin, &merchant_id, &buyer);
     assert_eq!(token_client.balance(&buyer), 2_000_000);
-    assert_eq!(f.client.get_merchant_cancellation_strikes(&merchant_id), 1);
+    assert_eq!(f.client.get_cancellation_strikes(&merchant_id), 1);
     assert_eq!(
         f.client.get_merchant(&merchant_id).status,
         MerchantStatus::Registered
     );
 
-    // Second cancellation reaches `max_cancellations_before_suspension`: the
+    // Second cancellation reaches `max_cancellations`: the
     // merchant is automatically suspended and the buyer is compensated again.
     f.client
         .record_merchant_cancellation(&f.admin, &merchant_id, &buyer);
     assert_eq!(token_client.balance(&buyer), 4_000_000);
-    assert_eq!(f.client.get_merchant_cancellation_strikes(&merchant_id), 2);
+    assert_eq!(f.client.get_cancellation_strikes(&merchant_id), 2);
     assert_eq!(
         f.client.get_merchant(&merchant_id).status,
         MerchantStatus::Suspended
@@ -2960,6 +3032,6 @@ fn test_merchant_cancellation_without_config_errors() {
         .try_record_merchant_cancellation(&f.admin, &merchant_id, &buyer);
     assert_eq!(
         result,
-        Err(Ok(MarketplaceError::CancellationPenaltyNotConfigured))
+        Err(Ok(MarketplaceError::CancellationPenaltyMissing))
     );
 }

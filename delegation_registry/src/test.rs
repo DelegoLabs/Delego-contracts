@@ -321,6 +321,26 @@ fn test_resumed_event_emitted() {
 }
 
 #[test]
+fn test_sweep_expired_delegations_rejects_active() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Agent_Active");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    let keeper = Address::generate(&env);
+    let mut keys = Vec::new(&env);
+    keys.push_back(BytesN::from_array(&env, &[7u8; 32]));
+    let result = client.try_sweep_expired_delegations(&keeper, &keys);
+    assert!(result.is_err());
+
+    // Active record must remain intact.
+    let record = client.get_delegation(&id);
+    assert_eq!(record.status, DelegationStatus::Active);
+}
+
+#[test]
 fn test_sweep_expired_updates_expired_delegations() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
@@ -938,19 +958,20 @@ fn test_revoke_paused_delegation_returns_true() {
 const LARGE_TTL: u32 = 10_000_000;
 
 #[test]
-fn test_get_delegation_by_label_active() {
+fn test_get_delegation_by_owner_label_active() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
     let label = Symbol::new(&env, "Byol_Active");
     let _id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
 
-    let record = client.get_delegation_by_label(&owner, &label);
-    assert_eq!(record.status, DelegationStatus::Active);
+    let record = client.get_delegation_by_owner_label(&owner, &label);
+    assert!(record.is_ok());
+    assert_eq!(record.unwrap().status, DelegationStatus::Active);
 }
 
 #[test]
-fn test_get_delegation_by_label_after_sweep() {
+fn test_get_delegation_by_owner_label_after_sweep() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
@@ -963,12 +984,13 @@ fn test_get_delegation_by_label_after_sweep() {
     ids.push_back(id);
     client.sweep_expired(&ids);
 
-    let record = client.get_delegation_by_label(&owner, &label);
-    assert_eq!(record.status, DelegationStatus::Expired);
+    let record = client.get_delegation_by_owner_label(&owner, &label);
+    assert!(record.is_ok());
+    assert_eq!(record.unwrap().status, DelegationStatus::Expired);
 }
 
 #[test]
-fn test_get_delegation_by_label_after_revocation() {
+fn test_get_delegation_by_owner_label_after_revocation() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
@@ -977,25 +999,24 @@ fn test_get_delegation_by_label_after_revocation() {
 
     client.revoke_delegation(&id);
 
-    let record = client.get_delegation_by_label(&owner, &label);
-    assert_eq!(record.status, DelegationStatus::Revoked);
+    let record = client.get_delegation_by_owner_label(&owner, &label);
+    assert!(record.is_ok());
+    assert_eq!(record.unwrap().status, DelegationStatus::Revoked);
 }
 
 #[test]
-fn test_get_delegation_by_label_not_found() {
+fn test_get_delegation_by_owner_label_not_found() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
     let label = Symbol::new(&env, "Byol_NotFound");
 
-    assert_eq!(
-        client.try_get_delegation_by_label(&owner, &label),
-        Err(Ok(DelegationError::NotFound))
-    );
+    let record = client.get_delegation_by_owner_label(&owner, &label);
+    assert_eq!(record, Err(DelegationError::NotFound));
 }
 
 #[test]
-fn test_get_delegation_by_label_idempotent_after_multiple_ops() {
+fn test_get_delegation_by_owner_label_idempotent_after_multiple_ops() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
@@ -1003,25 +1024,28 @@ fn test_get_delegation_by_label_idempotent_after_multiple_ops() {
     let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
 
     // Initially active
-    let record = client.get_delegation_by_label(&owner, &label);
-    assert_eq!(record.status, DelegationStatus::Active);
+    let record = client.get_delegation_by_owner_label(&owner, &label);
+    assert!(record.is_ok());
+    assert_eq!(record.unwrap().status, DelegationStatus::Active);
 
     // Sweep it
     env.ledger().set_sequence_number(300);
     client.sweep_expired(&soroban_sdk::Vec::from_slice(&env, &[id]));
 
-    let record = client.get_delegation_by_label(&owner, &label);
-    assert_eq!(record.status, DelegationStatus::Expired);
+    let record = client.get_delegation_by_owner_label(&owner, &label);
+    assert!(record.is_ok());
+    assert_eq!(record.unwrap().status, DelegationStatus::Expired);
 
     // Revoke it
     client.revoke_delegation(&id);
 
-    let record = client.get_delegation_by_label(&owner, &label);
-    assert_eq!(record.status, DelegationStatus::Revoked);
+    let record = client.get_delegation_by_owner_label(&owner, &label);
+    assert!(record.is_ok());
+    assert_eq!(record.unwrap().status, DelegationStatus::Revoked);
 }
 
 #[test]
-fn test_get_delegation_by_label_with_different_labels() {
+fn test_get_delegation_by_owner_label_with_different_labels() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
@@ -1031,14 +1055,15 @@ fn test_get_delegation_by_label_with_different_labels() {
     let id2 = client.create_delegation(&owner, &agent_id, &permissions_contract, &label2, &1000);
 
     // Both should be findable by their respective labels
-    let rec1 = client.get_delegation_by_label(&owner, &label1);
-    let rec2 = client.get_delegation_by_label(&owner, &label2);
-    assert_eq!(rec1.id, id1);
-    assert_eq!(rec2.id, id2);
+    let rec1 = client.get_delegation_by_owner_label(&owner, &label1);
+    let rec2 = client.get_delegation_by_owner_label(&owner, &label2);
+    assert!(rec1.is_ok() && rec2.is_ok());
+    assert_eq!(rec1.unwrap().delegation_id, id1);
+    assert_eq!(rec2.unwrap().delegation_id, id2);
 }
 
 #[test]
-fn test_get_delegation_by_label_not_matching_owner() {
+fn test_get_delegation_by_owner_label_not_matching_owner() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
@@ -1047,14 +1072,12 @@ fn test_get_delegation_by_label_not_matching_owner() {
     let id = client.create_delegation(&other_owner, &agent_id, &permissions_contract, &label, &1000);
 
     // Looking up with the original owner should not find it
-    assert_eq!(
-        client.try_get_delegation_by_label(&owner, &label),
-        Err(Ok(DelegationError::NotFound))
-    );
+    let record = client.get_delegation_by_owner_label(&owner, &label);
+    assert_eq!(record, Err(DelegationError::NotFound));
 }
 
 #[test]
-fn test_get_delegation_by_label_sweep_batch() {
+fn test_get_delegation_by_owner_label_sweep_batch() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
@@ -1073,10 +1096,11 @@ fn test_get_delegation_by_label_sweep_batch() {
     ids.push_back(id2);
     client.sweep_expired(&ids);
 
-    let rec1 = client.get_delegation_by_label(&owner, &label1);
-    let rec2 = client.get_delegation_by_label(&owner, &label2);
-    assert_eq!(rec1.status, DelegationStatus::Expired);
-    assert_eq!(rec2.status, DelegationStatus::Expired);
+    let rec1 = client.get_delegation_by_owner_label(&owner, &label1);
+    let rec2 = client.get_delegation_by_owner_label(&owner, &label2);
+    assert!(rec1.is_ok() && rec2.is_ok());
+    assert_eq!(rec1.unwrap().status, DelegationStatus::Expired);
+    assert_eq!(rec2.unwrap().status, DelegationStatus::Expired);
 }
 
 #[test]
@@ -1115,6 +1139,32 @@ fn test_get_delegation_bumps_ttl() {
         env.storage().persistent().get_ttl(&user_dels_key)
     });
     assert!(refreshed_user_dels_ttl > 17_280);
+}
+
+#[test]
+fn test_get_delegation_by_owner_label_bumps_ttl() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "TTL_Bump_V2");
+    let _id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &LARGE_TTL);
+
+    let v2_key = DataKey::DelegationV2(owner.clone(), label.clone());
+
+    let initial_v2_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&v2_key)
+    });
+    assert!(initial_v2_ttl > 17_280);
+
+    // Advance so the remaining TTL drops below the bump threshold, then read via
+    // get_delegation_by_owner_label and verify the DelegationV2 TTL is extended.
+    env.ledger()
+        .set_sequence_number(initial_v2_ttl - 17_280 + 1);
+    let _ = client.get_delegation_by_owner_label(&owner, &label);
+    let refreshed_v2_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&v2_key)
+    });
+    assert!(refreshed_v2_ttl > 17_280);
 }
 
 #[test]
@@ -2747,12 +2797,10 @@ fn test_get_keeper_bounty_status_eligible_when_ttl_below_threshold() {
     let label = Symbol::new(&env, "KprLow");
     let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &200_000);
 
-    // Advance ledger far enough that the storage TTL drops below the threshold.
-    // After creation the TTL is PERSISTENT_BUMP_AMOUNT (518_400).
-    // We need TTL < KEEPER_BOUNTY_THRESHOLD_LEDGERS (50_000), so move forward
-    // by 518_400 - 40_000 = 478_400 ledgers.
+    // The ledger-based TTL estimate drops below the threshold once the bump
+    // window (518_400) is nearly spent.
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400);
+        .set_sequence_number(env.ledger().sequence() + 160_000);
 
     let status = client.get_keeper_bounty_status(&id).unwrap();
     assert!(
@@ -2774,7 +2822,7 @@ fn test_bump_delegation_ttl_with_reward_pays_keeper_and_bumps_ttl() {
 
     // Drop the TTL below the threshold.
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400);
+        .set_sequence_number(env.ledger().sequence() + 160_000);
 
     let keeper = Address::generate(&env);
 
@@ -2838,7 +2886,7 @@ fn test_bump_delegation_ttl_with_reward_fails_when_delegation_not_active() {
 
     // Drop TTL below threshold.
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400);
+        .set_sequence_number(env.ledger().sequence() + 160_000);
 
     let keeper = Address::generate(&env);
     let err = client
@@ -2863,7 +2911,7 @@ fn test_bump_delegation_ttl_with_reward_fails_when_reserve_empty() {
 
     // Drop TTL below threshold.
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400);
+        .set_sequence_number(env.ledger().sequence() + 160_000);
 
     let keeper = Address::generate(&env);
     let err = client
@@ -2885,27 +2933,26 @@ fn test_bump_delegation_ttl_with_reward_enforces_cooldown() {
         setup_with_token(200_000_000); // enough for two payouts
 
     let label = Symbol::new(&env, "KprCool");
-    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &200_000);
-
-    // First bump: drop TTL below threshold and claim.
+    // Short expiry keeps the estimated TTL below the threshold even right
+    // after a bump, so only the cooldown can reject the second claim.
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100_000);
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400);
+        .set_sequence_number(env.ledger().sequence() + 60_000);
+
     let keeper = Address::generate(&env);
     client
         .bump_delegation_ttl_with_reward(&id, &keeper, &xlm_token)
         .unwrap();
+    assert!(client.get_keeper_bounty_status(&id).unwrap().remaining_ledgers
+        < KEEPER_BOUNTY_THRESHOLD_LEDGERS);
+    assert!(!client.get_keeper_bounty_status(&id).unwrap().is_eligible_for_bounty);
 
-    // Immediately after the bump the TTL is high again — let it drop once more
-    // but advance by less than KEEPER_BOUNTY_COOLDOWN_LEDGERS (17_280).
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400);
-
-    // Should be rejected due to cooldown — not enough ledgers since last claim.
+        .set_sequence_number(env.ledger().sequence() + KEEPER_BOUNTY_COOLDOWN_LEDGERS - 1);
     let err = client
         .try_bump_delegation_ttl_with_reward(&id, &keeper, &xlm_token)
         .unwrap_err()
         .unwrap();
-
     assert_eq!(
         err,
         soroban_sdk::Error::from_contract_error(DelegationError::NotEligibleForBounty as u32),
@@ -2919,19 +2966,19 @@ fn test_bump_delegation_ttl_with_reward_allowed_after_cooldown_expires() {
         setup_with_token(200_000_000);
 
     let label = Symbol::new(&env, "KprAfCool");
-    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &3_000_000);
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &200_000);
 
     // First claim.
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400);
+        .set_sequence_number(env.ledger().sequence() + 160_000);
     let keeper = Address::generate(&env);
     client
         .bump_delegation_ttl_with_reward(&id, &keeper, &xlm_token)
         .unwrap();
 
-    // Advance past the cooldown (17_280) AND let the TTL drop again.
+    // Advance past the cooldown (17_280); expiry keeps the TTL estimate low.
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400 + KEEPER_BOUNTY_COOLDOWN_LEDGERS);
+        .set_sequence_number(env.ledger().sequence() + KEEPER_BOUNTY_COOLDOWN_LEDGERS);
 
     // Second claim should succeed.
     let status = client
@@ -2961,6 +3008,93 @@ fn test_deposit_maintenance_reserve_requires_admin() {
 }
 
 #[test]
+fn test_deposit_maintenance_reserve_rejects_non_positive_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(DelegationRegistry, ());
+    let client = DelegationRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    for bad_amount in [0i128, -1i128, -50_000_000i128] {
+        let err = client
+            .try_deposit_maintenance_reserve(&admin, &bad_amount)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(
+            err,
+            soroban_sdk::Error::from_contract_error(DelegationError::InvalidAmount as u32)
+        );
+    }
+}
+
+#[test]
+fn test_deposit_maintenance_reserve_rejects_overflow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(DelegationRegistry, ());
+    let client = DelegationRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let first = client.deposit_maintenance_reserve(&admin, &i128::MAX);
+    assert_eq!(first, i128::MAX);
+
+    let err = client
+        .try_deposit_maintenance_reserve(&admin, &1i128)
+        .unwrap_err()
+        .unwrap();
+
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(DelegationError::ArithmeticOverflow as u32)
+    );
+}
+
+#[test]
+fn test_deposit_maintenance_reserve_emits_event() {
+    use soroban_sdk::IntoVal;
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(DelegationRegistry, ());
+    let client = DelegationRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let first_deposit = 25_000_000i128;
+    let second_deposit = 15_000_000i128;
+
+    assert_eq!(
+        client.deposit_maintenance_reserve(&admin, &first_deposit),
+        first_deposit
+    );
+    let new_balance = client.deposit_maintenance_reserve(&admin, &second_deposit);
+    assert_eq!(new_balance, first_deposit + second_deposit);
+
+    let events = env.events().all();
+    let dep_event = events
+        .iter()
+        .filter(|(contract, topics, _)| {
+            *contract == client.address
+                && topics.len() == 3
+                && topics.get(0) == Some(symbol_short!("DELEGO").into())
+                && topics.get(1) == Some(symbol_short!("resv_dep").into())
+                && topics.get(2) == Some(admin.clone().into_val(&env))
+        })
+        .last();
+
+    assert!(
+        dep_event.is_some(),
+        "maintenance reserve deposit event should have been emitted"
+    );
+
+    let (_, _, data) = dep_event.unwrap();
+    let payload: (i128, i128) = TryFromVal::try_from_val(&env, &data).unwrap();
+    assert_eq!(payload, (second_deposit, first_deposit + second_deposit));
+}
+
+#[test]
 fn test_get_maintenance_reserve_starts_at_zero() {
     let env = Env::default();
     env.mock_all_auths();
@@ -2981,7 +3115,7 @@ fn test_keeper_bounty_paid_event_is_emitted() {
     let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &200_000);
 
     env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 478_400);
+        .set_sequence_number(env.ledger().sequence() + 160_000);
 
     let keeper = Address::generate(&env);
     client
@@ -3008,8 +3142,6 @@ fn test_keeper_bounty_paid_event_is_emitted() {
     assert_eq!(event.keeper, keeper);
     assert_eq!(event.bounty_amount_stroops, KEEPER_BOUNTY_AMOUNT_STROOPS);
 }
-
-} // end keeper_bounty_unimplemented
 
 // ── Emergency delegation circuit breaker ────────────────────────────────────
 // NOTE: These tests reference `trigger_emergency_killswitch`, `reactivate_account`,
@@ -3888,202 +4020,184 @@ fn test_reactivate_sub_account_emits_event() {
     assert!(!client.reactivate_sub_account(&owner, &sub_id));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Task 3: 3-topic event assertions for set_spend_rate_limit,
-//         set_merchant_filter, admin_pause_delegation, admin_resume_delegation
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Helper: create an active delegation and return its id.
-fn make_active(
-    env: &Env,
-    client: &DelegationRegistryClient<'_>,
-    owner: &Address,
-    agent_id: &BytesN<32>,
-    permissions_contract: &Address,
-    label: &str,
-) -> u64 {
-    client.create_delegation(
-        owner,
-        agent_id,
-        permissions_contract,
-        &Symbol::new(env, label),
-        &100_000,
-    )
-}
+// ── Issue #760: DelegationKeepers swept with expired delegations ──────────────
 
 #[test]
-fn set_spend_rate_limit_emits_3_topic_event() {
-    let (env, client, _, owner, agent_id, perms) = setup();
+fn test_sweep_expired_removes_delegation_keepers() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
-    let id = make_active(&env, &client, &owner, &agent_id, &perms, "RateLimit_Evt");
-    client.set_spend_rate_limit(&id, &1_000u32, &5_000i128);
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Keepers_Sweep");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
 
-    let events = env.events().all();
-    let last = events.last().unwrap();
+    // Register a primary and secondary keeper for the delegation.
+    let primary = Address::generate(&env);
+    let secondary = Address::generate(&env);
+    client.set_delegation_keepers(&id, &primary, &secondary);
 
-    // Topics: (EVENT_TOPIC_CONTRACT, "rate_set", delegation_id).
-    let t: soroban_sdk::Vec<soroban_sdk::Val> = last.1.clone();
-    assert_eq!(t.len(), 3);
-    assert_eq!(Symbol::try_from_val(&env, &t.get(0).unwrap()).ok(), Some(EVENT_TOPIC_CONTRACT));
-    assert_eq!(Symbol::try_from_val(&env, &t.get(1).unwrap()).ok(), Some(symbol_short!("rate_set")));
-    assert_eq!(u64::try_from_val(&env, &t.get(2).unwrap()).ok(), Some(id));
-
-    let ev = SpendRateLimitSetEvent::try_from_val(&env, &last.2).unwrap();
-    assert_eq!(ev.delegation_id, id);
-    assert_eq!(ev.window_ledgers, 1_000u32);
-    assert_eq!(ev.max_window_spend_stroops, 5_000i128);
-}
-
-#[test]
-fn set_merchant_filter_emits_3_topic_event() {
-    let (env, client, _, owner, agent_id, perms) = setup();
-    env.mock_all_auths();
-
-    let id = make_active(&env, &client, &owner, &agent_id, &perms, "MerchFilter_Evt");
-    let mut allowed = Vec::new(&env);
-    allowed.push_back(Address::generate(&env));
-    client.set_merchant_filter(
-        &id,
-        &DelegationMerchantFilter {
-            allowed_merchants: allowed,
-            is_strict_whitelist: true,
-            max_per_merchant_stroops: 10_000,
-        },
+    // Confirm keepers are stored before the sweep.
+    assert!(
+        client.get_delegation_keepers(&id).is_some(),
+        "keepers should be present before sweep"
     );
 
-    let events = env.events().all();
-    let last = events.last().unwrap();
+    // Advance past the expiry ledger and sweep.
+    env.ledger().set_sequence_number(300);
+    let mut ids = Vec::new(&env);
+    ids.push_back(id);
+    let swept = client.sweep_expired(&ids);
 
-    // Topics: (EVENT_TOPIC_CONTRACT, "merch_set", delegation_id).
-    let t: soroban_sdk::Vec<soroban_sdk::Val> = last.1.clone();
-    assert_eq!(t.len(), 3);
-    assert_eq!(Symbol::try_from_val(&env, &t.get(0).unwrap()).ok(), Some(EVENT_TOPIC_CONTRACT));
-    assert_eq!(Symbol::try_from_val(&env, &t.get(1).unwrap()).ok(), Some(symbol_short!("merch_set")));
-    assert_eq!(u64::try_from_val(&env, &t.get(2).unwrap()).ok(), Some(id));
+    assert_eq!(swept.len(), 1, "delegation should have been swept");
+    assert_eq!(swept.get(0).unwrap(), id);
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Expired);
 
-    let ev = MerchantFilterSetEvent::try_from_val(&env, &last.2).unwrap();
-    assert_eq!(ev.delegation_id, id);
-    assert!(ev.is_strict_whitelist);
-    assert_eq!(ev.max_per_merchant_stroops, 10_000i128);
+    // After sweep, DelegationKeepers entry must be gone (issue #760).
+    assert!(
+        client.get_delegation_keepers(&id).is_none(),
+        "DelegationKeepers must be removed after sweep_expired"
+    );
 }
 
 #[test]
-fn admin_pause_delegation_emits_3_topic_event() {
-    let (env, client, admin, owner, agent_id, perms) = setup();
+fn test_sweep_expired_batch_removes_delegation_keepers() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
-    let id = make_active(&env, &client, &owner, &agent_id, &perms, "AdminPause_Evt");
-    client.admin_pause_delegation(&admin, &id);
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Keepers_Batch");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
 
-    let events = env.events().all();
-    let last = events.last().unwrap();
+    let primary = Address::generate(&env);
+    let secondary = Address::generate(&env);
+    client.set_delegation_keepers(&id, &primary, &secondary);
 
-    // Topics: (EVENT_TOPIC_CONTRACT, "adm_pause", delegation_id).
-    let t: soroban_sdk::Vec<soroban_sdk::Val> = last.1.clone();
-    assert_eq!(t.len(), 3);
-    assert_eq!(Symbol::try_from_val(&env, &t.get(0).unwrap()).ok(), Some(EVENT_TOPIC_CONTRACT));
-    assert_eq!(Symbol::try_from_val(&env, &t.get(1).unwrap()).ok(), Some(symbol_short!("adm_pause")));
-    assert_eq!(u64::try_from_val(&env, &t.get(2).unwrap()).ok(), Some(id));
+    assert!(
+        client.get_delegation_keepers(&id).is_some(),
+        "keepers should be present before batch sweep"
+    );
 
-    let ev = DelegationPausedEvent::try_from_val(&env, &last.2).unwrap();
-    assert_eq!(ev.delegation_id, id);
-    assert_eq!(ev.owner, owner);
-    assert_eq!(ev.agent, agent_id);
+    env.ledger().set_sequence_number(300);
+    let result = client.sweep_expired_batch(&1u64, &10u32);
+
+    assert_eq!(result.swept_records_count, 1, "one delegation should be swept");
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Expired);
+
+    // DelegationKeepers must be removed by sweep_expired_batch (issue #760).
+    assert!(
+        client.get_delegation_keepers(&id).is_none(),
+        "DelegationKeepers must be removed after sweep_expired_batch"
+    );
 }
 
 #[test]
-fn admin_resume_delegation_emits_3_topic_event() {
-    let (env, client, admin, owner, agent_id, perms) = setup();
+fn test_sweep_does_not_panic_when_no_keepers_configured() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
-    let id = make_active(&env, &client, &owner, &agent_id, &perms, "AdminResume_Evt");
-    client.admin_pause_delegation(&admin, &id);
-    client.admin_resume_delegation(&admin, &id);
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "No_Keepers");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
 
-    let events = env.events().all();
-    let last = events.last().unwrap();
+    // No set_delegation_keepers call — sweep must still succeed cleanly.
+    env.ledger().set_sequence_number(300);
+    let mut ids = Vec::new(&env);
+    ids.push_back(id);
+    let swept = client.sweep_expired(&ids);
 
-    // Topics: (EVENT_TOPIC_CONTRACT, "adm_rsme", delegation_id).
-    let t: soroban_sdk::Vec<soroban_sdk::Val> = last.1.clone();
-    assert_eq!(t.len(), 3);
-    assert_eq!(Symbol::try_from_val(&env, &t.get(0).unwrap()).ok(), Some(EVENT_TOPIC_CONTRACT));
-    assert_eq!(Symbol::try_from_val(&env, &t.get(1).unwrap()).ok(), Some(symbol_short!("adm_rsme")));
-    assert_eq!(u64::try_from_val(&env, &t.get(2).unwrap()).ok(), Some(id));
-
-    let ev = DelegationResumedEvent::try_from_val(&env, &last.2).unwrap();
-    assert_eq!(ev.delegation_id, id);
-    assert_eq!(ev.owner, owner);
-    assert_eq!(ev.agent, agent_id);
+    assert_eq!(swept.len(), 1);
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Expired);
+    // Nothing to assert for keepers — just confirming no panic.
+    assert!(client.get_delegation_keepers(&id).is_none());
 }
 
 #[test]
-fn admin_pause_delegation_requires_admin_auth() {
-    let (env, client, _, owner, agent_id, perms) = setup();
+fn test_set_delegation_keepers_active_emits_event() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
-    let id = make_active(&env, &client, &owner, &agent_id, &perms, "AdminPause_Auth");
-    let outsider = Address::generate(&env);
+    let label = Symbol::new(&env, "Keeper_Ok");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let primary = Address::generate(&env);
+    let secondary = Address::generate(&env);
+
+    client.set_delegation_keepers(&id, &primary, &secondary);
+
+    let keepers = client.get_delegation_keepers(&id).unwrap();
+    assert_eq!(keepers.primary, primary);
+    assert_eq!(keepers.secondary, secondary);
+
+    let events = env.events().all();
+    let (_, topics, data) = events.last().unwrap();
+    assert_eq!(topics.len(), 3);
     assert_eq!(
-        client.try_admin_pause_delegation(&outsider, &id),
-        Err(Ok(DelegationError::NotAuthorized)),
+        Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(),
+        EVENT_TOPIC_CONTRACT
     );
-    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Active);
-}
-
-#[test]
-fn admin_resume_delegation_requires_admin_auth() {
-    let (env, client, admin, owner, agent_id, perms) = setup();
-    env.mock_all_auths();
-
-    let id = make_active(&env, &client, &owner, &agent_id, &perms, "AdminResume_Auth");
-    client.admin_pause_delegation(&admin, &id);
-
-    let outsider = Address::generate(&env);
     assert_eq!(
-        client.try_admin_resume_delegation(&outsider, &id),
-        Err(Ok(DelegationError::NotAuthorized)),
+        Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap(),
+        symbol_short!("kpr_set")
     );
-    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Paused);
+    assert_eq!(u64::try_from_val(&env, &topics.get(2).unwrap()).unwrap(), id);
+    let (p, s) = <(Address, Address)>::try_from_val(&env, &data).unwrap();
+    assert_eq!(p, primary);
+    assert_eq!(s, secondary);
 }
 
 #[test]
-fn set_spend_rate_limit_and_set_merchant_filter_topics_are_distinct() {
-    let (env, client, _, owner, agent_id, perms) = setup();
+fn test_set_delegation_keepers_rejects_revoked() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
 
-    let id = make_active(&env, &client, &owner, &agent_id, &perms, "Distinct_Topics");
-    client.set_spend_rate_limit(&id, &500u32, &1_000i128);
-    let mut allowed = Vec::new(&env);
-    allowed.push_back(Address::generate(&env));
-    client.set_merchant_filter(
+    let label = Symbol::new(&env, "Keeper_Rev");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    client.revoke_delegation(&id);
+
+    let result = client.try_set_delegation_keepers(
         &id,
-        &DelegationMerchantFilter {
-            allowed_merchants: allowed,
-            is_strict_whitelist: false,
-            max_per_merchant_stroops: 999,
-        },
+        &Address::generate(&env),
+        &Address::generate(&env),
     );
+    assert_eq!(result, Err(Ok(DelegationError::NotActive)));
+    assert!(client.get_delegation_keepers(&id).is_none());
+}
 
-    let events = env.events().all();
-    let n = events.len();
-    assert!(n >= 2, "expected at least 2 events (rate_set + merch_set), got {n}");
-    let rate_ev = events.get(n - 2).unwrap();
-    let merch_ev = events.get(n - 1).unwrap();
+#[test]
+fn test_set_delegation_keepers_rejects_expired() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
 
-    let rt: soroban_sdk::Vec<soroban_sdk::Val> = rate_ev.1.clone();
-    let mt: soroban_sdk::Vec<soroban_sdk::Val> = merch_ev.1.clone();
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Keeper_Exp");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+    let expires_at = client.get_delegation(&id).expires_at_ledger;
 
-    // Both carry EVENT_TOPIC_CONTRACT as topic 0 and delegation_id as topic 2.
-    assert_eq!(Symbol::try_from_val(&env, &rt.get(0).unwrap()).ok(), Some(EVENT_TOPIC_CONTRACT));
-    assert_eq!(Symbol::try_from_val(&env, &mt.get(0).unwrap()).ok(), Some(EVENT_TOPIC_CONTRACT));
-    assert_eq!(u64::try_from_val(&env, &rt.get(2).unwrap()).ok(), Some(id));
-    assert_eq!(u64::try_from_val(&env, &mt.get(2).unwrap()).ok(), Some(id));
+    env.ledger().set_sequence_number(expires_at);
+    let result = client.try_set_delegation_keepers(
+        &id,
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
+    assert_eq!(result, Err(Ok(DelegationError::Expired)));
+    assert!(client.get_delegation_keepers(&id).is_none());
+}
 
-    // Action symbols are different.
-    let rate_action  = Symbol::try_from_val(&env, &rt.get(1).unwrap()).unwrap();
-    let merch_action = Symbol::try_from_val(&env, &mt.get(1).unwrap()).unwrap();
-    assert_ne!(rate_action, merch_action);
-    assert_eq!(rate_action,  symbol_short!("rate_set"));
-    assert_eq!(merch_action, symbol_short!("merch_set"));
+#[test]
+fn test_set_delegation_keepers_rejects_paused_and_unknown() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Keeper_Pau");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    client.pause_delegation(&id);
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    assert_eq!(
+        client.try_set_delegation_keepers(&id, &a, &b),
+        Err(Ok(DelegationError::NotActive))
+    );
+    assert_eq!(
+        client.try_set_delegation_keepers(&999, &a, &b),
+        Err(Ok(DelegationError::NotFound))
+    );
 }

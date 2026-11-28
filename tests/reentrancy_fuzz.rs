@@ -54,7 +54,9 @@
 #![cfg(test)]
 
 use arbitrary::{Arbitrary, Unstructured};
-use delego_escrow::{EscrowConfig, EscrowContract, EscrowContractClient, EscrowError, EscrowStatus};
+use delego_escrow::{
+    EscrowConfig, EscrowContract, EscrowContractClient, EscrowError, EscrowStatus,
+};
 use delego_permissions::{PermissionsContract, PermissionsContractClient};
 use soroban_sdk::{
     contract, contractimpl, contracttype,
@@ -316,7 +318,7 @@ pub struct MaliciousReentrantAttacker;
 
 #[contractimpl]
 impl MaliciousReentrantAttacker {
-    pub fn configure(
+    pub fn configure_attack(
         env: Env,
         escrow: Address,
         escrow_id: u64,
@@ -425,6 +427,8 @@ impl ReentrancyTestEnv {
             treasury,
             min_amount: 100i128,
             max_amount: 50_000i128,
+            min_fee_floor_stroops: 0,
+            max_fee_ceiling_stroops: 0,
         };
         let escrow_id = env.register(EscrowContract, (config,));
         let permissions_id = env.register(PermissionsContract, ());
@@ -602,14 +606,7 @@ fn test_refund_rejects_reentrant_release_from_token_hook() {
     let mal_token = t.malicious_token_client();
 
     let escrow_id = t.deposit_malicious(500);
-    mal_token.configure(
-        &t.escrow_id,
-        &escrow_id,
-        &t.buyer,
-        &t.seller,
-        &true,
-        &5i128,
-    );
+    mal_token.configure(&t.escrow_id, &escrow_id, &t.buyer, &t.seller, &true, &5i128);
 
     // Advance past timeout so the buyer can refund.
     t.env.ledger().with_mut(|l| {
@@ -649,14 +646,7 @@ fn test_attacker_callback_hook_release_rejected() {
     let escrow_id = t.deposit_malicious(300);
 
     // Point the attacker at release (op=0).
-    attacker.configure(
-        &t.escrow_id,
-        &escrow_id,
-        &t.buyer,
-        &t.seller,
-        &0u32,
-        &1i128,
-    );
+    attacker.configure_attack(&t.escrow_id, &escrow_id, &t.buyer, &t.seller, &0u32, &1i128);
 
     // Configure the malicious token to invoke the attacker's callback_hook
     // as its side-effect.  Because the MaliciousToken contract drives nested
@@ -666,14 +656,7 @@ fn test_attacker_callback_hook_release_rejected() {
     // while the guard is supposedly active is also rejected.  The direct call
     // here is outside the guard (guard is not held), so we prime the hook-via-
     // token path: this tests the token-mediated path end-to-end.
-    mal_token.configure(
-        &t.escrow_id,
-        &escrow_id,
-        &t.buyer,
-        &t.seller,
-        &true,
-        &1i128,
-    );
+    mal_token.configure(&t.escrow_id, &escrow_id, &t.buyer, &t.seller, &true, &1i128);
 
     // Release via the malicious token — hooks fire during transfer.
     escrow_client.release(&escrow_id, &t.buyer, &t.seller);
@@ -691,14 +674,7 @@ fn test_attacker_callback_hook_outside_guard_does_not_panic() {
 
     // No escrow funded — the nested call will fail with a different error
     // (NotFound / not Funded), but it must NOT panic.
-    attacker.configure(
-        &t.escrow_id,
-        &0u64,
-        &t.buyer,
-        &t.seller,
-        &0u32,
-        &1i128,
-    );
+    attacker.configure_attack(&t.escrow_id, &0u64, &t.buyer, &t.seller, &0u32, &1i128);
 
     // This should not panic; the call returns `was_rejected = false` because
     // the error is NOT `ReentrancyDetected` (it's NotFound or similar), but
@@ -745,10 +721,16 @@ fn test_deposit_new_escrow_during_release_does_not_corrupt_state() {
     escrow_client.release(&escrow_id_1, &t.buyer, &t.seller);
 
     // Escrow #1 must be Released.
-    assert_eq!(escrow_client.get_escrow(&escrow_id_1).status, EscrowStatus::Released);
+    assert_eq!(
+        escrow_client.get_escrow(&escrow_id_1).status,
+        EscrowStatus::Released
+    );
 
     // Escrow #2 must be untouched (still Funded).
-    assert_eq!(escrow_client.get_escrow(&escrow_id_2).status, EscrowStatus::Funded);
+    assert_eq!(
+        escrow_client.get_escrow(&escrow_id_2).status,
+        EscrowStatus::Funded
+    );
 
     // All reentrancy attempts against escrow #1 must have been rejected.
     assert!(mal_token.all_rejected());
@@ -851,7 +833,8 @@ fn test_permissions_allowance_never_goes_negative_under_fuzz() {
         assert!(
             record.limit_total >= record.spent,
             "seed {seed}: allowance went below zero (limit={} spent={})",
-            record.limit_total, record.spent
+            record.limit_total,
+            record.spent
         );
     }
 }
@@ -928,7 +911,9 @@ fn run_fuzz_suite(forced_target: AttackTarget, iterations: u64) {
 
         // Execute the outer operation and verify reentrancy invariants.
         match forced_target {
-            AttackTarget::Release | AttackTarget::DepositDuringRelease | AttackTarget::ReleaseDuringRefund => {
+            AttackTarget::Release
+            | AttackTarget::DepositDuringRelease
+            | AttackTarget::ReleaseDuringRefund => {
                 escrow_client.release(&escrow_id, &t.buyer, &t.seller);
                 let record = escrow_client.get_escrow(&escrow_id);
                 assert_eq!(
@@ -940,7 +925,10 @@ fn run_fuzz_suite(forced_target: AttackTarget, iterations: u64) {
             AttackTarget::PartialRelease => {
                 let partial_amount = reentry_amount.max(1).min(amount - 1);
                 let result = escrow_client.partial_release(&escrow_id, &t.buyer, &partial_amount);
-                assert_eq!(result.released, partial_amount, "seed {seed}: partial released wrong amount");
+                assert_eq!(
+                    result.released, partial_amount,
+                    "seed {seed}: partial released wrong amount"
+                );
                 let record = escrow_client.get_escrow(&escrow_id);
                 assert_eq!(
                     record.released_amount, partial_amount,
@@ -1008,11 +996,17 @@ fn test_guard_is_released_after_successful_outer_call() {
 
     // First release succeeds.
     escrow_client.release(&id1, &t.buyer, &t.seller);
-    assert_eq!(escrow_client.get_escrow(&id1).status, EscrowStatus::Released);
+    assert_eq!(
+        escrow_client.get_escrow(&id1).status,
+        EscrowStatus::Released
+    );
 
     // Second release also succeeds — guard was unlocked after id1.
     escrow_client.release(&id2, &t.buyer, &t.seller);
-    assert_eq!(escrow_client.get_escrow(&id2).status, EscrowStatus::Released);
+    assert_eq!(
+        escrow_client.get_escrow(&id2).status,
+        EscrowStatus::Released
+    );
 }
 
 /// A failing outer call (e.g. wrong caller) does not leave the guard locked.
@@ -1026,7 +1020,10 @@ fn test_guard_is_not_held_after_failed_outer_call() {
 
     // Attempt release with a wrong caller — escrow rejects it.
     let fail_result = escrow_client.try_release(&id, &impostor, &t.seller);
-    assert!(fail_result.is_err(), "expected release to fail with wrong caller");
+    assert!(
+        fail_result.is_err(),
+        "expected release to fail with wrong caller"
+    );
 
     // A subsequent legitimate release by the correct buyer must still succeed.
     escrow_client.release(&id, &t.buyer, &t.seller);
@@ -1077,11 +1074,13 @@ fn test_disabled_hook_records_no_reentry_attempts() {
     escrow_client.release(&escrow_id, &t.buyer, &t.seller);
 
     assert_eq!(
-        mal_token.attempt_count(), 0,
+        mal_token.attempt_count(),
+        0,
         "disabled hook: unexpected re-entry attempts recorded"
     );
     assert_eq!(
-        mal_token.rejected_count(), 0,
+        mal_token.rejected_count(),
+        0,
         "disabled hook: unexpected rejections recorded"
     );
     assert_eq!(
@@ -1126,7 +1125,11 @@ fn test_escrow_record_fully_consistent_after_reentrancy_attack() {
     escrow_client.release(&escrow_id, &t.buyer, &t.seller);
 
     let final_record = escrow_client.get_escrow(&escrow_id);
-    assert_eq!(final_record.status, EscrowStatus::Released, "status wrong after attack");
+    assert_eq!(
+        final_record.status,
+        EscrowStatus::Released,
+        "status wrong after attack"
+    );
     assert_eq!(
         final_record.amount, amount,
         "amount field mutated during attack"

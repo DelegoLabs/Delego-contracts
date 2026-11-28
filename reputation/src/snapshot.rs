@@ -95,9 +95,11 @@ pub fn record_review(env: &Env, merchant: &Address, rating: u32) {
         env.storage().persistent().remove(&pending_key);
     } else {
         env.storage().persistent().set(&pending_key, &buf);
-        env.storage()
-            .persistent()
-            .extend_ttl(&pending_key, SNAPSHOT_TTL_THRESHOLD, SNAPSHOT_TTL_BUMP);
+        env.storage().persistent().extend_ttl(
+            &pending_key,
+            SNAPSHOT_TTL_THRESHOLD,
+            SNAPSHOT_TTL_BUMP,
+        );
     }
 }
 

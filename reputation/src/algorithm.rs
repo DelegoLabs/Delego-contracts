@@ -135,7 +135,6 @@ fn isqrt(n: i128) -> i128 {
 pub fn compute_dispute_penalty_multiplier(consecutive_losses: u32, max_power: u32) -> u32 {
     let power = consecutive_losses.min(max_power);
     1u32.checked_shl(power).unwrap_or(u32::MAX) // 2^power, capped at u32::MAX
-    1u32.checked_shl(power).unwrap_or(u32::MAX) // 2^power
 }
 
 /// Resets dispute penalty if merchant has completed enough dispute-free orders.

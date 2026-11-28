@@ -14,26 +14,36 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes, BytesN, Env,
-    IntoVal, InvokeError, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
+    BytesN, ConversionError, Env, IntoVal, InvokeError, MapObject, String, Symbol, TryFromVal, Val,
+    Vec,
 };
 
 pub mod algorithm;
+pub mod arbitration;
+pub use arbitration::{
+    ArbitrationDeadlinePenaltyEvent, ArbitrationFinalizedEvent, ArbitrationPanelInitializedEvent,
+    ArbitrationVoteCastEvent, DisputeAssignment, VoteOutcome,
+};
 pub mod appeals;
+#[cfg(test)]
+mod arbitration_test;
 pub use appeals::{
     AppealConfig, AppealOutcome, AppealStatus, AppealVote, AppealedReview, ReviewAppeal,
 };
 #[cfg(test)]
 mod appeals_test;
 #[cfg(test)]
+mod attestation_test;
+#[cfg(test)]
 mod blinded_review_test;
+pub mod flags;
 #[cfg(test)]
 mod fraud_report_test;
 #[cfg(test)]
 mod rehabilitation_test;
 #[cfg(test)]
 mod reputation_reader_test;
-pub mod flags;
 pub use flags::{
     FlagReportingTrait, ReviewFlagRecord, ReviewFlagResolved, ReviewFlagStatus, FLAG_BOUNTY_BPS,
     MIN_FLAG_BOND,
@@ -53,8 +63,8 @@ pub use snapshot::{ReputationSnapshot, SNAPSHOT_INTERVAL_LEDGERS};
 pub mod antisybil;
 /// Anonymous buyer reviews under ephemeral stealth keys (issue #588).
 pub mod stealth;
-pub use stealth::{AnonymousReview, AnonymousReviewSubmitted};
 pub use antisybil::{calculate_reviewer_weight, get_buyer_completed_orders, EscrowListPageMirror};
+pub use stealth::{AnonymousReview, AnonymousReviewSubmitted};
 
 /// Half-life of the reputation decay curve, in ledgers (~30 days at 5s/ledger).
 pub const DECAY_HALF_LIFE_LEDGERS: u32 = 518_400;
@@ -382,6 +392,26 @@ pub struct EscrowRecordMirror {
     pub timeout_ledger: u32,
 }
 
+/// Structural mirror of the marketplace contract's `ReviewAttestation` wire
+/// shape (issue #558); see [`EscrowStatusMirror`] for why this mirrors rather
+/// than imports the type. Field names must stay in sync with
+/// `delego-marketplace`'s `ReviewAttestation`, or the decode fails closed and
+/// the review is rejected as [`ReputationError::ReviewAttestationInvalid`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewAttestationMirror {
+    /// Order the attestation was issued for.
+    pub order_id: u64,
+    /// Buyer that settled the order.
+    pub buyer: Address,
+    /// Merchant the order was placed with.
+    pub merchant: Address,
+    /// Ledger sequence at which the attestation was issued.
+    pub issued_ledger: u32,
+    /// `true` once the attestation has backed a review.
+    pub consumed: bool,
+}
+
 /// Proof binding a review to a specific, independently verifiable escrow
 /// settlement (issue #286). Submitted to
 /// [`ReputationContract::submit_verified_review`], which calls back into
@@ -655,6 +685,12 @@ pub enum ReputationError {
     AppealWindowNotExpired = 3040,
     /// Review rating is outside the accepted `20..=100` range (issue #584).
     InvalidRatingValue = 3046,
+    /// No marketplace review-attestation authority has been configured, so
+    /// attested reviews cannot be verified (issue #558).
+    ReviewAttestationAuthorityNotSet = 3047,
+    /// The review attestation could not be verified or consumed by the
+    /// configured marketplace contract (issue #558).
+    ReviewAttestationInvalid = 3048,
 }
 
 #[cfg(test)]
@@ -675,7 +711,11 @@ mod rating_validation_tests {
     #[test]
     fn validate_rating_accepts_in_range_values() {
         for rating in [20u32, 60, 100] {
-            assert_eq!(validate_rating(rating), Ok(()), "rating {rating} should be accepted");
+            assert_eq!(
+                validate_rating(rating),
+                Ok(()),
+                "rating {rating} should be accepted"
+            );
         }
     }
 }
@@ -734,6 +774,8 @@ mod error_code_allocation {
             ReputationError::AppealWindowExpired as u32,
             ReputationError::AppealWindowNotExpired as u32,
             ReputationError::InvalidRatingValue as u32,
+            ReputationError::ReviewAttestationAuthorityNotSet as u32,
+            ReputationError::ReviewAttestationInvalid as u32,
         ];
         for code in codes {
             assert!(
@@ -931,66 +973,6 @@ impl RankedMerchantPage {
     }
 }
 
-impl TryFromVal<Env, Val> for RankedMerchantPage {
-    type Error = ConversionError;
-
-    fn try_from_val(env: &Env, val: &Val) -> Result<Self, Self::Error> {
-        const KEYS: [&'static str; 5] = [
-            "merchants",
-            "has_more",
-            "next_last_score_bps",
-            "next_last_merchant_id",
-            "total_count",
-        ];
-        let mut vals: [Val; 5] = [Val::VOID.to_val(); 5];
-        let map: MapObject = val.try_into().map_err(|_| ConversionError)?;
-        env.map_unpack_to_slice(map, &KEYS, &mut vals)
-            .map_err(|_| ConversionError)?;
-        Ok(Self {
-            merchants: vals[0].try_into_val(env).map_err(|_| ConversionError)?,
-            has_more: vals[1].try_into_val(env).map_err(|_| ConversionError)?,
-            next_last_score_bps: vals[2].try_into_val(env).map_err(|_| ConversionError)?,
-            next_last_merchant_id: vals[3].try_into_val(env).map_err(|_| ConversionError)?,
-            total_count: vals[4].try_into_val(env).map_err(|_| ConversionError)?,
-        })
-    }
-}
-
-impl TryFromVal<Env, RankedMerchantPage> for Val {
-    type Error = ConversionError;
-
-    fn try_from_val(env: &Env, val: &RankedMerchantPage) -> Result<Self, Self::Error> {
-        const KEYS: [&'static str; 5] = [
-            "merchants",
-            "has_more",
-            "next_last_score_bps",
-            "next_last_merchant_id",
-            "total_count",
-        ];
-        let vals: [Val; 5] = [
-            (&val.merchants)
-                .try_into_val(env)
-                .map_err(|_| ConversionError)?,
-            val.has_more
-                .try_into_val(env)
-                .map_err(|_| ConversionError)?,
-            val.next_last_score_bps
-                .try_into_val(env)
-                .map_err(|_| ConversionError)?,
-            val.next_last_merchant_id
-                .try_into_val(env)
-                .map_err(|_| ConversionError)?,
-            (&val.total_count)
-                .try_into_val(env)
-                .map_err(|_| ConversionError)?,
-        ];
-        Ok(env
-            .map_new_from_slices(&KEYS, &vals)
-            .map_err(|_| ConversionError)?
-            .into())
-    }
-}
-
 /// Read-only projection of a merchant's reputation used by the discovery
 /// index. Mirrors the fields buyers need to render a ranked listing without
 /// pulling the full [`ReputationScore`] record.
@@ -1122,6 +1104,18 @@ pub enum DataKey {
     AppealArbiter(Address),
     /// Bond forfeited to a charity address, in stroops.
     AppealCharityBalance(Address),
+}
+
+/// Storage keys owned by the storefront review-attestation feature
+/// (issue #558).
+///
+/// Kept separate from [`DataKey`] because that enum is at the contract-spec
+/// variant limit, so extending it would be rejected at compile time.
+#[contracttype]
+pub enum ReviewAttestationKey {
+    /// Marketplace contract whose review attestations this contract accepts
+    /// and consumes when a review is filed. Set by the admin.
+    Authority,
 }
 
 /// Maximum basis points value (100.00%), used both for ratings/scores and
@@ -1555,10 +1549,14 @@ impl ReputationContract {
     /// Records the current ledger as the last review from `buyer` to `seller`.
     fn record_review_ledger(env: &Env, buyer: &Address, seller: &Address) {
         let key = DataKey::LastReviewLedger(buyer.clone(), seller.clone());
-        env.storage().persistent().set(&key, &env.ledger().sequence());
         env.storage()
             .persistent()
-            .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+            .set(&key, &env.ledger().sequence());
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     /// Rate the entity on the other side of a completed escrow. `rater` must
@@ -1592,8 +1590,6 @@ impl ReputationContract {
             return Err(ReputationError::InvalidParam);
         }
 
-        Self::check_review_cooldown(&env, &rater, &entity)?;
-
         let rated_key = DataKey::RatedEscrows(rater.clone());
         let mut rated: Vec<u64> = env
             .storage()
@@ -1603,23 +1599,13 @@ impl ReputationContract {
         if rated.contains(escrow_id) {
             return Err(ReputationError::DuplicateRating);
         }
+
+        Self::check_review_cooldown(&env, &rater, &entity)?;
+
         rated.push_back(escrow_id);
         env.storage().persistent().set(&rated_key, &rated);
 
         Self::record_review_ledger(&env, &rater, &entity);
-        
-        // Record review commitment with verified_purchase=false for regular ratings
-        let review_id = record.entity; // Using entity as review_id mapping
-        let content_hash = soroban_sdk::BytesN::<32>::from_array(&env, [0u8; 32]); // Placeholder
-        let _ = Self::record_review(
-            env.clone(),
-            rater.clone(),
-            entity.clone(),
-            review_id,
-            4, // rating already extracted from record
-            content_hash,
-            false, // verified_purchase=false for regular ratings
-        );
 
         record.rating = Some(rating);
         env.storage().persistent().set(&record_key, &record);
@@ -1724,22 +1710,20 @@ impl ReputationContract {
         env.storage().persistent().extend_ttl(
             &reviewed_key,
             PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT);
-        
-        // Record the verified purchase review commitment
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Record the verified purchase review commitment. The proof binds the
+        // settlement but carries no review text, so the content hash is empty.
         let review_id = proof.escrow_id;
-        let content_hash = proof.content_hash; // Assuming proof has content_hash, otherwise use default
-        // For now, we'll set verified_purchase based on the proof verification above
-        // The actual content_hash would come from the reviewer's off-chain review content
         let _ = Self::record_review(
             env.clone(),
             rater.clone(),
             entity.clone(),
             review_id,
-        4,
-        soroban_sdk::BytesN::<32>::from_array(&env, [0u8; 32]),
-        true, // verified_purchase flag set to true for verified reviews
-        );
+            rating,
+            BytesN::<32>::from_array(&env, &[0u8; 32]),
+            true,
         );
 
         let record_key = DataKey::TransactionRecord(proof.escrow_id);
@@ -3361,14 +3345,10 @@ impl ReputationContract {
         // Validate rating range (1.0-5.0 stars mapped to 20..=100)
         validate_rating(rating)?;
 
-        // Check if review already committed
+        // Check if review already committed. The key stores a `ReviewCommitment`
+        // struct, so existence must be checked with `has` rather than decoded.
         let commitment_key = DataKey::ReviewCommitment(escrow_id);
-        if env
-            .storage()
-            .persistent()
-            .get::<_, bool>(&commitment_key)
-            .unwrap_or(false)
-        {
+        if env.storage().persistent().has(&commitment_key) {
             return Err(ReputationError::DuplicateReviewCommitment);
         }
 
@@ -3403,6 +3383,7 @@ impl ReputationContract {
             rating,
             content_hash,
             submitted_ledger: env.ledger().sequence(),
+            verified_purchase: false,
         };
 
         env.storage().persistent().set(&commitment_key, &commitment);
@@ -3734,12 +3715,7 @@ impl ReputationContract {
         );
 
         env.events().publish(
-            (
-                symbol_short!("reput"),
-                symbol_short!("rehab_go"),
-                merchant,
-            ),
-            (symbol_short!("reput"), symbol_short!("rehab_str"), merchant),
+            (symbol_short!("reput"), symbol_short!("rehab_go"), merchant),
             program.clone(),
         );
 
@@ -3833,12 +3809,7 @@ impl ReputationContract {
         let collateral_returned = program.collateral_staked_stroops;
 
         env.events().publish(
-            (
-                symbol_short!("reput"),
-                symbol_short!("rehab_ok"),
-                merchant,
-            ),
-            (symbol_short!("reput"), symbol_short!("rehab_grd"), merchant),
+            (symbol_short!("reput"), symbol_short!("rehab_ok"), merchant),
             program,
         );
 
@@ -3883,11 +3854,7 @@ impl ReputationContract {
         };
 
         env.events().publish(
-            (
-                symbol_short!("reput"),
-                symbol_short!("bld_token"),
-            ),
-            (symbol_short!("reput"), symbol_short!("blind_tok")),
+            (symbol_short!("reput"), symbol_short!("bld_token")),
             receipt.clone(),
         );
 
@@ -4039,6 +4006,12 @@ impl ReputationContract {
         stealth::merchant_review_count(&env, &merchant)
     }
 
+    /// Whether an anonymous-review ticket commitment is registered and not
+    /// yet redeemed (issue #775).
+    pub fn is_anonymous_ticket_live(env: Env, commitment: BytesN<32>) -> bool {
+        stealth::is_ticket_live(&env, &commitment)
+    }
+
     // --- Fraud Reporting ---
 
     /// File a fraud report with staked bond. Reporter must bond 50 USDC (or configured amount).
@@ -4099,11 +4072,7 @@ impl ReputationContract {
         );
 
         env.events().publish(
-            (
-                symbol_short!("reput"),
-                symbol_short!("fraud_new"),
-            ),
-            (symbol_short!("reput"), symbol_short!("fraudfile")),
+            (symbol_short!("reput"), symbol_short!("fraud_new")),
             report.clone(),
         );
 
@@ -4143,11 +4112,7 @@ impl ReputationContract {
 
         // Event emits outcome: valid reports get bounty, invalid reports lose bond
         env.events().publish(
-            (
-                symbol_short!("reput"),
-                symbol_short!("fraud_res"),
-            ),
-            (symbol_short!("reput"), symbol_short!("fraudresl")),
+            (symbol_short!("reput"), symbol_short!("fraud_res")),
             report.clone(),
         );
 
@@ -4211,13 +4176,13 @@ impl ReputationContract {
 
     /// Resolve a flagged review. Upheld flags remove fraudulent review and reward reporter.
     /// Frivolous reports result in bond forfeiture.
-    pub fn resolve_flag(
+    pub fn resolve_review_flag(
         env: Env,
         arbiter: Address,
         flag_id: u64,
         upheld: bool,
     ) -> Result<bool, ReputationError> {
-        flags::resolve_flag(env, arbiter, flag_id, upheld)
+        flags::resolve_review_flag(env, arbiter, flag_id, upheld)
     }
 
     /// Retrieve a review flag report by flag_id.
@@ -4259,6 +4224,30 @@ impl ReputationContract {
         if rating < MIN_RATING || rating > MAX_RATING {
             return Err(ReputationError::InvalidRating);
         }
+        Self::store_review_commitment(
+            &env,
+            reviewer,
+            merchant,
+            review_id,
+            rating,
+            content_hash,
+            verified_purchase,
+        )
+    }
+
+    /// Shared writer for the review commitment and its per-merchant index.
+    ///
+    /// Callers are responsible for authorization and rating validation before
+    /// reaching this helper.
+    fn store_review_commitment(
+        env: &Env,
+        reviewer: Address,
+        merchant: Address,
+        review_id: u64,
+        rating: u32,
+        content_hash: BytesN<32>,
+        verified_purchase: bool,
+    ) -> Result<(), ReputationError> {
         let commitment_key = DataKey::ReviewCommitment(review_id);
         if env.storage().persistent().has(&commitment_key) {
             return Err(ReputationError::DuplicateReviewCommitment);
@@ -4284,14 +4273,137 @@ impl ReputationContract {
             .storage()
             .persistent()
             .get(&merchant_reviews_key)
-            .unwrap_or_else(|| Vec::new(&env));
+            .unwrap_or_else(|| Vec::new(env));
         review_ids.push_back(review_id);
-        env.storage().persistent().set(&merchant_reviews_key, &review_ids);
+        env.storage()
+            .persistent()
+            .set(&merchant_reviews_key, &review_ids);
         env.storage().persistent().extend_ttl(
             &merchant_reviews_key,
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+        Ok(())
+    }
+
+    // --- Storefront review attestations (issue #558) ---
+
+    /// Configure the marketplace contract whose review attestations this
+    /// contract verifies and consumes when a review is filed. Admin-only.
+    pub fn set_review_attestation_authority(
+        env: Env,
+        admin: Address,
+        marketplace: Address,
+    ) -> Result<(), ReputationError> {
+        admin.require_auth();
+        Self::require_caller_is_admin(&env, &admin)?;
+
+        env.storage()
+            .instance()
+            .set(&ReviewAttestationKey::Authority, &marketplace);
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        Ok(())
+    }
+
+    /// Return the configured marketplace review-attestation authority, if any.
+    pub fn get_review_attestation_authority(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&ReviewAttestationKey::Authority)
+    }
+
+    /// File a review backed by a marketplace-issued review attestation
+    /// (issue #558).
+    ///
+    /// The marketplace contract issues one [`ReviewAttestationMirror`] per
+    /// order it releases, and this call consumes it atomically: the configured
+    /// authority's `consume_review_attestation` verifies that `reviewer` is the
+    /// order's buyer and `merchant` its seller, and marks the attestation
+    /// consumed, so the same order can back exactly one review.
+    ///
+    /// If the consumer rejects the attestation — unknown, expired, already
+    /// used, or bound to a different buyer/merchant — the review is refused
+    /// with [`ReputationError::ReviewAttestationInvalid`] and nothing is
+    /// stored. The returned attestation is re-checked here as well, so a
+    /// malfunctioning authority cannot slip an attestation for another order
+    /// past the contract.
+    ///
+    /// On success the review commitment is stored with
+    /// `verified_purchase = true`.
+    pub fn submit_attested_review(
+        env: Env,
+        reviewer: Address,
+        merchant: Address,
+        order_id: u64,
+        rating: u32,
+        content_hash: BytesN<32>,
+    ) -> Result<(), ReputationError> {
+        reviewer.require_auth();
+
+        if reviewer == merchant {
+            return Err(ReputationError::InvalidParam);
+        }
+        if rating < MIN_RATING || rating > MAX_RATING {
+            return Err(ReputationError::InvalidRating);
+        }
+        if Self::is_frozen(env.clone(), merchant.clone()) {
+            return Err(ReputationError::EntityFrozen);
+        }
+
+        let marketplace: Address = env
+            .storage()
+            .instance()
+            .get(&ReviewAttestationKey::Authority)
+            .ok_or(ReputationError::ReviewAttestationAuthorityNotSet)?;
+
+        // Refuse a duplicate before spending the buyer's attestation.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::ReviewCommitment(order_id))
+        {
+            return Err(ReputationError::DuplicateReviewCommitment);
+        }
+
+        let args = soroban_sdk::vec![
+            &env,
+            env.current_contract_address().into_val(&env),
+            order_id.into_val(&env),
+            reviewer.clone().into_val(&env),
+            merchant.clone().into_val(&env),
+        ];
+        let call = env.try_invoke_contract::<ReviewAttestationMirror, InvokeError>(
+            &marketplace,
+            &Symbol::new(&env, "consume_review_attestation"),
+            args,
+        );
+        let attestation = match call {
+            Ok(Ok(attestation)) => attestation,
+            _ => return Err(ReputationError::ReviewAttestationInvalid),
+        };
+
+        let matches_order = attestation.order_id == order_id
+            && attestation.buyer == reviewer
+            && attestation.merchant == merchant
+            && attestation.consumed;
+        if !matches_order {
+            return Err(ReputationError::ReviewAttestationInvalid);
+        }
+
+        Self::store_review_commitment(
+            &env,
+            reviewer,
+            merchant,
+            order_id,
+            rating,
+            content_hash,
+            true,
+        )
+    }
+
     // --- Review appeals (issue #583) ---
 
     /// Configures the review appeal mechanism. Admin-only.
@@ -4785,6 +4897,55 @@ impl ReputationContract {
     pub fn get_snapshot_average(env: Env, merchant: Address) -> u32 {
         snapshot::current_average(&env, &merchant)
     }
+
+    // --- Arbitration Panels (issue #774) ---
+
+    /// Admin-only: initialize a five-arbiter panel and its first assignment.
+    pub fn initialize_arbitration_panel(
+        env: Env,
+        admin: Address,
+        dispute_id: u64,
+        arbiters: Vec<Address>,
+        assigned_arbiter: Address,
+    ) -> Result<(), ReputationError> {
+        admin.require_auth();
+        Self::require_caller_is_admin(&env, &admin)?;
+        arbitration::initialize_panel(&env, dispute_id, arbiters, assigned_arbiter)
+    }
+
+    /// Cast a vote as a member of a dispute's arbiter panel.
+    pub fn cast_arbitration_vote(
+        env: Env,
+        arbiter: Address,
+        dispute_id: u64,
+        outcome: VoteOutcome,
+    ) -> Result<ArbiterTally, ReputationError> {
+        arbitration::cast_vote(&env, dispute_id, &arbiter, outcome)
+    }
+
+    /// Read the current arbiter tally for a dispute.
+    pub fn get_arbitration_tally(
+        env: Env,
+        dispute_id: u64,
+    ) -> Result<ArbiterTally, ReputationError> {
+        arbitration::get_tally(&env, dispute_id)
+    }
+
+    /// Whether an arbiter already voted on a dispute.
+    pub fn has_arbitration_voted(env: Env, dispute_id: u64, arbiter: Address) -> bool {
+        arbitration::has_voted(&env, dispute_id, &arbiter)
+    }
+
+    /// Apply an overdue arbiter's penalty and reassign the dispute. Callable
+    /// by anyone, but the caller is authenticated like other cleanup paths.
+    pub fn check_arbitration_deadline(
+        env: Env,
+        caller: Address,
+        dispute_id: u64,
+    ) -> Result<bool, ReputationError> {
+        caller.require_auth();
+        arbitration::check_arbiter_deadline(&env, dispute_id)
+    }
 }
 
 // --- ReputationReaderTrait Implementation for Cross-Contract Access ---
@@ -4840,6 +5001,13 @@ impl ReputationReaderTrait for ReputationContract {
             Err(_) => Err(0),
         }
     }
+
+    fn get_merchant_settled_volume(_env: Env, _merchant: Address) -> Result<i128, u32> {
+        // Settled volume is authoritative in the escrow contract; this contract
+        // records transaction amounts as informational-only data and keeps no
+        // per-merchant volume total, so the query cannot be served here.
+        Err(0)
+    }
 }
 
 // --- FlagReportingTrait Implementation for Trait-Based Access (issue #580) ---
@@ -4854,12 +5022,12 @@ impl FlagReportingTrait for ReputationContract {
         flags::flag_review(env, reporter, review_id, bond_amount)
     }
 
-    fn resolve_flag(
+    fn resolve_review_flag(
         env: Env,
         arbiter: Address,
         flag_id: u64,
         upheld: bool,
     ) -> Result<bool, ReputationError> {
-        flags::resolve_flag(env, arbiter, flag_id, upheld)
+        flags::resolve_review_flag(env, arbiter, flag_id, upheld)
     }
 }

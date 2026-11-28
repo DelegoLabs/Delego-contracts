@@ -14,7 +14,7 @@ use soroban_sdk::{contractimpl, contracttype, symbol_short, Address, Env};
 
 use crate::{
     is_zero_address, DataKey, DelegationError, DelegationRegistry, DelegationRegistryArgs,
-    DelegationRegistryClient, EVENT_TOPIC_CONTRACT, PERSISTENT_BUMP_AMOUNT,
+    DelegationRegistryClient, DelegationStatus, EVENT_TOPIC_CONTRACT, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_BUMP_THRESHOLD,
 };
 
@@ -141,6 +141,9 @@ impl DelegationRegistry {
     /// # Errors
     ///
     /// * [`DelegationError::NotFound`] - the delegation does not exist.
+    /// * [`DelegationError::NotActive`] - the delegation is not `Active`.
+    /// * [`DelegationError::Expired`] - the delegation's `expires_at_ledger`
+    ///   has been reached.
     /// * [`DelegationError::InvalidParam`] - a keeper is the zero address or
     ///   `primary == secondary`.
     pub fn set_delegation_keepers(
@@ -153,6 +156,13 @@ impl DelegationRegistry {
             .ok_or(DelegationError::NotFound)?;
         record.owner.require_auth();
 
+        if record.status != DelegationStatus::Active {
+            return Err(DelegationError::NotActive);
+        }
+        if env.ledger().sequence() >= record.expires_at_ledger {
+            return Err(DelegationError::Expired);
+        }
+
         if primary == secondary
             || is_zero_address(&env, &primary)
             || is_zero_address(&env, &secondary)
@@ -161,12 +171,25 @@ impl DelegationRegistry {
         }
 
         let key = DataKey::DelegationKeepers(delegation_id);
-        env.storage()
-            .persistent()
-            .set(&key, &DelegationKeepers { primary, secondary });
+        env.storage().persistent().set(
+            &key,
+            &DelegationKeepers {
+                primary: primary.clone(),
+                secondary: secondary.clone(),
+            },
+        );
         env.storage()
             .persistent()
             .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        env.events().publish(
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("kpr_set"),
+                delegation_id,
+            ),
+            (primary, secondary),
+        );
 
         Ok(())
     }

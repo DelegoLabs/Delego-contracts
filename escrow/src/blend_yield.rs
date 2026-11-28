@@ -1,11 +1,15 @@
 //! Opt-in, per-escrow accounting over Blend's non-collateral supply positions.
 //! Failed pool calls or principal shortfalls abort the enclosing transaction.
+use crate::checkpoint::{self, CheckpointError};
 use delego_interfaces::blend::{underlying, BlendPoolClient, Request, SUPPLY, WITHDRAW};
 use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
     contracterror, contracttype, panic_with_error, symbol_short, token, vec, Address, Env, IntoVal,
     Map, Symbol, TryFromVal, Val,
 };
+
+pub(crate) const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
+pub(crate) const PERSISTENT_BUMP_AMOUNT: u32 = 518_400;
 
 /// Configuration is immutable after funding.
 #[contracttype]
@@ -28,20 +32,20 @@ pub struct YieldBearingEscrowConfig {
 #[repr(u32)]
 pub enum BlendYieldError {
     /// Invalid, duplicate, or already-used configuration.
-    InvalidConfig = 4900,
+    InvalidConfig = 700,
     /// Pool response cannot be decoded or violates accounting expectations.
-    InvalidPool = 4901,
+    InvalidPool = 701,
     /// Conversion or balance arithmetic overflowed.
-    MathOverflow = 4902,
+    MathOverflow = 702,
     /// Redeemed balance does not cover this escrow's principal.
-    PrincipalShortfall = 4903,
+    PrincipalShortfall = 703,
     /// Position has already been funded.
-    AlreadyFunded = 4904,
+    AlreadyFunded = 704,
 }
 
 #[contracttype]
 #[derive(Clone)]
-enum Key {
+pub(crate) enum Key {
     BlendConfig(u64),
     BlendPosition(u64),
     /// Pool isolated by an emergency detach (issue #597).
@@ -63,12 +67,18 @@ fn fail(env: &Env, error: BlendYieldError) -> ! {
     panic_with_error!(env, error)
 }
 
+fn checkpoint_fail(env: &Env, error: CheckpointError) -> ! {
+    panic_with_error!(env, error)
+}
+
 fn checked(env: &Env, amount: Option<i128>) -> i128 {
     amount.unwrap_or_else(|| fail(env, BlendYieldError::MathOverflow))
 }
 
 fn bump(env: &Env, key: &Key) {
-    env.storage().persistent().extend_ttl(key, 17_280, 518_400);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 }
 
 /// Read configuration, including realized interest after redemption.
@@ -83,9 +93,12 @@ pub fn config(env: &Env, id: u64) -> Option<YieldBearingEscrowConfig> {
 
 /// Whether `pool` has been isolated by an emergency detach (issue #597).
 pub fn is_pool_detached(env: &Env, pool: &Address) -> bool {
-    env.storage()
-        .persistent()
-        .has(&Key::DetachedPool(pool.clone()))
+    let key = Key::DetachedPool(pool.clone());
+    let detached = env.storage().persistent().has(&key);
+    if detached {
+        bump(env, &key);
+    }
+    detached
 }
 
 /// Isolate `pool`: no further supply reaches it and redemptions stop calling
@@ -96,7 +109,9 @@ pub fn detach_pool(env: &Env, pool: &Address) -> bool {
     if env.storage().persistent().has(&key) {
         return false;
     }
-    env.storage().persistent().set(&key, &env.ledger().sequence());
+    env.storage()
+        .persistent()
+        .set(&key, &env.ledger().sequence());
     bump(env, &key);
     true
 }
@@ -104,10 +119,12 @@ pub fn detach_pool(env: &Env, pool: &Address) -> bool {
 /// Total principal of positions written off `pool` after it was detached.
 /// Those positions were settled from the contract's primary reserves.
 pub fn stranded_principal(env: &Env, pool: &Address) -> i128 {
-    env.storage()
-        .persistent()
-        .get(&Key::StrandedPrincipal(pool.clone()))
-        .unwrap_or(0)
+    let key = Key::StrandedPrincipal(pool.clone());
+    let principal: Option<i128> = env.storage().persistent().get(&key);
+    if principal.is_some() {
+        bump(env, &key);
+    }
+    principal.unwrap_or(0)
 }
 
 /// Called only after the parent escrow verifies Created status and both auths.
@@ -220,6 +237,8 @@ pub fn fund(env: &Env, id: u64, asset: &Address, amount: i128) {
         },
     );
     bump(env, &key);
+    checkpoint::stake(env, &cfg.lending_pool_contract, id, shares)
+        .unwrap_or_else(|error| checkpoint_fail(env, error));
     env.events().publish(
         (symbol_short!("escrow"), symbol_short!("bl_supply"), id),
         (amount, shares),
@@ -254,6 +273,8 @@ pub fn redeem(env: &Env, id: u64) {
         );
         env.storage().persistent().set(&stranded_key, &stranded);
         bump(env, &stranded_key);
+        checkpoint::unstake(env, &cfg.lending_pool_contract, id, position.shares)
+            .unwrap_or_else(|error| checkpoint_fail(env, error));
         position.shares = 0;
         env.storage().persistent().set(&key, &position);
         env.events().publish(
@@ -307,10 +328,14 @@ pub fn redeem(env: &Env, id: u64) {
         fail(env, BlendYieldError::PrincipalShortfall);
     }
     let interest = checked(env, received.checked_sub(position.principal));
+    checkpoint::unstake(env, &cfg.lending_pool_contract, id, position.shares)
+        .unwrap_or_else(|error| checkpoint_fail(env, error));
     position.shares = 0;
     env.storage().persistent().set(&key, &position);
     cfg.accrued_yield_stroops = interest;
-    env.storage().persistent().set(&Key::BlendConfig(id), &cfg);
+    let config_key = Key::BlendConfig(id);
+    env.storage().persistent().set(&config_key, &cfg);
+    bump(env, &config_key);
     if interest > 0 {
         token.transfer(&owner, &cfg.yield_recipient, &interest);
     }

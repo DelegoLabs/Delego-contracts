@@ -2484,7 +2484,14 @@ fn test_mixed_extreme_outcome_sequences_stay_bounded() {
             let outcome = outcomes[(next(&mut state) % outcomes.len() as u64) as usize].clone();
             let one_off_counterparty = Address::generate(&env);
             let is_disputed = matches!(outcome, TransactionOutcome::Disputed);
-            client.record_transaction(&admin, &i, &entity, &one_off_counterparty, &1_000i128, &outcome);
+            client.record_transaction(
+                &admin,
+                &i,
+                &entity,
+                &one_off_counterparty,
+                &1_000i128,
+                &outcome,
+            );
             if !is_disputed {
                 let rating = (next(&mut state) % 10_001) as u32;
                 client.rate_entity(&one_off_counterparty, &i, &entity, &rating);
@@ -3326,4 +3333,134 @@ fn test_review_cooldown_is_scoped_to_the_buyer_seller_pair() {
     // Same buyer, different seller; same seller, different buyer: unaffected.
     client.rate_entity(&buyer, &2u64, &other_seller, &9000u32);
     client.rate_entity(&other_buyer, &3u64, &seller, &9000u32);
+}
+
+// --- Review commitment storage typing (issue #725) ---
+
+#[soroban_sdk::contract]
+pub struct MockEscrowContract;
+
+#[soroban_sdk::contractimpl]
+impl MockEscrowContract {
+    pub fn __constructor(env: Env, buyer: Address, seller: Address, token: Address) {
+        env.storage()
+            .instance()
+            .set(&symbol_short!("buyer"), &buyer);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("seller"), &seller);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("token"), &token);
+    }
+
+    pub fn get_escrow(env: Env, escrow_id: u64) -> crate::EscrowRecordMirror {
+        crate::EscrowRecordMirror {
+            escrow_id,
+            buyer: env
+                .storage()
+                .instance()
+                .get(&symbol_short!("buyer"))
+                .unwrap(),
+            seller: env
+                .storage()
+                .instance()
+                .get(&symbol_short!("seller"))
+                .unwrap(),
+            token: env
+                .storage()
+                .instance()
+                .get(&symbol_short!("token"))
+                .unwrap(),
+            amount: 1_000,
+            released_amount: 1_000,
+            refunded_amount: 0,
+            status: crate::EscrowStatusMirror::Released,
+            order_id: BytesN::from_array(&env, &[0u8; 32]),
+            created_at: 0,
+            updated_at: 0,
+            timeout_ledger: 0,
+        }
+    }
+}
+
+fn setup_review_commitment(
+    env: &Env,
+) -> (
+    ReputationContractClient<'_>,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
+    let (client, _admin) = setup(env);
+    let contract_id = client.address.clone();
+    let buyer = Address::generate(env);
+    let seller = Address::generate(env);
+    let token = Address::generate(env);
+    let escrow_contract = env.register(
+        MockEscrowContract,
+        (buyer.clone(), seller.clone(), token.clone()),
+    );
+    (client, contract_id, escrow_contract, buyer, seller)
+}
+
+#[test]
+fn review_commitment_is_stored_as_struct_and_duplicates_are_rejected() {
+    let env = Env::default();
+    let (client, contract_id, escrow_contract, buyer, seller) = setup_review_commitment(&env);
+    let content_hash = BytesN::from_array(&env, &[7u8; 32]);
+
+    client.submit_review_commitment(&buyer, &100u64, &50u32, &content_hash, &escrow_contract);
+
+    let stored: crate::ReviewCommitment = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReviewCommitment(100))
+            .expect("commitment should be stored")
+    });
+    assert_eq!(stored.escrow_id, 100);
+    assert_eq!(stored.reviewer, buyer);
+    assert_eq!(stored.merchant, seller);
+    assert_eq!(stored.rating, 50);
+    assert_eq!(stored.content_hash, content_hash);
+
+    let duplicate = client.try_submit_review_commitment(
+        &buyer,
+        &100u64,
+        &50u32,
+        &content_hash,
+        &escrow_contract,
+    );
+    assert_eq!(
+        duplicate,
+        Err(Ok(ReputationError::DuplicateReviewCommitment))
+    );
+}
+
+#[test]
+fn review_commitments_are_independent_per_escrow_id() {
+    let env = Env::default();
+    let (client, contract_id, escrow_contract, buyer, _seller) = setup_review_commitment(&env);
+    let content_hash = BytesN::from_array(&env, &[9u8; 32]);
+
+    client.submit_review_commitment(&buyer, &200u64, &40u32, &content_hash, &escrow_contract);
+    client.submit_review_commitment(&buyer, &201u64, &60u32, &content_hash, &escrow_contract);
+
+    let first: crate::ReviewCommitment = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReviewCommitment(200))
+            .unwrap()
+    });
+    let second: crate::ReviewCommitment = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReviewCommitment(201))
+            .unwrap()
+    });
+    assert_eq!(first.escrow_id, 200);
+    assert_eq!(first.rating, 40);
+    assert_eq!(second.escrow_id, 201);
+    assert_eq!(second.rating, 60);
 }

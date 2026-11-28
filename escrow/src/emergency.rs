@@ -23,11 +23,7 @@ pub struct EmergencyFundRecovered {
     pub recovered_at: u64,
 }
 
-fn recover_funds(
-    env: &Env,
-    order_id: u64,
-    recovery_address: Address,
-) -> Result<bool, EscrowError> {
+fn recover_funds(env: &Env, order_id: u64, recovery_address: Address) -> Result<bool, EscrowError> {
     if is_zero_address(env, &recovery_address) {
         return Err(EscrowError::InvalidAddress);
     }
@@ -40,7 +36,11 @@ fn recover_funds(
         .ok_or(EscrowError::NotFound)?;
 
     let now = env.ledger().timestamp();
-    if now <= record.created_at.saturating_add(EMERGENCY_RECOVERY_DORMANCY_SECS) {
+    if now
+        <= record
+            .created_at
+            .saturating_add(EMERGENCY_RECOVERY_DORMANCY_SECS)
+    {
         return Err(EscrowError::EmergencyRescueTimelockNotElapsed);
     }
 
@@ -60,6 +60,13 @@ fn recover_funds(
     let proposal_key = DataKey::EmergencyRescueProposal(order_id);
     let mut proposal: Option<EmergencyRescueProposal> =
         env.storage().persistent().get(&proposal_key);
+    if proposal.is_some() {
+        env.storage().persistent().extend_ttl(
+            &proposal_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
 
     if let Some(ref existing) = proposal {
         if existing.executed {
@@ -102,6 +109,11 @@ fn recover_funds(
     if let Some(ref mut existing) = proposal {
         existing.executed = true;
         env.storage().persistent().set(&proposal_key, existing);
+        env.storage().persistent().extend_ttl(
+            &proposal_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     record.status = EscrowStatus::Refunded;
@@ -119,7 +131,11 @@ fn recover_funds(
     token_client.transfer(&env.current_contract_address(), &recovery_address, &amount);
 
     env.events().publish(
-        (symbol_short!("escrow"), symbol_short!("emg_recov"), order_id),
+        (
+            symbol_short!("escrow"),
+            symbol_short!("emg_recov"),
+            order_id,
+        ),
         EmergencyFundRecovered {
             order_id,
             recovery_address,

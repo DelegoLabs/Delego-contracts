@@ -257,10 +257,13 @@ fn recurring_relayer_and_channel_share_lifetime_and_rollback_nonce_on_failure() 
         expiration_ledger,
         epoch,
     };
+    let signing_payload = env.as_contract(&contract, || {
+        crate::relayed_spend_signing_payload(&env, &message)
+    });
     let signature = BytesN::from_array(
         &env,
         &signing_key
-            .sign(&message.to_xdr(&env).iter().collect::<std::vec::Vec<_>>())
+            .sign(&signing_payload.iter().collect::<std::vec::Vec<_>>())
             .to_bytes(),
     );
     client.execute_spend_via_relayer(
@@ -332,6 +335,86 @@ fn recurring_expiry_still_blocks_renewed_allowance() {
             .get_recurring_quota(&owner, &delegate)
             .unwrap()
             .cumulative_lifetime_spent,
+        0
+    );
+}
+
+#[test]
+fn get_recurring_quota_bumps_ttl_when_below_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_max_entry_ttl(PERMISSION_TTL_BUMP * 2);
+    env.ledger().set_min_persistent_entry_ttl(1_000);
+    env.ledger().set_sequence_number(100);
+
+    let contract = env.register(PermissionsContract, ());
+    let owner = Address::generate(&env);
+    let delegate = Address::generate(&env);
+    let client = PermissionsContractClient::new(&env, &contract);
+
+    client.grant(&owner, &delegate, &1_000, &1_000, &Vec::new(&env), &(WEEK * 8));
+    client.configure_recurring_quota(&owner, &delegate, &WEEK, &1_000, &5_000);
+
+    let key = DataKey::RecurringQuota(owner.clone(), delegate.clone());
+    let initial_ttl = env.as_contract(&contract, || env.storage().persistent().get_ttl(&key));
+    assert!(initial_ttl >= PERMISSION_TTL_BUMP);
+
+    // Advance ledger so remaining TTL falls below PERMISSION_TTL_THRESHOLD.
+    let advance = initial_ttl - PERMISSION_TTL_THRESHOLD + 100;
+    env.ledger().set_sequence_number(100 + advance);
+
+    let ttl_before = env.as_contract(&contract, || env.storage().persistent().get_ttl(&key));
+    assert!(ttl_before < PERMISSION_TTL_THRESHOLD);
+
+    assert!(client.get_recurring_quota(&owner, &delegate).is_some());
+
+    let ttl_after = env.as_contract(&contract, || env.storage().persistent().get_ttl(&key));
+    assert!(ttl_after >= PERMISSION_TTL_BUMP);
+    assert!(ttl_after > ttl_before);
+}
+
+#[test]
+fn recurring_remaining_saturates_for_over_spent_legacy_state() {
+    let config = recurring_quota::RecurringQuotaConfig {
+        epoch_duration_ledgers: WEEK,
+        per_epoch_quota_stroops: 100,
+        lifetime_hard_cap_stroops: 100,
+        cumulative_lifetime_spent: 0,
+        current_epoch_index: 0,
+    };
+
+    // Spending exactly at or beyond either cap must clamp to zero instead of
+    // panicking on unchecked `i128` subtraction (issue #753).
+    for (epoch_spent, lifetime_spent) in [(100, 0), (150, 0), (0, 100), (0, 150)] {
+        let state = recurring_quota::RecurringQuotaState {
+            config: recurring_quota::RecurringQuotaConfig {
+                cumulative_lifetime_spent: lifetime_spent,
+                ..config.clone()
+            },
+            epoch_spent,
+        };
+        assert_eq!(state.remaining(100), 0);
+    }
+
+    // Legacy permissions without a quota record follow the same rule.
+    let (env, contract, owner, delegate, _) = setup(100, 100);
+    env.as_contract(&contract, || {
+        let key = DataKey::Permission(owner.clone(), delegate.clone());
+        let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
+        record.spent = 150;
+        env.storage().persistent().set(&key, &record);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RecurringQuota(owner.clone(), delegate.clone()));
+    });
+    let record: PermissionRecord = env.as_contract(&contract, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Permission(owner.clone(), delegate.clone()))
+            .unwrap()
+    });
+    assert_eq!(
+        env.as_contract(&contract, || recurring_quota::remaining(&env, &record)),
         0
     );
 }

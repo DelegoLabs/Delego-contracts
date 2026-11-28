@@ -26,7 +26,7 @@
 // every public constant, type, and function carries in this file.
 #![allow(missing_docs)]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
     Symbol, Vec,
 };
 
@@ -38,6 +38,29 @@ pub use heartbeat::{
 /// Persistent entries are bumped when they approach expiry and kept alive
 /// for roughly 30 days, matching the repository's persistent-storage policy.
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
+
+/// Estimates the remaining storage TTL (in ledgers) of a delegation record
+/// using only on-chain state, so it works in `no_std` production builds where
+/// the test-only `get_ttl` accessor does not exist.
+///
+/// The estimate is the smaller of:
+/// - the ledgers left until `expires_at_ledger`, and
+/// - the ledgers left in the last bump window: `PERSISTENT_BUMP_AMOUNT` minus
+///   the ledgers elapsed since `DataKey::KeeperLastBountyLedger(id)`. When no
+///   bounty has been paid yet the window is assumed fresh (bumped on write).
+fn estimated_storage_ttl(env: &Env, delegation_id: u64, record: &DelegationRecord) -> u32 {
+    let current = env.ledger().sequence();
+    let until_expiry = record.expires_at_ledger.saturating_sub(current);
+    let last_bounty: Option<u32> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::KeeperLastBountyLedger(delegation_id));
+    let bump_window = match last_bounty {
+        Some(last) => PERSISTENT_BUMP_AMOUNT.saturating_sub(current.saturating_sub(last)),
+        None => PERSISTENT_BUMP_AMOUNT,
+    };
+    until_expiry.min(bump_window)
+}
 /// Target TTL (in ledgers) applied when a persistent entry is bumped.
 ///
 /// 518 400 ledgers ≈ 30 days at 5 s/ledger.  Bumping to this value every
@@ -638,23 +661,6 @@ pub enum DataKey {
     KeeperLastBountyLedger(u64),
     /// Legacy (V1) delegation record keyed by owner address.
     DelegationV1(Address),
-    /// Current (V2) delegation record keyed by owner address and label.
-    DelegationV2(Address, Symbol),
-    /// Schema version marker for the delegation storage layout.
-    SchemaVersion,
-    /// Sliding-window spend velocity limit configured for a delegation
-    /// (issue #494), keyed by delegation id.
-    SpendRateLimit(u64),
-    /// Merchant whitelist filter configured for a delegation (issue #493).
-    MerchantFilter(u64),
-    /// Cumulative stroops spent by a delegation with a specific merchant
-    /// (issue #493).
-    MerchantSpent(u64, Address),
-    /// Latest liveness heartbeat submitted by a keeper (issue #576).
-    KeeperHeartbeat(Address),
-    /// Primary/secondary keeper assignment for a delegation (issue #576).
-    DelegationKeepers(u64),
-}
 
 /// Current delegation storage schema version.
 pub const DELEGATION_SCHEMA_VERSION: u32 = 2;
@@ -664,48 +670,45 @@ pub const DELEGATION_SCHEMA_VERSION: u32 = 2;
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DelegationRecordV1 {
-    /// Unique identifier for the delegation.
-    pub id: u64,
     /// Address of the delegation owner.
     pub owner: Address,
-    /// Identifier of the authorized agent.
-    pub agent_id: BytesN<32>,
-    /// Contract address for which permissions are delegated.
-    pub permissions_contract: Address,
-    /// Current lifecycle status.
-    pub status: DelegationStatus,
-    /// Human-readable label for the delegation.
-    pub label: Symbol,
-    /// Ledger timestamp when the delegation was created.
-    pub created_at: u64,
-    /// Ledger timestamp of the last mutation to this delegation.
-    pub updated_at: u64,
+    /// Address of the authorized agent.
+    pub agent: Address,
     /// Ledger sequence at which the delegation expires.
     pub expires_at_ledger: u32,
-    /// Version number used for history/rollback.
-    pub version: u32,
-    /// Capabilities granted to the delegate, packed into one word.
-    pub permissions: PermissionBitmask,
-    /// Nonce for key revocation tracking.
-    pub nonce: u64,
+    /// Whether the delegation was revoked.
+    pub revoked: bool,
 }
 
 impl DelegationRecordV1 {
     /// Converts a legacy V1 record into the current V2 schema.
-    pub fn into_v2(self) -> DelegationRecord {
+    pub fn into_v2(self, env: &Env, id: u64) -> DelegationRecord {
+        let agent_str = self.agent.to_string();
+        let agent_len = agent_str.len().min(56);
+        let mut agent_str_bytes = [0u8; 56];
+        agent_str.copy_into_slice(&mut agent_str_bytes[..agent_len as usize]);
+        let agent_hash = env
+            .crypto()
+            .sha256(&Bytes::from_slice(env, &agent_str_bytes[..agent_len as usize]))
+            .to_bytes();
+
         DelegationRecord {
-            id: self.id,
+            id,
             owner: self.owner,
-            agent_id: self.agent_id,
-            permissions_contract: self.permissions_contract,
-            status: self.status,
-            label: self.label,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
+            agent_id: agent_hash,
+            permissions_contract: Address::from_str(env, ZERO_CONTRACT_STRKEY),
+            status: if self.revoked {
+                DelegationStatus::Revoked
+            } else {
+                DelegationStatus::Active
+            },
+            label: Symbol::new(env, "V1"),
+            created_at: env.ledger().timestamp(),
+            updated_at: env.ledger().timestamp(),
             expires_at_ledger: self.expires_at_ledger,
-            version: self.version,
-            permissions: self.permissions,
-            nonce: self.nonce,
+            version: 1,
+            permissions: PermissionBitmask::all(),
+            nonce: 0,
         }
     }
 }
@@ -798,6 +801,10 @@ pub enum DelegationError {
     /// Both the primary and secondary keepers missed their heartbeat window
     /// (issue #576).
     NoLiveKeeper = 4032,
+    /// The supplied amount is invalid (must be strictly positive).
+    InvalidAmount = 4033,
+    /// An arithmetic operation overflowed its integer bounds.
+    ArithmeticOverflow = 4034,
 }
 
 /// The delegation registry contract.
@@ -954,6 +961,89 @@ impl DelegationRegistry {
             ttl_ledgers,
             PermissionBitmask::all(),
         )
+    }
+
+    /// Migrates a legacy V1 delegation for `owner` to the canonical id-keyed
+    /// record layout.
+    pub fn migrate_v1_delegation(
+        env: Env,
+        owner: Address,
+    ) -> Result<u64, DelegationError> {
+        owner.require_auth();
+
+        let v1_key = DataKey::DelegationV1(owner.clone());
+        let v1: DelegationRecordV1 = env
+            .storage()
+            .persistent()
+            .get(&v1_key)
+            .ok_or(DelegationError::NotFound)?;
+        if v1.owner != owner {
+            return Err(DelegationError::NotFound);
+        }
+
+        let id = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(1u64);
+        let next_id = id.checked_add(1).ok_or(DelegationError::IdExhausted)?;
+        env.storage().instance().set(&DataKey::NextId, &next_id);
+
+        let record = v1.into_v2(&env, id);
+        let delegation_key = DataKey::Delegation(id);
+        env.storage()
+            .persistent()
+            .set(&delegation_key, &record);
+        env.storage().persistent().extend_ttl(
+            &delegation_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Self::write_delegation_v2(&env, &record);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegationVersion(id), &record.version);
+        env.storage().persistent().extend_ttl(
+            &DataKey::DelegationVersion(id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let user_delegations_key = DataKey::UserDelegations(owner.clone());
+        let mut user_delegations = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<u64>>(&user_delegations_key)
+            .unwrap_or(Vec::new(&env));
+        user_delegations.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&user_delegations_key, &user_delegations);
+        env.storage().persistent().extend_ttl(
+            &user_delegations_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Self::store_snapshot(&env, id, &record);
+        env.storage().persistent().remove(&v1_key);
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        env.events().publish(
+            (EVENT_TOPIC_CONTRACT, symbol_short!("created"), id),
+            DelegationCreatedEvent {
+                delegation_id: id,
+                owner: record.owner,
+                agent: record.agent_id,
+                timestamp: record.updated_at,
+            },
+        );
+
+        Ok(id)
     }
 
     /// Creates a new delegation whose delegate only holds `permissions`.
@@ -1737,16 +1827,25 @@ impl DelegationRegistry {
     /// Returns a delegation record by owner and label, looking up via the
     /// DataKey::DelegationV2 secondary index. Returns `NotFound` when no
     /// delegation with the given owner/label pair exists.
-    pub fn get_delegation_by_label(
+    pub fn get_delegation_by_owner_label(
         env: Env,
         owner: Address,
         label: Symbol,
     ) -> Result<DelegationRecord, DelegationError> {
         let key = DataKey::DelegationV2(owner.clone(), label);
-        env.storage()
+        let record = env
+            .storage()
             .persistent()
             .get::<_, DelegationRecord>(&key)
-            .ok_or(DelegationError::NotFound)
+            .ok_or(DelegationError::NotFound)?;
+
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(record)
     }
 
     /// Returns all delegations associated with the given agent identifier.
@@ -2331,6 +2430,10 @@ impl DelegationRegistry {
             DataKey::SpendRateLimit(delegation_id),
             DataKey::MerchantFilter(delegation_id),
             DataKey::KeeperLastBountyLedger(delegation_id),
+            // Issue #760: keeper assignment stored by heartbeat.rs must be
+            // removed when the delegation is swept so no orphaned config
+            // entries remain in persistent storage.
+            DataKey::DelegationKeepers(delegation_id),
         ] {
             if env.storage().persistent().has(&key) {
                 env.storage().persistent().remove(&key);
@@ -2930,7 +3033,7 @@ impl DelegationRegistry {
         }
 
         if amount_stroops <= 0 {
-            return Err(DelegationError::InvalidTtl); // Reuse for "invalid amount"
+            return Err(DelegationError::InvalidAmount);
         }
 
         let current: i128 = env
@@ -2941,7 +3044,7 @@ impl DelegationRegistry {
 
         let new_total = current
             .checked_add(amount_stroops)
-            .ok_or(DelegationError::IdExhausted)?;
+            .ok_or(DelegationError::ArithmeticOverflow)?;
 
         env.storage()
             .instance()
@@ -2949,6 +3052,11 @@ impl DelegationRegistry {
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        env.events().publish(
+            (EVENT_TOPIC_CONTRACT, symbol_short!("resv_dep"), caller),
+            (amount_stroops, new_total),
+        );
 
         Ok(new_total)
     }
@@ -2966,10 +3074,9 @@ impl DelegationRegistry {
     /// Off-chain keepers should call this view function to determine whether
     /// submitting a heartbeat transaction is currently profitable.
     ///
-    /// `remaining_ledgers` reports the live Soroban persistent-storage TTL for
-    /// the delegation record — not the application-level `expires_at_ledger` —
-    /// so the field correctly tracks archival risk independent of the
-    /// delegation's own expiry window.
+    /// `remaining_ledgers` is a ledger-based estimate of the storage TTL: the
+    /// smaller of the ledgers left until `expires_at_ledger` and the ledgers
+    /// left in the last bump window (tracked via `KeeperLastBountyLedger`).
     pub fn get_keeper_bounty_status(
         env: Env,
         delegation_id: u64,
@@ -2987,17 +3094,7 @@ impl DelegationRegistry {
         let is_live = record.status == DelegationStatus::Active
             && current_ledger < record.expires_at_ledger;
 
-        let delegation_key = DataKey::Delegation(delegation_id);
-        // `get_ttl` is only available in testutils; in production code we
-        // cannot query the actual storage TTL, so we treat it as 0 (worst
-        // case — eligible for a bump) which is the safe/conservative default.
-        #[cfg(test)]
-        let storage_ttl: u32 = {
-            use soroban_sdk::testutils::storage::Persistent as _;
-            env.storage().persistent().get_ttl(&delegation_key)
-        };
-        #[cfg(not(test))]
-        let storage_ttl: u32 = 0;
+        let storage_ttl: u32 = estimated_storage_ttl(&env, delegation_id, &record);
 
         // A keeper is eligible when:
         //   1. the delegation is live (Active and not yet expired)
@@ -3080,14 +3177,7 @@ impl DelegationRegistry {
 
         // 2. The storage TTL must be approaching the archival threshold.
         let delegation_key = DataKey::Delegation(delegation_id);
-        // `get_ttl` is only available in testutils; use 0 (conservative) in production.
-        #[cfg(test)]
-        let storage_ttl: u32 = {
-            use soroban_sdk::testutils::storage::Persistent as _;
-            env.storage().persistent().get_ttl(&delegation_key)
-        };
-        #[cfg(not(test))]
-        let storage_ttl: u32 = 0;
+        let storage_ttl: u32 = estimated_storage_ttl(&env, delegation_id, &record);
 
         if storage_ttl >= KEEPER_BOUNTY_THRESHOLD_LEDGERS {
             return Err(DelegationError::NotEligibleForBounty);
@@ -3178,13 +3268,7 @@ impl DelegationRegistry {
         );
 
         // Return the refreshed status (now ineligible due to cooldown reset).
-        #[cfg(test)]
-        let refreshed_ttl: u32 = {
-            use soroban_sdk::testutils::storage::Persistent as _;
-            env.storage().persistent().get_ttl(&delegation_key)
-        };
-        #[cfg(not(test))]
-        let refreshed_ttl: u32 = PERSISTENT_BUMP_AMOUNT;
+        let refreshed_ttl: u32 = estimated_storage_ttl(&env, delegation_id, &record);
 
         Ok(KeeperBountyStatus {
             delegation_id,
@@ -3256,11 +3340,7 @@ impl DelegationRegistry {
         let v1: Option<DelegationRecordV1> = env.storage().persistent().get(&v1_key);
         let v1 = v1?;
 
-        if v1.id != delegation_id {
-            return None;
-        }
-
-        let record = v1.into_v2();
+        let record = v1.into_v2(env, delegation_id);
 
         // Write the migrated record under both the canonical and V2 keys so
         // subsequent reads take the fast path, then drop the legacy entry.
@@ -3641,6 +3721,8 @@ mod error_code_uniqueness_tests {
             (DelegationError::SubAccountAddressTaken, 4030u32),
             (DelegationError::KeepersNotConfigured, 4031u32),
             (DelegationError::NoLiveKeeper, 4032u32),
+            (DelegationError::InvalidAmount, 4033u32),
+            (DelegationError::ArithmeticOverflow, 4034u32),
         ];
 
         for (variant, expected) in codes {
@@ -3680,6 +3762,8 @@ mod error_code_uniqueness_tests {
             DelegationError::SubAccountAddressTaken as u32,
             DelegationError::KeepersNotConfigured as u32,
             DelegationError::NoLiveKeeper as u32,
+            DelegationError::InvalidAmount as u32,
+            DelegationError::ArithmeticOverflow as u32,
         ];
         seen.sort_unstable();
         for pair in seen.windows(2) {

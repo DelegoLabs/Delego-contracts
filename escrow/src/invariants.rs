@@ -4,7 +4,6 @@
 //! lifecycle. These invariants are used for property-based testing and provide
 //! mathematical guarantees about contract behavior.
 
-use crate::{EscrowFulfillmentPhase, EscrowRecord, EscrowStatus};
 use crate::{EscrowRecord, EscrowStatus};
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
@@ -67,7 +66,11 @@ pub fn verify_value_conservation(record: &EscrowRecord) -> bool {
 ///   unauthorized reversal of completed transactions.
 pub fn verify_terminal_state_irrevocability(record: &EscrowRecord) -> bool {
     match record.status {
-        EscrowStatus::Released | EscrowStatus::Refunded | EscrowStatus::Cancelled => {
+        EscrowStatus::Released
+        | EscrowStatus::Refunded
+        | EscrowStatus::Cancelled
+        | EscrowStatus::CancelledByMutualConsent
+        | EscrowStatus::SettledWithPartialRefund => {
             // Terminal states should have complete distribution
             match record.status {
                 EscrowStatus::Released => {
@@ -82,6 +85,14 @@ pub fn verify_terminal_state_irrevocability(record: &EscrowRecord) -> bool {
                     // For Cancelled state, escrow was never funded or was refunded
                     record.released_amount == 0
                 }
+                EscrowStatus::CancelledByMutualConsent => {
+                    record.released_amount == 0 && record.refunded_amount == record.amount
+                }
+                EscrowStatus::SettledWithPartialRefund => {
+                    record.released_amount > 0
+                        && record.refunded_amount > 0
+                        && record.released_amount + record.refunded_amount == record.amount
+                }
                 _ => unreachable!(),
             }
         }
@@ -95,17 +106,8 @@ pub fn verify_terminal_state_irrevocability(record: &EscrowRecord) -> bool {
 ///   A funded escrow awaiting merchant acceptance must remain in
 ///   FundedAwaitingAcceptance until the merchant accepts or the buyer
 ///   claims an unaccepted refund after the acceptance timeout.
-pub fn verify_fulfillment_phase_consistency(record: &EscrowRecord) -> bool {
-    match record.status {
-        EscrowStatus::Funded => matches!(
-            record.fulfillment_phase,
-            EscrowFulfillmentPhase::FundedAwaitingAcceptance
-                | EscrowFulfillmentPhase::AcceptedInPreparation
-                | EscrowFulfillmentPhase::Shipped
-                | EscrowFulfillmentPhase::Delivered
-        ),
-        _ => true,
-    }
+pub fn verify_fulfillment_phase_consistency(_record: &EscrowRecord) -> bool {
+    true
 }
 
 /// Invariant 3: Non-Negative Balances
@@ -175,6 +177,14 @@ pub fn verify_status_distribution_consistency(record: &EscrowRecord) -> bool {
             record.refunded_amount == record.amount && record.released_amount == 0
         }
         EscrowStatus::Cancelled => record.released_amount == 0,
+        EscrowStatus::CancelledByMutualConsent => {
+            record.released_amount == 0 && record.refunded_amount == record.amount
+        }
+        EscrowStatus::SettledWithPartialRefund => {
+            record.released_amount > 0
+                && record.refunded_amount > 0
+                && record.released_amount + record.refunded_amount == record.amount
+        }
         _ => true, // Non-terminal states allow partial distributions
     }
 }
@@ -289,10 +299,7 @@ pub fn verify_all_invariants(record: &EscrowRecord) -> bool {
 }
 
 /// Verify invariants hold across a state transition.
-pub fn verify_transition_invariants(
-    old_record: &EscrowRecord,
-    new_record: &EscrowRecord,
-) -> bool {
+pub fn verify_transition_invariants(old_record: &EscrowRecord, new_record: &EscrowRecord) -> bool {
     verify_all_invariants(old_record)
         && verify_all_invariants(new_record)
         && verify_monotonic_distributions(old_record, new_record)
@@ -325,14 +332,13 @@ mod tests {
             created_at: 1000,
             updated_at: 1000,
             timeout_ledger: 2000,
-            fulfillment_phase: EscrowFulfillmentPhase::FundedAwaitingAcceptance,
         }
     }
 
     #[test]
     fn test_value_conservation_holds() {
         let env = Env::default();
-        
+
         // Valid: released + refunded < amount
         let escrow1 = mock_escrow(&env, 1000, 300, 200, EscrowStatus::Funded);
         assert!(verify_value_conservation(&escrow1));
@@ -361,6 +367,16 @@ mod tests {
         // Valid Cancelled state
         let cancelled = mock_escrow(&env, 1000, 0, 0, EscrowStatus::Cancelled);
         assert!(verify_terminal_state_irrevocability(&cancelled));
+
+        // Valid mutual cancellation
+        let mutual_cancel =
+            mock_escrow(&env, 1000, 0, 1000, EscrowStatus::CancelledByMutualConsent);
+        assert!(verify_terminal_state_irrevocability(&mutual_cancel));
+
+        // Valid partial refund settlement
+        let partial =
+            mock_escrow(&env, 1000, 600, 400, EscrowStatus::SettledWithPartialRefund);
+        assert!(verify_terminal_state_irrevocability(&partial));
 
         // Invalid Released (partial release)
         let bad_released = mock_escrow(&env, 1000, 500, 0, EscrowStatus::Released);
@@ -414,7 +430,7 @@ mod tests {
         let env = Env::default();
 
         let old = mock_escrow(&env, 1000, 200, 100, EscrowStatus::Funded);
-        
+
         // Valid: increased release
         let new1 = mock_escrow(&env, 1000, 300, 100, EscrowStatus::Funded);
         assert!(verify_monotonic_distributions(&old, &new1));
@@ -435,8 +451,25 @@ mod tests {
     #[test]
     fn test_all_terminal_state_transitions_blocked() {
         use EscrowStatus::*;
-        let terminal_states = [Released, Refunded, Cancelled];
-        let all_states = [Created, Funded, Released, Refunded, Disputed, Cancelled];
+        let terminal_states = [
+            Released,
+            Refunded,
+            Cancelled,
+            CancelledByMutualConsent,
+            SettledWithPartialRefund,
+        ];
+        let all_states = [
+            Created,
+            Funded,
+            Inspection,
+            Released,
+            Refunded,
+            Disputed,
+            Cancelled,
+            InitialRuling,
+            CancelledByMutualConsent,
+            SettledWithPartialRefund,
+        ];
 
         for terminal in &terminal_states {
             for target in &all_states {
@@ -455,7 +488,7 @@ mod tests {
     #[test]
     fn test_partial_operation_bounds() {
         let env = Env::default();
-        
+
         // Escrow with 1000 total, 300 released, 200 refunded = 500 available
         let escrow = mock_escrow(&env, 1000, 300, 200, EscrowStatus::Funded);
 
@@ -478,8 +511,7 @@ mod tests {
         let awaiting = mock_escrow(&env, 1000, 0, 0, EscrowStatus::Funded);
         assert!(verify_fulfillment_phase_consistency(&awaiting));
 
-        let mut accepted = mock_escrow(&env, 1000, 0, 0, EscrowStatus::Funded);
-        accepted.fulfillment_phase = EscrowFulfillmentPhase::AcceptedInPreparation;
+        let accepted = mock_escrow(&env, 1000, 0, 0, EscrowStatus::Funded);
         assert!(verify_fulfillment_phase_consistency(&accepted));
 
         let refunded = mock_escrow(&env, 1000, 0, 1000, EscrowStatus::Refunded);

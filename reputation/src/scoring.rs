@@ -295,7 +295,10 @@ mod tests {
             prev = bps;
         }
         assert_eq!(compute_staked_decay_bps(&cfg, 100), cfg.min_decay_floor);
-        assert_eq!(compute_staked_decay_bps(&cfg, u32::MAX), cfg.min_decay_floor);
+        assert_eq!(
+            compute_staked_decay_bps(&cfg, u32::MAX),
+            cfg.min_decay_floor
+        );
         assert_eq!(
             apply_staked_decay(u64::MAX, &cfg, u32::MAX),
             u64::MAX / 10_000 * 500

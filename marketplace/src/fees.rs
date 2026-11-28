@@ -37,14 +37,8 @@ pub fn calculate_discounted_fee(base_fee_bps: u32, governance_stake: i128) -> u3
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        DataKey, MarketplaceContract, MarketplaceContractClient, RegisterParams,
-    };
-    use soroban_sdk::{
-        symbol_short,
-        testutils::Address as _,
-        Address, Env, String,
-    };
+    use crate::{DataKey, MarketplaceContract, MarketplaceContractClient, RegisterParams};
+    use soroban_sdk::{symbol_short, testutils::Address as _, Address, Env, String};
 
     #[test]
     fn test_no_discount_below_minimum_stake_tier() {
@@ -140,9 +134,10 @@ mod tests {
         // Unregistered address defaults to 0 bps
         let unregistered = Address::generate(&env);
         env.as_contract(&contract_id, || {
-            env.storage()
-                .persistent()
-                .set(&DataKey::GovernanceStake(unregistered.clone()), &100_000_0000000i128);
+            env.storage().persistent().set(
+                &DataKey::GovernanceStake(unregistered.clone()),
+                &100_000_0000000i128,
+            );
         });
         assert_eq!(client.get_merchant_fee_bps(&unregistered), 0);
     }

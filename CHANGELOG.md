@@ -20,6 +20,16 @@ will reject the change.
 
 ### Unreleased
 
+- Fix `fund_with_lst` so funding a `Created` escrow with LST collateral transitions it to `Funded`,
+  sets `ESCROW_FLAG_FUNDED`, refreshes `updated_at`, and bumps the escrow record TTL; repeat LST
+  funding is rejected with `LstCollateralAlreadyRecorded` (issue #764).
+- Add regression coverage confirming unique `EscrowError` discriminants and exact decoding of `DefiPoolDetached`, `DefiPoolAlreadyDetached`, and `SameLedgerManipulationDetected` (issue #762).
+- Add pro-rata partial refund settlement (issue #539): `resolve_partial_refund` (buyer and merchant authorization)
+  and `arbitrate_partial_refund` (arbiter authorization on disputed escrows), emitting `PartialRefundSettled`.
+- Fix escrow error-code collisions and stale decoding mappings (#706). Preserve
+  unambiguous codes, allocate 491-503 for conflicting/missing variants, and add
+  complete uniqueness and round-trip coverage. `ExceedsTotalEscrowAmount` uses
+  494 because 471 already belongs to `MilestoneNotFound`.
 - `create_delegation` and `create_scoped_delegation` now reject a zero `owner` or `permissions_contract`
   address with the new `DelegationError::InvalidParam` (4020), mirroring the escrow `is_zero_address`
   guard (issue #92).
@@ -88,6 +98,9 @@ will reject the change.
 
 ### Unreleased
 
+- Add merchant security bonds (issue #551): `deposit_bond`, governance-admin-gated `slash_bond`, and the
+  `get_security_bond` view.
+
 ### 0.0.1 - 2026-09-30
 
 - Fix pre-existing build breakage: restore missing `[features]` table header in `marketplace/Cargo.toml` so the `testutils` feature is correctly declared.
@@ -103,6 +116,18 @@ will reject the change.
 
 ### Unreleased
 
+- Clamp recurring-quota remaining allowance to zero when epoch, lifetime, or legacy spend counters exceed their caps, instead of panicking on underflow (issue #753).
+- `grant` and `grant_child` now reject `ttl_ledgers == 0` with the new `PermissionError::InvalidTtl` (2433)
+  (issue #10).
+- Repair the account recovery module (issue #686): valid SDK v22 storage calls with TTL extension, the
+  `RecoveryKey::Quorum` key, and typed `RecoveryError` codes (2701-2711). The 48-hour cool-down is now measured in
+  ledgers.
+- Repair the multi-sig module and wire it into `PermissionsContract` (issue #687): `init_multisig`,
+  `get_multisig_config`, `propose_multisig`, `approve_multisig` and `get_multisig_proposal`, with `MultiSigError`
+  (2601-2607). The unfinished envelope executor, which never compiled, is removed.
+- Replace the uncompiled one-time tickets with bounded spend tickets and wire them into `PermissionsContract`
+  (issue #688): `issue_spend_ticket`, `redeem_spend_ticket`, `revoke_spend_ticket` and `get_spend_ticket`, with
+  `TicketError` (2801-2807).
 - Wire the gas sponsorship module into `PermissionsContract` (issue #689):
   `configure_sponsorship`, `fund_sponsorship`, `charge_sponsored_fee`,
   `get_sponsorship_policy` and `get_sponsorship_balance`, backed by

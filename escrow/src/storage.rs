@@ -2,6 +2,9 @@
 //!
 //! This module provides transient storage-based reentrancy guards to protect
 //! against cross-contract reentrancy attacks during external token calls.
+//!
+//! Note: the priority surcharge helper described in the issue lives in
+//! `escrow/src/gas_surcharge.rs` and is intentionally not implemented here.
 
 use soroban_sdk::{contracttype, Env};
 
@@ -43,7 +46,7 @@ impl ReentrancyGuard {
     /// Returns `Ok(())` if the guard was successfully acquired (was `NotEntered`).
     /// Returns `Err(ReentrancyStatus::Entered)` if the guard is already held.
     pub fn try_acquire(env: &Env) -> Result<(), ReentrancyStatus> {
-        let storage = env.storage().transient();
+        let storage = env.storage().temporary();
         let status: ReentrancyStatus = storage
             .get(&ReentrancyKey::Guard)
             .unwrap_or(ReentrancyStatus::NotEntered);
@@ -62,14 +65,14 @@ impl ReentrancyGuard {
     /// This should be called in a `finally`-like pattern (using `drop` or
     /// explicit cleanup) to ensure the guard is always released.
     pub fn release(env: &Env) {
-        let storage = env.storage().transient();
+        let storage = env.storage().temporary();
         storage.set(&ReentrancyKey::Guard, &ReentrancyStatus::NotEntered);
         // No need to extend TTL for NotEntered - it will expire naturally
     }
 
     /// Checks if the guard is currently held (for testing/debugging).
     pub fn is_held(env: &Env) -> bool {
-        let storage = env.storage().transient();
+        let storage = env.storage().temporary();
         let status: ReentrancyStatus = storage
             .get(&ReentrancyKey::Guard)
             .unwrap_or(ReentrancyStatus::NotEntered);

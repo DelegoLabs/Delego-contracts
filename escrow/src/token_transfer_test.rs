@@ -202,3 +202,125 @@ fn sac_missing_trustline_maps_to_specific_error() {
         Err(EscrowError::TokenInvalidTokenContract)
     );
 }
+
+// --- New comprehensive tests -----------------------------------------------
+
+#[test]
+fn safe_token_transfer_from_with_valid_void_return() {
+    use crate::token_transfer::safe_token_transfer_from;
+    
+    let env = Env::default();
+    env.mock_all_auths();
+    let host = env.register(Host, ());
+    let token_id = env.register(VoidToken, ());
+    let payer = Address::generate(&env);
+    
+    let res = env.as_contract(&host, || {
+        safe_token_transfer_from(&env, &token_id, &payer, 250)
+    });
+    
+    assert_eq!(res, Ok(()));
+}
+
+#[test]
+fn safe_token_transfer_from_rejects_negative_amount() {
+    use crate::token_transfer::safe_token_transfer_from;
+    
+    let env = Env::default();
+    env.mock_all_auths();
+    let host = env.register(Host, ());
+    let token_id = env.register(VoidToken, ());
+    let payer = Address::generate(&env);
+    
+    let res = env.as_contract(&host, || {
+        safe_token_transfer_from(&env, &token_id, &payer, -100)
+    });
+    
+    assert_eq!(res, Err(EscrowError::InvalidAmount));
+}
+
+#[test]
+fn safe_token_transfer_from_with_real_sac_insufficient_balance() {
+    use crate::token_transfer::safe_token_transfer_from;
+    
+    let env = Env::default();
+    env.mock_all_auths();
+    let host = env.register(Host, ());
+    let admin = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(admin).address();
+    
+    // Mint only 50 tokens to payer
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &50);
+    
+    // Try to transfer 200 tokens (more than available)
+    let res = env.as_contract(&host, || {
+        safe_token_transfer_from(&env, &token_id, &payer, 200)
+    });
+    
+    assert_eq!(res, Err(EscrowError::TokenInsufficientBalance));
+}
+
+#[test]
+fn multiple_sequential_transfers_maintain_balance_integrity() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let host = env.register(Host, ());
+    let admin = Address::generate(&env);
+    let recipient1 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+    let recipient3 = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin);
+    let token_id = sac.address();
+    
+    // Mint 1000 tokens to host contract
+    StellarAssetClient::new(&env, &token_id).mint(&host, &1_000);
+    
+    // Perform multiple transfers
+    env.as_contract(&host, || {
+        safe_token_transfer(&env, &token_id, &recipient1, 300).unwrap();
+        safe_token_transfer(&env, &token_id, &recipient2, 250).unwrap();
+        safe_token_transfer(&env, &token_id, &recipient3, 100).unwrap();
+    });
+    
+    let client = TokenClient::new(&env, &token_id);
+    
+    // Verify all balances
+    assert_eq!(client.balance(&recipient1), 300);
+    assert_eq!(client.balance(&recipient2), 250);
+    assert_eq!(client.balance(&recipient3), 100);
+    assert_eq!(client.balance(&host), 350); // 1000 - 300 - 250 - 100
+}
+
+#[test]
+fn edge_case_transfer_exactly_all_available_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let host = env.register(Host, ());
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin);
+    let token_id = sac.address();
+    
+    // Mint exact amount
+    let exact_amount = 500_i128;
+    StellarAssetClient::new(&env, &token_id).mint(&host, &exact_amount);
+    
+    // Transfer exactly all available balance
+    let res = env.as_contract(&host, || {
+        safe_token_transfer(&env, &token_id, &recipient, exact_amount)
+    });
+    
+    assert_eq!(res, Ok(()));
+    
+    let client = TokenClient::new(&env, &token_id);
+    assert_eq!(client.balance(&recipient), exact_amount);
+    assert_eq!(client.balance(&host), 0);
+    
+    // Attempting another transfer should fail with insufficient balance
+    let res2 = env.as_contract(&host, || {
+        safe_token_transfer(&env, &token_id, &recipient, 1)
+    });
+    
+    assert_eq!(res2, Err(EscrowError::TokenInsufficientBalance));
+}

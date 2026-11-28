@@ -16,9 +16,11 @@
 //!
 //! `PermissionError` keeps its historical status-code style by adding the
 //! allocation base (`2000`) to each legacy value (e.g. `ParentNotFound`
-//! moves from `404` to `2404`). The unit tests below enforce that every
-//! `PermissionError` discriminant is inside the contract's range and that
-//! the documented ranges are pairwise disjoint.
+//! moves from `404` to `2404`). Within the same block, `MultiSigError` owns
+//! `2601..=2607`, `RecoveryError` `2701..=2711` and `TicketError` `2801..=2807`.
+//! The unit tests below enforce that every `PermissionError` discriminant is
+//! inside the contract's range and that the documented ranges are pairwise
+//! disjoint.
 
 // Contract crates compile as no_std for release and wasm builds, but keep std
 // enabled during testing so dev-dependencies and test assertions operate normally.
@@ -26,12 +28,20 @@
 #![cfg_attr(not(test), no_std)]
 #![allow(clippy::too_many_arguments)]
 #![warn(missing_docs)]
-mod recovery;
+/// Multi-signature approval management (issue #687).
+pub mod multisig;
+/// Guardian-quorum account recovery (issue #686).
+pub mod recovery;
 mod recurring_quota;
 mod crypto;
-mod sponsorship;
+/// Gas fee sponsorship quota and deduction logic (issues #689, #752).
+pub mod sponsorship;
+/// Ephemeral, bounded spend tickets (issue #688).
+pub mod tickets;
+pub use multisig::{MultiSigConfig, MultiSigError, MultiSigProposal};
 pub use recurring_quota::RecurringQuotaConfig;
 pub use sponsorship::{GasSponsorshipQuota, SponsorshipDataKey, SponsorshipPolicy};
+pub use tickets::{SpendTicket, TicketDataKey, TicketError};
 pub use crypto::{
     verify_passkey_signature, verify_passkey_signature_compressed, verify_passkey_signature_flexible,
 };
@@ -296,6 +306,9 @@ pub enum PermissionError {
     /// Distinct from `Expired` (ledger-sequence expiry) so callers can distinguish
     /// between the two expiration dimensions (issue #566).
     SessionExpired = 2432,
+    /// A grant was requested with `ttl_ledgers == 0`, which would create an
+    /// immediately expired permission (issue #10).
+    InvalidTtl = 2433,
 }
 
 /// Epoch period for allowance reset logic.
@@ -373,6 +386,7 @@ mod error_code_tests {
         PermissionError::RelayerFrozen as u32,
         PermissionError::InvalidSignature as u32,
         PermissionError::SessionExpired as u32,
+        PermissionError::InvalidTtl as u32,
     ];
 
     /// Compile-time completeness guard: this `match` has no wildcard arm, so
@@ -430,16 +444,17 @@ mod error_code_tests {
             | EphemeralRelayerUnsupported
             | RelayerFrozen
             | InvalidSignature
-            | SessionExpired => err as u32,
+            | SessionExpired
+            | InvalidTtl => err as u32,
         }
     }
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        // 49 = every `PermissionError` variant, each listed exactly once.
+        // 50 = every `PermissionError` variant, each listed exactly once.
         // `exhaustive_permission_error_guard` above fails to compile if a new
         // variant is added without being accounted for here (issue #691).
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 49);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 50);
         for code in PERMISSION_ERROR_CODES {
             assert!(
                 (2001..=2500).contains(code),
@@ -1619,29 +1634,23 @@ pub struct PermissionsContract;
 // the ABI entry-point signatures above; they cannot be annotated individually
 // from user code, so the allow lives on the impl block for those generated
 // wrappers only. User-defined functions carry their own scoped allows.
+/// Extends the TTL on a persistent storage key when it falls below [`PERMISSION_TTL_THRESHOLD`].
 #[allow(clippy::too_many_arguments)]
 pub fn bump_persistent_ttl(env: &Env, key: &DataKey) {
-    if env
-        .storage()
+    env.storage()
         .persistent()
-        .get_ttl(key)
-        .unwrap_or(0)
-        < PERMISSION_TTL_THRESHOLD
-    {
-        env.storage()
-            .persistent()
-            .extend_ttl(key, PERMISSION_TTL_BUMP, PERMISSION_TTL_BUMP);
-    }
+        .extend_ttl(key, PERMISSION_TTL_THRESHOLD, PERMISSION_TTL_BUMP);
 }
 
-pub fn bump_instance_ttl(env: &Env) {
+/// Placeholder for instance-storage TTL extension.
+pub fn bump_instance_ttl(_env: &Env) {
     // Instance keys that need TTL bumping are tracked separately;
     // this is a no-op for now since instance keys are managed differently.
 }
 
 /// Extends the TTL on a persistent storage key if it falls below the threshold.
 /// This prevents active permissions from being evicted during archival.
-fn extend_persistent_ttl_if_needed(env: &Env, key: &DataKey) {
+pub(crate) fn extend_persistent_ttl_if_needed(env: &Env, key: &DataKey) {
     bump_persistent_ttl(env, key);
 }
 
@@ -1654,6 +1663,9 @@ impl PermissionsContract {
     /// `(owner, delegate)` pair, it returns [`PermissionError::AlreadyGranted`]
     /// instead of resetting its spend accounting. Callers that deliberately
     /// want to replace an existing delegation must use [`Self::re_grant`].
+    ///
+    /// A `ttl_ledgers` of `0` is rejected with [`PermissionError::InvalidTtl`]:
+    /// it would record a permission that is already expired (issue #10).
     pub fn grant(
         env: Env,
         owner: Address,
@@ -1663,6 +1675,10 @@ impl PermissionsContract {
         allowed_merchants: Vec<Address>,
         ttl_ledgers: u32,
     ) -> Result<(), PermissionError> {
+        if ttl_ledgers == 0 {
+            return Err(PermissionError::InvalidTtl);
+        }
+
         Self::grant_impl(
             env,
             owner,
@@ -1932,6 +1948,47 @@ impl PermissionsContract {
         }
     }
 
+    /// Grant a spending permission bounded to the calendar ledger window
+    /// `[not_before_ledger, not_after_ledger]`.
+    pub fn grant_bounded(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        limit_total: i128,
+        limit_per_tx: i128,
+        allowed_merchants: Vec<Address>,
+        not_before_ledger: u32,
+        not_after_ledger: u32,
+    ) -> Result<(), PermissionError> {
+        if not_after_ledger == 0 || not_before_ledger > not_after_ledger {
+            return Err(PermissionError::InvalidParam);
+        }
+        let current_ledger = env.ledger().sequence();
+        if not_after_ledger <= current_ledger {
+            return Err(PermissionError::InvalidTtl);
+        }
+        let ttl_ledgers = not_after_ledger - current_ledger;
+        Self::grant_impl(
+            env.clone(),
+            owner.clone(),
+            delegate.clone(),
+            limit_total,
+            limit_per_tx,
+            allowed_merchants,
+            ttl_ledgers,
+            false,
+            None,
+        )?;
+        let key = DataKey::Permission(owner, delegate);
+        let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
+        record.not_before_ledger = not_before_ledger;
+        record.not_after_ledger = not_after_ledger;
+        record.expires_at_ledger = not_after_ledger;
+        env.storage().persistent().set(&key, &record);
+        extend_persistent_ttl_if_needed(&env, &key);
+        Ok(())
+    }
+
     /// Explicitly replaces an existing delegation's terms (issue #51).
     ///
     /// Unlike [`Self::grant`], this is permitted on a live (Active/Paused)
@@ -2138,31 +2195,7 @@ impl PermissionsContract {
         if !delegates.contains(&delegate) {
             delegates.push_back(delegate.clone());
             env.storage().persistent().set(&user_perms_key, &delegates);
-            Self::extend_persistent_ttl_if_needed(&env, &user_perms_key);
-        }
-
-        let user_perms_key = DataKey::UserPermissions(owner.clone());
-        let mut delegates: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&user_perms_key)
-            .unwrap_or(Vec::new(&env));
-        if !delegates.contains(&delegate) {
-            delegates.push_back(delegate.clone());
-            env.storage().persistent().set(&user_perms_key, &delegates);
-            Self::extend_persistent_ttl_if_needed(&env, &user_perms_key);
-        }
-
-        let user_perms_key = DataKey::UserPermissions(owner.clone());
-        let mut delegates: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&user_perms_key)
-            .unwrap_or(Vec::new(&env));
-        if !delegates.contains(&delegate) {
-            delegates.push_back(delegate.clone());
-            env.storage().persistent().set(&user_perms_key, &delegates);
-            Self::extend_persistent_ttl_if_needed(&env, &user_perms_key);
+            extend_persistent_ttl_if_needed(&env, &user_perms_key);
         }
 
         let record = PermissionRecord {
@@ -2184,7 +2217,7 @@ impl PermissionsContract {
         };
 
         env.storage().persistent().set(&key, &record);
-        Self::extend_persistent_ttl_if_needed(&env, &key);
+        extend_persistent_ttl_if_needed(&env, &key);
 
         let epoch_key = DataKey::ExecutionEpoch(owner.clone(), delegate.clone());
         let epoch_config = env
@@ -2295,6 +2328,7 @@ impl PermissionsContract {
     /// unscoped sub-delegation to a downstream agent.
     ///
     /// # Errors
+    /// - [`PermissionError::InvalidTtl`] if `ttl_ledgers` is `0`.
     /// - [`PermissionError::ParentNotFound`] if the parent permission
     ///   doesn't exist.
     /// - [`PermissionError::PermissionPaused`] / [`PermissionError::Expired`]
@@ -2311,6 +2345,10 @@ impl PermissionsContract {
         allowed_merchants: Vec<Address>,
         ttl_ledgers: u32,
     ) -> Result<(), PermissionError> {
+        if ttl_ledgers == 0 {
+            return Err(PermissionError::InvalidTtl);
+        }
+
         parent_delegate.require_auth();
 
         if let Some(state) = env
@@ -2465,7 +2503,7 @@ impl PermissionsContract {
             if let Some(index) = delegates.first_index_of(&delegate) {
                 delegates.remove(index);
                 env.storage().persistent().set(&user_perms_key, &delegates);
-                Self::extend_persistent_ttl_if_needed(&env, &user_perms_key);
+                extend_persistent_ttl_if_needed(&env, &user_perms_key);
             }
             Self::remove_from_address_index(
                 &env,
@@ -2475,7 +2513,7 @@ impl PermissionsContract {
 
             record.status = PermissionStatus::Revoked;
             env.storage().persistent().set(&key, &record);
-            Self::extend_persistent_ttl_if_needed(&env, &key);
+            extend_persistent_ttl_if_needed(&env, &key);
             env.storage()
                 .persistent()
                 .remove(&DataKey::PendingDecrement(owner.clone(), delegate.clone()));
@@ -3804,34 +3842,25 @@ impl PermissionsContract {
         let key = DataKey::Permission(owner.clone(), delegate.clone());
         let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
 
-        // Reset spent when crossing an epoch boundary (issue #11).
-        let current_ledger = env.ledger().sequence();
-        let ledgers_since_reset = current_ledger.saturating_sub(record.last_reset_ledger);
-        match record.epoch {
-            Epoch::Daily => {
-                if ledgers_since_reset >= 1 {
-                    record.spent = 0;
-                    record.last_reset_ledger = current_ledger;
-                }
         if !recurring_quota::consume(env, &mut record, amount)? {
             // Reset spent when crossing an epoch boundary (issue #11).
             let current_ledger = env.ledger().sequence();
             let ledgers_since_reset = current_ledger.saturating_sub(record.last_reset_ledger);
             match record.epoch {
                 Epoch::Daily => {
-                    if ledgers_since_reset >= 1 {
+                    if ledgers_since_reset >= 17_280 {
                         record.spent = 0;
                         record.last_reset_ledger = current_ledger;
                     }
                 }
                 Epoch::Weekly => {
-                    if ledgers_since_reset >= 7 {
+                    if ledgers_since_reset >= 120_960 {
                         record.spent = 0;
                         record.last_reset_ledger = current_ledger;
                     }
                 }
                 Epoch::Monthly => {
-                    if ledgers_since_reset >= 30 {
+                    if ledgers_since_reset >= 518_400 {
                         record.spent = 0;
                         record.last_reset_ledger = current_ledger;
                     }
@@ -3860,6 +3889,7 @@ impl PermissionsContract {
             _ => None,
         };
         env.storage().persistent().set(&key, &record);
+        extend_persistent_ttl_if_needed(env, &key);
 
         Self::record_spend_stats(env, owner, delegate, amount);
 
@@ -3903,6 +3933,7 @@ impl PermissionsContract {
                 _ => None,
             };
             env.storage().persistent().set(&parent_key, &parent_record);
+            extend_persistent_ttl_if_needed(env, &parent_key);
         }
 
         Ok(SpendExecutionResult {
@@ -4203,7 +4234,7 @@ impl PermissionsContract {
             .ok_or(PermissionError::NonceAlreadyUsed)?;
 
         env.storage().persistent().set(&nonce_key, &next_nonce);
-        Self::extend_persistent_ttl_if_needed(&env, &nonce_key);
+        extend_persistent_ttl_if_needed(&env, &nonce_key);
 
         env.events().publish(
             (
@@ -4643,7 +4674,7 @@ impl PermissionsContract {
             &DataKey::MultiPermission(primary_owner.clone(), delegate.clone()),
             &record,
         );
-        Self::extend_persistent_ttl_if_needed(&env, &DataKey::MultiPermission(primary_owner.clone(), delegate.clone()));
+        extend_persistent_ttl_if_needed(&env, &DataKey::MultiPermission(primary_owner.clone(), delegate.clone()));
 
         // Index the grant by delegate so a queued spend can resolve the one
         // grant — and therefore the one quorum — it draws on (issue #377).
@@ -4780,7 +4811,7 @@ impl PermissionsContract {
             .filter(|spent| *spent <= record.limit_total)
             .ok_or(PermissionError::ExceedsAllowance)?;
         env.storage().persistent().set(&key, &record);
-        Self::extend_persistent_ttl_if_needed(&env, &key);
+        extend_persistent_ttl_if_needed(&env, &key);
 
         Self::record_rolling_window_spend(&env, &primary_owner, &delegate, amount)?;
 
@@ -4878,12 +4909,12 @@ impl PermissionsContract {
         env.storage()
             .persistent()
             .set(&DataKey::SpendProposal(proposal_id), &proposal);
-        Self::extend_persistent_ttl_if_needed(&env, &DataKey::SpendProposal(proposal_id));
+        extend_persistent_ttl_if_needed(&env, &DataKey::SpendProposal(proposal_id));
         queued.push_back(proposal_id);
         env.storage()
             .persistent()
             .set(&DataKey::DelegateSpendProposals(delegate.clone()), &queued);
-        Self::extend_persistent_ttl_if_needed(&env, &DataKey::DelegateSpendProposals(delegate.clone()));
+        extend_persistent_ttl_if_needed(&env, &DataKey::DelegateSpendProposals(delegate.clone()));
         env.storage()
             .instance()
             .set(&DataKey::SpendProposalCounter, &proposal_id);
@@ -5725,7 +5756,7 @@ impl PermissionsContract {
         env.storage().persistent().set(&pend_key, &pending);
 
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("allowdec_q")),
+            (symbol_short!("perm"), symbol_short!("allowdecq")),
             AllowanceDecreaseQueuedEvent {
                 owner,
                 delegate,
@@ -5734,6 +5765,22 @@ impl PermissionsContract {
             },
         );
 
+        Ok(())
+    }
+
+    /// Cancel a pending allowance decrease queued for `(owner, delegate)`.
+    /// Only `owner` may cancel a pending decrease.
+    pub fn cancel_pending_decrease(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Result<(), PermissionError> {
+        owner.require_auth();
+        let pend_key = DataKey::PendingDecrement(owner, delegate);
+        if !env.storage().persistent().has(&pend_key) {
+            return Err(PermissionError::NotFound);
+        }
+        env.storage().persistent().remove(&pend_key);
         Ok(())
     }
 
@@ -6031,12 +6078,8 @@ impl PermissionsContract {
             .set(&DataKey::FrozenRelayer(relayer.clone()), &false);
 
         env.events().publish(
-            (symbol_short!("perm"), symbol_short!("rlyr_unfrz")),
-            RelayerFreezeEvent {
-                relayer,
-                frozen: false,
-                ledger: env.ledger().sequence(),
-            },
+            (symbol_short!("perm"), symbol_short!("rlyrunfrz")),
+            RelayerFrozenEvent { admin, relayer },
         );
 
         Ok(true)
@@ -6109,6 +6152,23 @@ impl PermissionsContract {
         sponsorship::charge_fee(&env, &sponsor, &relayer, fee_stroops)
     }
 
+    /// Deactivate `sponsor`'s gas sponsorship policy so no further relayer fees
+    /// or deposits can be processed until reconfigured.
+    pub fn deactivate_sponsorship(env: Env, sponsor: Address) -> Result<(), PermissionError> {
+        sponsorship::deactivate(&env, &sponsor)
+    }
+
+    /// Withdraw `amount` of unspent `token` from `sponsor`'s escrowed
+    /// sponsorship balance back to `sponsor`, returning the remaining balance.
+    pub fn withdraw_sponsorship(
+        env: Env,
+        sponsor: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<i128, PermissionError> {
+        sponsorship::withdraw(&env, &sponsor, &token, amount)
+    }
+
     /// Returns `sponsor`'s sponsorship policy, if one is configured.
     pub fn get_sponsorship_policy(env: Env, sponsor: Address) -> Option<SponsorshipPolicy> {
         sponsorship::read_policy(&env, &sponsor)
@@ -6117,6 +6177,96 @@ impl PermissionsContract {
     /// Returns `sponsor`'s remaining sponsorship budget in stroops (0 if unfunded).
     pub fn get_sponsorship_balance(env: Env, sponsor: Address) -> i128 {
         sponsorship::read_balance(&env, &sponsor)
+    }
+
+    // ── Multi-sig approvals (issue #687) ────────────────────────────────────
+
+    /// Registers the multi-sig signer set and threshold of `account`. Requires
+    /// `account`'s authorization and can only be done once.
+    ///
+    /// Unrelated to [`Self::grant_multi_owner`], which governs the spending of
+    /// a delegated allowance.
+    pub fn init_multisig(
+        env: Env,
+        account: Address,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), MultiSigError> {
+        multisig::initialize(&env, account, signers, threshold)
+    }
+
+    /// Returns the multi-sig configuration of `account`.
+    pub fn get_multisig_config(
+        env: Env,
+        account: Address,
+    ) -> Result<MultiSigConfig, MultiSigError> {
+        multisig::get_config(&env, &account)
+    }
+
+    /// Opens a multi-sig proposal and returns its id. Requires the
+    /// authorization of `proposer`, who counts as the first approval.
+    pub fn propose_multisig(
+        env: Env,
+        account: Address,
+        proposer: Address,
+        payload_hash: BytesN<32>,
+    ) -> Result<u64, MultiSigError> {
+        multisig::propose(&env, account, proposer, payload_hash)
+    }
+
+    /// Approves a multi-sig proposal and returns whether the threshold has been
+    /// reached. Requires `signer`'s authorization.
+    pub fn approve_multisig(
+        env: Env,
+        account: Address,
+        signer: Address,
+        proposal_id: u64,
+    ) -> Result<bool, MultiSigError> {
+        multisig::approve(&env, account, signer, proposal_id)
+    }
+
+    /// Returns a multi-sig proposal of `account`.
+    pub fn get_multisig_proposal(
+        env: Env,
+        account: Address,
+        proposal_id: u64,
+    ) -> Result<MultiSigProposal, MultiSigError> {
+        multisig::get_proposal(&env, &account, proposal_id)
+    }
+
+    // ── Spend tickets (issue #688) ──────────────────────────────────────────
+
+    /// Issues a ticket letting `delegate` spend up to `max_amount` on behalf of
+    /// `owner` before `expires_at_ledger`, and returns its id. Requires
+    /// `owner`'s authorization.
+    pub fn issue_spend_ticket(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        max_amount: i128,
+        expires_at_ledger: u32,
+    ) -> Result<u64, TicketError> {
+        tickets::issue(&env, owner, delegate, max_amount, expires_at_ledger)
+    }
+
+    /// Redeems `amount` from a ticket and returns the amount still redeemable.
+    /// Requires the ticket delegate's authorization.
+    pub fn redeem_spend_ticket(
+        env: Env,
+        ticket_id: u64,
+        amount: i128,
+    ) -> Result<i128, TicketError> {
+        tickets::redeem(&env, ticket_id, amount)
+    }
+
+    /// Revokes a ticket. Requires the ticket owner's authorization.
+    pub fn revoke_spend_ticket(env: Env, ticket_id: u64) -> Result<(), TicketError> {
+        tickets::revoke(&env, ticket_id)
+    }
+
+    /// Returns a spend ticket.
+    pub fn get_spend_ticket(env: Env, ticket_id: u64) -> Result<SpendTicket, TicketError> {
+        tickets::get(&env, ticket_id)
     }
 
     /// Pause new grant creation. Admin-only.
@@ -7485,3 +7635,90 @@ mod audit_log_page_tests {
 
 #[cfg(test)]
 mod recurring_quota_tests;
+
+/// Tests for the non-zero `ttl_ledgers` guard (issue #10).
+#[cfg(test)]
+mod ttl_guard_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+
+    const SEQUENCE: u32 = 100;
+
+    fn setup(env: &Env) -> PermissionsContractClient<'_> {
+        env.mock_all_auths();
+        env.ledger().set_sequence_number(SEQUENCE);
+        let contract_id = env.register(PermissionsContract, ());
+        PermissionsContractClient::new(env, &contract_id)
+    }
+
+    #[test]
+    fn grant_rejects_zero_ttl() {
+        let env = Env::default();
+        let client = setup(&env);
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchants = Vec::<Address>::new(&env);
+
+        assert_eq!(
+            client.try_grant(&owner, &delegate, &1_000, &100, &merchants, &0),
+            Err(Ok(PermissionError::InvalidTtl))
+        );
+        // Nothing may be recorded by a rejected grant.
+        assert!(client.try_get_permission(&owner, &delegate).is_err());
+    }
+
+    #[test]
+    fn grant_accepts_ttl_of_one() {
+        let env = Env::default();
+        let client = setup(&env);
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchants = Vec::<Address>::new(&env);
+
+        assert_eq!(
+            client.try_grant(&owner, &delegate, &1_000, &100, &merchants, &1),
+            Ok(Ok(()))
+        );
+        let record = client.get_permission(&owner, &delegate);
+        assert_eq!(record.status, PermissionStatus::Active);
+        assert_eq!(record.expires_at_ledger, SEQUENCE + 1);
+    }
+
+    #[test]
+    fn grant_child_rejects_zero_ttl() {
+        let env = Env::default();
+        let client = setup(&env);
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let child = Address::generate(&env);
+        let merchants = Vec::<Address>::new(&env);
+
+        client.grant(&owner, &delegate, &1_000, &100, &merchants, &1_000);
+
+        assert_eq!(
+            client.try_grant_child(&owner, &delegate, &child, &500, &50, &merchants, &0),
+            Err(Ok(PermissionError::InvalidTtl))
+        );
+        assert!(client.try_get_permission(&delegate, &child).is_err());
+    }
+
+    #[test]
+    fn grant_child_accepts_ttl_of_one() {
+        let env = Env::default();
+        let client = setup(&env);
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let child = Address::generate(&env);
+        let merchants = Vec::<Address>::new(&env);
+
+        client.grant(&owner, &delegate, &1_000, &100, &merchants, &1_000);
+
+        assert_eq!(
+            client.try_grant_child(&owner, &delegate, &child, &500, &50, &merchants, &1),
+            Ok(Ok(()))
+        );
+        let record = client.get_permission(&delegate, &child);
+        assert_eq!(record.status, PermissionStatus::Active);
+        assert_eq!(record.expires_at_ledger, SEQUENCE + 1);
+    }
+}
