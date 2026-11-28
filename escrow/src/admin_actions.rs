@@ -352,7 +352,7 @@ impl EscrowContract {
                 env.storage()
                     .instance()
                     .set(&DataKey::FeeConfig, &FeeConfig {
-                        basis_points: fee_bps,
+                        fee_bps,
                         treasury,
                         min_fee_floor_stroops: min_floor,
                         max_fee_ceiling_stroops: max_ceil,
@@ -481,7 +481,11 @@ impl EscrowContract {
             .get(&AdminActionKey::FeeTiers)
             .unwrap_or(Vec::new(&env));
         if tiers.len() == 0 {
-            return Self::get_fee_config(env).fee_bps;
+            // Propagate FeeConfigNotSet as 0 so callers that don't care about
+            // the error still get a safe (zero-fee) default rather than a panic.
+            return Self::get_fee_config(env)
+                .map(|c| c.fee_bps)
+                .unwrap_or(0);
         }
         let mut selected: u32 = tiers.get(0).unwrap().fee_basis_points;
         for tier in tiers.iter() {
