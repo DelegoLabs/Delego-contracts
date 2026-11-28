@@ -542,6 +542,30 @@ pub struct EphemeralSessionBounds {
     pub max_spending_limit: i128,
 }
 
+/// Emitted when a sliding-window spend rate limit is configured for a
+/// delegation (issue #494).
+#[contracttype]
+#[allow(missing_docs)]
+#[derive(Clone, Debug)]
+pub struct SpendRateLimitSetEvent {
+    pub delegation_id: u64,
+    pub window_ledgers: u32,
+    pub max_window_spend_stroops: i128,
+    pub timestamp: u64,
+}
+
+/// Emitted when a merchant whitelist filter is configured for a delegation
+/// (issue #493).
+#[contracttype]
+#[allow(missing_docs)]
+#[derive(Clone, Debug)]
+pub struct MerchantFilterSetEvent {
+    pub delegation_id: u64,
+    pub is_strict_whitelist: bool,
+    pub max_per_merchant_stroops: i128,
+    pub timestamp: u64,
+}
+
 /// Rolling time-window spend velocity limit for an autonomous agent
 /// delegation (issue #494). Mitigates risk if an agent key is compromised by
 /// bounding spend to `max_window_spend_stroops` per `window_ledgers`, in
@@ -1413,7 +1437,11 @@ impl DelegationRegistry {
         Self::store_snapshot(&env, delegation_id, &record);
 
         env.events().publish(
-            (symbol_short!("deleg"), symbol_short!("paused")),
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("adm_pause"),
+                delegation_id,
+            ),
             DelegationPausedEvent {
                 delegation_id,
                 owner: record.owner.clone(),
@@ -1471,7 +1499,11 @@ impl DelegationRegistry {
         Self::store_snapshot(&env, delegation_id, &record);
 
         env.events().publish(
-            (symbol_short!("deleg"), symbol_short!("resumed")),
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("adm_rsme"),
+                delegation_id,
+            ),
             DelegationResumedEvent {
                 delegation_id,
                 owner: record.owner.clone(),
@@ -2085,6 +2117,21 @@ impl DelegationRegistry {
             &DataKey::SpendRateLimit(delegation_id),
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Topics: (contract, action, entity_id) — consistent 3-topic pattern.
+        env.events().publish(
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("rate_set"),
+                delegation_id,
+            ),
+            SpendRateLimitSetEvent {
+                delegation_id,
+                window_ledgers,
+                max_window_spend_stroops,
+                timestamp: env.ledger().timestamp(),
+            },
         );
         Ok(())
     }
@@ -3491,6 +3538,21 @@ impl DelegationRegistry {
             &DataKey::MerchantFilter(delegation_id),
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Topics: (contract, action, entity_id) — consistent 3-topic pattern.
+        env.events().publish(
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("merch_set"),
+                delegation_id,
+            ),
+            MerchantFilterSetEvent {
+                delegation_id,
+                is_strict_whitelist: filter.is_strict_whitelist,
+                max_per_merchant_stroops: filter.max_per_merchant_stroops,
+                timestamp: env.ledger().timestamp(),
+            },
         );
 
         Ok(true)

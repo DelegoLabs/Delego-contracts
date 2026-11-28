@@ -1247,6 +1247,40 @@ pub struct EscrowDisputedEvent {
     pub disputed_by: Address,
 }
 
+/// A single evidence digest registered by one party to a disputed escrow.
+///
+/// Up to 5 digests may be registered per party (buyer or seller). Each
+/// digest is a SHA-256 hash of an off-chain evidence document; the actual
+/// document is never stored on-chain so the contract never sees or evaluates
+/// its content. Arbiters retrieve the digests via `get_evidence_digests` and
+/// verify the corresponding documents off-chain.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceRecord {
+    /// Escrow this evidence belongs to.
+    pub order_id: u64,
+    /// Party (buyer or seller) who submitted this record.
+    pub submitter: Address,
+    /// SHA-256 hash of the off-chain evidence document.
+    pub digest: BytesN<32>,
+    /// Ledger sequence at which this digest was registered.
+    pub submission_ledger: u32,
+}
+
+/// Emitted when a party registers an evidence digest for a disputed escrow.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EvidenceSubmittedEvent {
+    /// Escrow under dispute.
+    pub escrow_id: u64,
+    /// Party who submitted the digest.
+    pub submitter: Address,
+    /// SHA-256 hash of the off-chain evidence document.
+    pub digest: BytesN<32>,
+    /// Total number of digests this party has registered so far.
+    pub total_submitted: u32,
+}
+
 /// Emitted when a dispute is resolved.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -2322,6 +2356,9 @@ pub enum DataKey {
     SettledLedger(u64),
     /// Lightweight archive header for a settled escrow stored in persistent storage.
     EscrowArchive(u64),
+    /// Evidence digests submitted by a party (buyer or seller) for a disputed
+    /// escrow (issue: tamper-proof evidence). Keyed by (escrow_id, submitter).
+    EvidenceDigests(u64, Address),
 }
 
 // NOTE: `EscrowError` intentionally does not use the `#[contracterror]` derive.
@@ -5496,7 +5533,13 @@ impl EscrowContract {
 
     /// Get the configured volume fee tier table, ascending by `min_volume`
     /// (issue #328). Empty when unset (base `FeeConfig::fee_bps` applies).
-    pub fn get_fee_tiers(env: Env) -> Vec<FeeTier> {
+    ///
+    /// This returns the legacy [`FeeTier`]-keyed table managed by
+    /// `add_fee_tier` / `remove_fee_tier`. The admin-action-gated
+    /// [`FeeTierConfig`] table (managed via `AdminAction::FeeTiers`) is
+    /// exposed by `get_fee_tiers` in `admin_actions.rs`; renaming this
+    /// entrypoint to `get_volume_fee_tiers` avoids the WASM export collision.
+    pub fn get_volume_fee_tiers(env: Env) -> Vec<FeeTier> {
         get_fee_tiers(&env)
     }
 
@@ -6614,14 +6657,8 @@ impl EscrowContract {
         order_hash: Option<BytesN<32>>,
         schema: Option<Symbol>,
     ) -> Result<u64, EscrowError> {
-        if let Some(pause_state) = env
-            .storage()
-            .instance()
-            .get::<DataKey, EscrowPauseState>(&DataKey::PauseState)
-        {
-            if pause_state.create_paused {
-                return Err(EscrowError::CreationPaused);
-            }
+        if Self::is_create_effectively_paused(&env) {
+            return Err(EscrowError::CreationPaused);
         }
 
         if let Some(registry) = env
@@ -10267,6 +10304,127 @@ impl EscrowContract {
         Ok(true)
     }
 
+    /// Register a tamper-proof evidence digest for a disputed escrow.
+    ///
+    /// Either the buyer or seller of the escrow may submit up to **5** SHA-256
+    /// digests while the dispute is active and before the resolution deadline.
+    /// The contract never stores or evaluates the underlying document; it only
+    /// records the hash so an arbiter (or any off-chain verifier) can confirm
+    /// that a document existed and was not altered after submission.
+    ///
+    /// # Validation
+    /// * `submitter` must be the buyer or seller of `escrow_id` and must
+    ///   authorize this call.
+    /// * The escrow must be in `Disputed` status.
+    /// * The dispute resolution deadline (timestamp) must not have passed.
+    /// * No more than 5 digests may be registered per party per escrow.
+    /// * The same digest may not be registered twice by the same party.
+    ///
+    /// # Events
+    /// Emits `(escrow, evid_sub, escrow_id) → EvidenceSubmittedEvent` on success.
+    pub fn submit_evidence_digest(
+        env: Env,
+        escrow_id: u64,
+        submitter: Address,
+        digest: BytesN<32>,
+    ) -> Result<u32, EscrowError> {
+        submitter.require_auth();
+
+        // Load and validate the escrow record.
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+
+        if submitter != record.buyer && submitter != record.seller {
+            return Err(EscrowError::NotADisputeParty);
+        }
+
+        if record.status != EscrowStatus::Disputed {
+            return Err(EscrowError::NotDisputed);
+        }
+
+        // Check the resolution deadline (stored as a u64 timestamp).
+        let deadline: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeDeadline(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        if env.ledger().timestamp() > deadline {
+            return Err(EscrowError::DisputeDeadlineExpired);
+        }
+
+        // Load existing digests for this party (or start fresh).
+        let key = DataKey::EvidenceDigests(escrow_id, submitter.clone());
+        let mut records: Vec<EvidenceRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        const MAX_EVIDENCE_PER_PARTY: u32 = 5;
+        if records.len() >= MAX_EVIDENCE_PER_PARTY {
+            return Err(EscrowError::EvidenceDigestLimitExceeded);
+        }
+
+        // Reject duplicate digests from the same submitter.
+        for existing in records.iter() {
+            if existing.digest == digest {
+                return Err(EscrowError::DuplicateEvidenceDigest);
+            }
+        }
+
+        records.push_back(EvidenceRecord {
+            order_id: escrow_id,
+            submitter: submitter.clone(),
+            digest: digest.clone(),
+            submission_ledger: env.ledger().sequence(),
+        });
+
+        let total = records.len();
+
+        // Persist and extend TTL so evidence survives as long as the escrow.
+        env.storage().persistent().set(&key, &records);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("escrow"),
+                symbol_short!("evid_sub"),
+                escrow_id,
+            ),
+            EvidenceSubmittedEvent {
+                escrow_id,
+                submitter,
+                digest,
+                total_submitted: total,
+            },
+        );
+
+        Ok(total)
+    }
+
+    /// Retrieve all evidence digests submitted by `submitter` for `escrow_id`.
+    ///
+    /// Returns an empty vector when no digests have been registered. This
+    /// read-only helper is designed for arbiters and off-chain verifiers;
+    /// it carries no authorization requirement.
+    pub fn get_evidence_digests(
+        env: Env,
+        escrow_id: u64,
+        submitter: Address,
+    ) -> Vec<EvidenceRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EvidenceDigests(escrow_id, submitter))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     /// Permissionless keeper entrypoint: extend the persistent-storage TTL of
     /// an active (non-terminal) escrow by a bounded number of ledgers so it cannot be archived out from
     /// under its funds while resolution — including a pending dispute — is
@@ -12840,14 +12998,34 @@ impl EscrowContract {
     /// Get the current escrow creation pause state.
     /// Returns false if pause has expired.
     pub fn get_create_paused(env: Env) -> bool {
+        Self::is_create_effectively_paused(&env)
+    }
+
+    /// Shared helper: returns `true` only when new escrow creation is
+    /// actively paused right now.  Both `get_create_paused` and
+    /// `create_internal` delegate here so their evaluation logic can never
+    /// drift.
+    ///
+    /// A pause is considered *active* when:
+    /// * `PauseState` is set in instance storage,
+    /// * `create_paused` is `true`, **and**
+    /// * either no `expires_at_ledger` was stored (`None`) or the current
+    ///   ledger sequence has not yet reached `expires_at_ledger`
+    ///   (`Some(exp)` where `current_ledger < exp`).
+    ///
+    /// Any other combination — missing key, `create_paused = false`, or an
+    /// already-elapsed expiry — returns `false` so creation is unblocked.
+    fn is_create_effectively_paused(env: &Env) -> bool {
         env.storage()
             .instance()
             .get::<DataKey, EscrowPauseState>(&DataKey::PauseState)
             .map(|s| {
-                if let Some(expires_at) = s.expires_at_ledger {
-                    s.create_paused && env.ledger().sequence() < expires_at
-                } else {
-                    s.create_paused
+                if !s.create_paused {
+                    return false;
+                }
+                match s.expires_at_ledger {
+                    Some(exp) => env.ledger().sequence() < exp,
+                    None => true,
                 }
             })
             .unwrap_or(false)
